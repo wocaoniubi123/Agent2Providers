@@ -1,0 +1,42 @@
+name: fork-build
+
+# fork 自建构建：手动触发 → 编译 Windows x64 插件二进制 → 打成可安装 zip → 上传 artifact。
+#
+# 官方 repo 的 build.yml 只做一件事：把发版派发给 `Agent2Builder/agent2api-providers-releases`
+# 那个专用构建仓库，需要只存在于上游的 `BUILDER_DISPATCH_TOKEN`。fork 里跑不了那条，
+# 也不需要——这里不签名、不发版，只产出一个**未签名**的包，供网关「从文件安装」使用
+# （网关对本地文件安装不要求签名，装完界面标黄；也不会被官方自动更新覆盖）。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+
+      # pack.mjs 默认先 cargo build --release，再把 target/<triple>/release 里的
+      # 二进制与 pack.json 打成 agent2api-providers-<version>-<target>.zip
+      - name: 编译并打包
+        shell: pwsh
+        run: node scripts/pack.mjs --out dist
+
+      - name: 产物清单
+        shell: pwsh
+        run: Get-ChildItem dist | Format-Table Name, Length, LastWriteTime
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent2api-providers-windows-x64
+          path: dist/*.zip
+          if-no-files-found: error
