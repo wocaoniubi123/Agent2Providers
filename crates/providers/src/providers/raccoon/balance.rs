@@ -73,6 +73,20 @@ pub(super) fn main_site_url() -> String {
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| DEFAULT_MAIN_SITE_URL.to_string())
 }
+/// 积分/余额接口的 origin。
+///
+/// apex（https://xiaohuanxiong.com）把 /api/web/points/* 这一族拦成 403（空响应体）；
+/// 同一 token 打 https://www.xiaohuanxiong.com 的同一条路径返回 200 且数据自洽
+/// （2026-11-06 实测：四个钱包之和 == available_points，owner_id 与账号 uid 一致）。
+/// 签到/发放那几条链路在同一 apex 上是通的，因此只把余额这一处换成 www，不改动
+/// main_site_url() 的既有语义。RACCOON_POINTS_SITE_URL 可覆盖。
+fn points_origin() -> String {
+    std::env::var("RACCOON_POINTS_SITE_URL")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "https://www.xiaohuanxiong.com".to_string())
+}
 
 /// 查询某账号的余额 / 积分（归一化形状见 `ProviderAdapter::query_usage` 的文档）。
 ///
@@ -90,7 +104,7 @@ pub(super) async fn query_usage(ctx: &PluginCtx, account_id: &str) -> Result<Val
             "该账号没有可用凭证，无法查询积分",
         ));
     }
-    let origin = main_site_url();
+    let origin = points_origin();
     let mut org_headers = Vec::new();
     super::headers::append_org(&mut org_headers, &credentials.org_code)
         .map_err(|message| GatewayError::with_status(400, message))?;
