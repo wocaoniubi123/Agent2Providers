@@ -443,8 +443,24 @@ impl Provider for LoomyProvider {
                     serde_json::to_value(account)
                         .map_err(|error| format!("登录结果无法序列化: {error}"))
                 }
+                "invite.status" => balance::invite_status(ctx, _account).await,
+                "invite.bind" => {
+                    let code = payload
+                        .get("code")
+                        .or_else(|| payload.get("inviteCode"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    balance::bind_invite(ctx, _account, code).await
+                }
+                "invite.redeem" => {
+                    let code = payload
+                        .get("code")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    balance::redeem_code(ctx, _account, code).await
+                }
                 other => Err(format!(
-                    "Loomy 不认识管理动作「{other}」（可用：login.sms-send / login.sms-verify）"
+                    "Loomy 不认识管理动作「{other}」（可用：login.sms-send / login.sms-verify / invite.status / invite.bind / invite.redeem）"
                 )),
             }
         })
