@@ -105,6 +105,7 @@ impl Provider for KiroProvider {
                 // 余额格点开是逐窗口明细（月度额度 / Free trial / Bonus credits）；
                 // 明细行见 usage.rs 的 `credits`。
                 credit_detail: true,
+                invite_code: false,
                 credit_expiry: false,
                 usage_detail: false,
                 edition: false,

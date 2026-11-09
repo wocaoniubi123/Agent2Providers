@@ -100,6 +100,7 @@ impl Provider for LoomyProvider {
             .with_account_features(proto::AccountFeatures {
                 usage: true,
                 credit_detail: true,
+                invite_code: true,
                 identifier: vec!["uid".to_string()],
                 expiry: Vec::new(),
                 ..Default::default()

@@ -199,6 +199,17 @@ pub struct AccountFeatures {
     /// 点开一定有逐份读数。没把握的家不要开 —— 点开一个空框比没有入口更糟。
     #[serde(default)]
     pub credit_detail: bool,
+    /// 有「邀请码」概念（填别人的码得积分，自己也能生成码邀别人）。
+    ///
+    /// 消费方：账号页工具栏那个「邀请码」按钮与它的弹窗 —— 没申报的家整个
+    /// 入口都不出现，避免出现一个「点了什么都没有」的全局按钮。
+    ///
+    /// 与 [`Capabilities`] 无关：邀请码是账号维度的运营动作，不是转发能力，
+    /// 所以放在 `AccountFeatures` 而不是能力位。厂商协议各不相同（Loomy 走
+    /// `points/activation` + `invitation-codes`，别家有自己的），网关不该知道
+    /// 细节 —— 它只按这一位决定「给不给入口」，实现全在插件的 `admin.action`。
+    #[serde(default)]
+    pub invite_code: bool,
     /// `credits[]` 里带**逐份到期时刻**（`expireAt`），可以按「快到期优先」排序。
     ///
     /// ── 为什么与 `credit_detail` 分开 ───────────────────────────
@@ -354,6 +365,7 @@ impl Default for AccountFeatures {
         Self {
             usage: false,
             credit_detail: false,
+            invite_code: false,
             credit_expiry: false,
             usage_detail: false,
             edition: false,

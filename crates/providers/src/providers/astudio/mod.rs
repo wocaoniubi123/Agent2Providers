@@ -105,6 +105,7 @@ impl Provider for AStudioProvider {
             .with_account_features(proto::AccountFeatures {
                 usage: true,
                 credit_detail: false,
+                invite_code: false,
                 credit_expiry: false,
                 usage_detail: false,
                 edition: false,
