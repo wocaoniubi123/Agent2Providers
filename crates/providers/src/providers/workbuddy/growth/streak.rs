@@ -18,7 +18,7 @@
 //!
 //! ```text
 //! ① 昨日漏签 + 有补签卡 → 补签
-//! ② 拉连登完整状态 → 对每个 unlocked 档位兑换
+//! ② 拉连登完整状态 → 对每个 available 档位兑换
 //! ③ 拉抽奖余额 → 抽完
 //! ```
 //!
@@ -66,7 +66,10 @@ pub const MAX_DRAWS: usize = 20;
 #[derive(Clone, Debug, Default)]
 pub struct Tier {
     pub tier: String,
-    /// `locked` / `unlocked` / `claimed`（上游原文，未识别的值原样保留）
+    /// `locked` / `available` / `claimed`（上游原文，未识别的值原样保留）
+    ///
+    /// 2026-11-11 实测 33 个国内版账号：上游只会给这三个值，**`available`
+    /// 才是「已解锁待领取」**（不是 `unlocked`）。
     pub status: String,
     pub credit: i64,
     pub energy: i64,
@@ -77,11 +80,20 @@ pub struct Tier {
 impl Tier {
     /// 可兑换：已解锁且未领取。
     ///
-    /// 只认 `unlocked` 而不是「非 locked 且非 claimed」：上游以后若加出
-    /// `expired` 之类的新状态，按「可兑换」去试会稳定报错；只认已知的可兑换
-    /// 态，遇到没见过的值就跳过并如实记进报告。
+    /// ── 状态值以上游实测为准（2026-11-11，33 个账号逐个查）──────────
+    /// 上游只给三种值：`locked`（未到天数）/ **`available`**（已解锁待领取）/
+    /// `claimed`（已领取）。**从来不给 `unlocked`**。
+    ///
+    /// 此前这里只认 `unlocked`，后果是整条链路静默失效：33 个号里 7 个处于
+    /// `available` 的 7d 档一次都没兑过 → 抽奖次数永远是 0 → 抽奖环节也无事
+    /// 可做 → `run_once` 返回空 → `done==0 && failed==0` 按设计不进报告
+    /// （见 `run_for_accounts`），所以日志里连一行都看不到。**症状就是
+    /// 「连登管家好像从来没跑过」**。
+    ///
+    /// `unlocked` 保留是为了兼容上游可能的旧写法；不认识的值仍然跳过 ——
+    /// 按「可兑换」去盲试会在上游加出新状态（如 `expired`）时稳定报错。
     fn redeemable(&self) -> bool {
-        self.status == "unlocked"
+        matches!(self.status.as_str(), "available" | "unlocked")
     }
 }
 
@@ -549,8 +561,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tier_redeemable_only_for_unlocked() {
-        let mut tier = Tier { tier: "7d".into(), status: "unlocked".into(), ..Default::default() };
+    fn tier_redeemable_only_for_available() {
+        // 上游实际给的是 `available`（2026-11-11 实测 33 个国内版账号），不是 `unlocked`
+        let mut tier = Tier { tier: "7d".into(), status: "available".into(), ..Default::default() };
+        assert!(tier.redeemable());
+        // 旧写法仍兼容
+        tier.status = "unlocked".into();
         assert!(tier.redeemable());
         tier.status = "locked".into();
         assert!(!tier.redeemable());
@@ -567,7 +583,7 @@ mod tests {
             "streak": { "days": 9 },
             "makeup_cards": { "balance": 2 },
             "redemption_status": {
-                "tier_7d_status": "unlocked",
+                "tier_7d_status": "available",
                 "tiers": [
                     { "tier": "7d", "credit": 100, "energy": 5, "cards": 1, "chances": 2 },
                     { "tier": "14d", "credit": 200, "energy": 8, "cards": 1, "chances": 3 }
@@ -579,7 +595,7 @@ mod tests {
         assert_eq!(full.makeup_cards, 2);
         assert_eq!(full.tiers.len(), 2);
         // 7d 的状态来自扁平字段，奖励读数来自 tiers 条目
-        assert_eq!(full.tiers[0].status, "unlocked");
+        assert_eq!(full.tiers[0].status, "available");
         assert_eq!(full.tiers[0].credit, 100);
         assert_eq!(full.tiers[0].chances, 2);
         // 14d 没有对应的 tier_14d_status → 空状态，不可兑换
