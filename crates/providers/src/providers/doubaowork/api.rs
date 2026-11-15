@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 
 use super::PROVIDER_ID;
 use crate::errors::GatewayError;
+use crate::http::AccountRequest;
 
 pub const BASE_URL: &str = "https://www.doubao.com";
 pub const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
@@ -22,9 +23,7 @@ pub fn client(
 ) -> Result<reqwest::Client, GatewayError> {
     type Key = (String, Option<crate::timeouts::Timeouts>);
     static CLIENTS: OnceLock<Mutex<HashMap<Key, reqwest::Client>>> = OnceLock::new();
-    let proxy = proxy
-        .map(proto::WireProxy::to_url)
-        .unwrap_or_else(|| gateway_proxy.trim().to_string());
+    let proxy = crate::http::proxy_url(proxy, gateway_proxy);
     let timeouts = stream.then(crate::timeouts::current);
     let key = (proxy.clone(), timeouts);
     let clients = CLIENTS.get_or_init(Mutex::default);
@@ -324,7 +323,7 @@ pub async fn json_response(
     ug: bool,
 ) -> Result<Value, GatewayError> {
     let mut response = builder
-        .send()
+        .with_account_user_agent().send()
         .await
         .map_err(|error| GatewayError::with_status(502, crate::http::describe(&error)))?;
     let status = response.status().as_u16();

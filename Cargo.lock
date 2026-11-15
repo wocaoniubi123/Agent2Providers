@@ -58,14 +58,16 @@ name = "agent2api-provider-sdk"
 version = "0.2.2-beta.2"
 dependencies = [
  "agent2api-provider-protocol",
+ "percent-encoding",
  "serde",
  "serde_json",
  "tokio",
+ "url",
 ]
 
 [[package]]
 name = "agent2api-providers"
-version = "3.99.0"
+version = "4.0.0"
 dependencies = [
  "aes",
  "aes-gcm",
