@@ -1,0 +1,68 @@
+{
+  "account_features": {
+    "claim": false,
+    "concurrency_default": null,
+    "credit_detail": true,
+    "credit_expiry": true,
+    "default_limiters": null,
+    "edition": false,
+    "email_as_name": false,
+    "expiry": [
+      "expiresAt"
+    ],
+    "identifier": [
+      "id"
+    ],
+    "invite_code": false,
+    "long_lived": false,
+    "plan_channel": false,
+    "usage": true,
+    "usage_detail": false
+  },
+  "admin_panels": [],
+  "capabilities": {
+    "anonymous_default_session": false,
+    "chat": true,
+    "checkin": true,
+    "claims": true,
+    "env_credentials": false,
+    "model_refresh": true,
+    "refresh": true,
+    "refresh_uses_account": true,
+    "sse_model_rewrite": false,
+    "sse_strip_newline_chunks": false,
+    "stateful": false,
+    "supports_default_model": false,
+    "system_proxy_when_unset": false,
+    "usage": true,
+    "web_login": true
+  },
+  "checkin": {
+    "daily": true,
+    "description": "一次领当天全部奖励（每日签到 + 新人礼） · 幂等由上游保证",
+    "exclude_guest": false,
+    "growth": false,
+    "modes": [
+      "checkin"
+    ],
+    "onboarding": true,
+    "plans": false,
+    "ui_hooks": []
+  },
+  "default_models": [],
+  "id": "officeace",
+  "label": "OfficeAce 果办",
+  "login_methods": [
+    {
+      "button": "网页登录",
+      "hint": "完成华为云授权后，网关会自动轮询取回登录凭据",
+      "kind": "browser"
+    }
+  ],
+  "needs_proxy": false,
+  "order": 12,
+  "refusal_finishes": [
+    "content_filter"
+  ],
+  "refusal_markers": []
+}

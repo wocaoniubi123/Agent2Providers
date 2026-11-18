@@ -1,0 +1,28 @@
+{
+  "abi": 1,
+  "verified": false,
+  "requires": [
+    "accounts.cas.v1",
+    "catalog.v1",
+    "chat.stream.v1",
+    "checkin.rolling.v1",
+    "clock.v1",
+    "desktop.credentials.v1",
+    "errors.v1",
+    "http.v1",
+    "login.forms.v1",
+    "login.interaction.v1",
+    "native.helpers.v1",
+    "settings.v1",
+    "state.v1"
+  ],
+  "origins": [
+    "https://agent.xfyun.cn",
+    "https://astronstudio-api-volces-prod.xf-yun.com"
+  ],
+  "helpers": [
+    "desktop.credentials.astudio.v1"
+  ],
+  "memory_mib": 64,
+  "concurrency": 8
+}

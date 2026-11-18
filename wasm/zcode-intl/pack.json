@@ -1,0 +1,19 @@
+{
+  "id": "agent2api-wasm-zcode-intl",
+  "name": "ZCode 国际版 · Wasm",
+  "description": "独立的 ZCode 国际版 提供商。",
+  "version": "0.1.0",
+  "protocol": 1,
+  "providers": [
+    {
+      "id": "zcode-intl",
+      "label": "ZCode 国际版",
+      "order": 14,
+      "default_enabled": true
+    }
+  ],
+  "entry": {
+    "wasm32-unknown-unknown": "zcode-intl.wasm"
+  },
+  "homepage": "https://github.com/ProvidersPlugin/Agent2Providers"
+}

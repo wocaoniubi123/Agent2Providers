@@ -1,0 +1,93 @@
+{
+  "account_features": {
+    "claim": false,
+    "concurrency_default": null,
+    "credit_detail": false,
+    "credit_expiry": false,
+    "default_limiters": null,
+    "edition": false,
+    "email_as_name": false,
+    "expiry": [],
+    "identifier": [
+      "uid"
+    ],
+    "invite_code": false,
+    "long_lived": false,
+    "plan_channel": false,
+    "usage": true,
+    "usage_detail": false
+  },
+  "admin_panels": [],
+  "capabilities": {
+    "anonymous_default_session": false,
+    "chat": true,
+    "checkin": false,
+    "claims": false,
+    "env_credentials": false,
+    "model_refresh": true,
+    "refresh": false,
+    "refresh_uses_account": false,
+    "sse_model_rewrite": false,
+    "sse_strip_newline_chunks": false,
+    "stateful": true,
+    "supports_default_model": false,
+    "system_proxy_when_unset": false,
+    "usage": true,
+    "web_login": true
+  },
+  "checkin": null,
+  "default_models": [
+    {
+      "id": "kimi-k3",
+      "kind": "chat",
+      "modelType": 83,
+      "name": "Kimi-K3",
+      "supportsImages": true,
+      "supportsReasoning": true,
+      "supportsToolCall": true
+    },
+    {
+      "defaultContextWindow": "1024000",
+      "id": "glm-5.3-flash",
+      "kind": "chat",
+      "maxInputTokens": 1024000,
+      "modelType": 91,
+      "name": "GLM-5.3-Flash",
+      "supportsImages": true,
+      "supportsReasoning": true,
+      "supportsToolCall": true
+    }
+  ],
+  "id": "catpaw",
+  "label": "CatPaw",
+  "login_methods": [
+    {
+      "button": "网页登录",
+      "hint": "打开美团 passport 授权页，完成后自动收下账号",
+      "kind": "browser"
+    },
+    {
+      "extra_fields": [
+        {
+          "key": "uid",
+          "label": "uid / 登录名",
+          "multiline": false,
+          "optional": true,
+          "placeholder": "可选：账号的 uid 或登录名"
+        }
+      ],
+      "kind": "token",
+      "label": "登录凭据",
+      "placeholder": "粘贴 accessToken / auth.json 内容"
+    },
+    {
+      "button": "导入本机登录态",
+      "hint": "读取本机 CatPaw 客户端的登录态（~/.meituan-catpaw/auth.json）",
+      "kind": "desktop"
+    }
+  ],
+  "needs_proxy": false,
+  "order": 25,
+  "refusal_finishes": [],
+  "refusal_markers": []
+}

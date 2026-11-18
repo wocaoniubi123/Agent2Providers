@@ -1,0 +1,39 @@
+{
+  "abi": 1,
+  "verified": false,
+  "requires": [
+    "accounts.cas.v1",
+    "accounts.identity.v1",
+    "catalog.v1",
+    "chat.stream.v1",
+    "clock.v1",
+    "credential.kiro-external-refresh.v1",
+    "desktop.credentials.v1",
+    "errors.v1",
+    "http.v1",
+    "login.forms.v1",
+    "login.interaction.v1",
+    "locks.v1",
+    "native.helpers.v1",
+    "random.v1",
+    "settings.v1",
+    "state.v1"
+  ],
+  "origins": [
+    "https://app.kiro.dev",
+    "https://management.eu-central-1.kiro.dev",
+    "https://management.us-east-1.kiro.dev",
+    "https://oidc.eu-central-1.amazonaws.com",
+    "https://oidc.us-east-1.amazonaws.com",
+    "https://prod.eu-central-1.auth.desktop.kiro.dev",
+    "https://prod.us-east-1.auth.desktop.kiro.dev",
+    "https://runtime.eu-central-1.kiro.dev",
+    "https://runtime.us-east-1.kiro.dev",
+    "https://view.awsapps.com"
+  ],
+  "helpers": [
+    "desktop.credentials.kiro.v1"
+  ],
+  "memory_mib": 64,
+  "concurrency": 8
+}

@@ -1,0 +1,19 @@
+{
+  "id": "agent2api-wasm-doubaowork",
+  "name": "豆包工作 · Wasm",
+  "description": "独立的 豆包工作 提供商。",
+  "version": "0.1.0",
+  "protocol": 1,
+  "providers": [
+    {
+      "id": "doubaowork",
+      "label": "豆包工作",
+      "order": 30,
+      "default_enabled": true
+    }
+  ],
+  "entry": {
+    "wasm32-unknown-unknown": "doubaowork.wasm"
+  },
+  "homepage": "https://github.com/ProvidersPlugin/Agent2Providers"
+}

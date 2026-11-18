@@ -1,0 +1,19 @@
+{
+  "id": "agent2api-wasm-antigravity",
+  "name": "Antigravity · Wasm",
+  "description": "独立的 Antigravity 提供商。",
+  "version": "0.1.0",
+  "protocol": 1,
+  "providers": [
+    {
+      "id": "antigravity",
+      "label": "Antigravity",
+      "order": 29,
+      "default_enabled": true
+    }
+  ],
+  "entry": {
+    "wasm32-unknown-unknown": "antigravity.wasm"
+  },
+  "homepage": "https://github.com/ProvidersPlugin/Agent2Providers"
+}

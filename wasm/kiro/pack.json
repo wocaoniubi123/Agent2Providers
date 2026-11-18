@@ -1,0 +1,19 @@
+{
+  "id": "agent2api-wasm-kiro",
+  "name": "Kiro · Wasm",
+  "description": "独立的 Kiro 提供商。",
+  "version": "0.1.0",
+  "protocol": 1,
+  "providers": [
+    {
+      "id": "kiro",
+      "label": "Kiro",
+      "order": 31,
+      "default_enabled": true
+    }
+  ],
+  "entry": {
+    "wasm32-unknown-unknown": "kiro.wasm"
+  },
+  "homepage": "https://github.com/ProvidersPlugin/Agent2Providers"
+}

@@ -1,0 +1,80 @@
+{
+  "account_features": {
+    "claim": false,
+    "concurrency_default": 3,
+    "credit_detail": false,
+    "credit_expiry": false,
+    "default_limiters": [
+      {
+        "action": "skip",
+        "kind": "balance",
+        "period_seconds": 0,
+        "threshold": 1.0
+      }
+    ],
+    "edition": false,
+    "email_as_name": false,
+    "expiry": [
+      "expiresAt"
+    ],
+    "identifier": [
+      "userId",
+      "uid"
+    ],
+    "invite_code": false,
+    "long_lived": false,
+    "plan_channel": false,
+    "usage": true,
+    "usage_detail": true
+  },
+  "admin_panels": [],
+  "capabilities": {
+    "anonymous_default_session": false,
+    "chat": true,
+    "checkin": true,
+    "claims": true,
+    "env_credentials": false,
+    "model_refresh": true,
+    "refresh": true,
+    "refresh_uses_account": true,
+    "sse_model_rewrite": false,
+    "sse_strip_newline_chunks": false,
+    "stateful": true,
+    "supports_default_model": false,
+    "system_proxy_when_unset": false,
+    "usage": true,
+    "web_login": true
+  },
+  "checkin": {
+    "daily": true,
+    "description": "每日福利 · 领取 → 确认 → 回读核实 · 按北京时间自然日重置",
+    "exclude_guest": false,
+    "growth": false,
+    "modes": [
+      "checkin"
+    ],
+    "onboarding": true,
+    "plans": false,
+    "ui_hooks": []
+  },
+  "default_models": [],
+  "id": "codearts",
+  "label": "CodeArts",
+  "login_methods": [
+    {
+      "button": "网页登录",
+      "hint": "打开华为云授权页，完成后自动收下账号",
+      "kind": "browser"
+    },
+    {
+      "extra_fields": [],
+      "kind": "token",
+      "label": "登录凭据",
+      "placeholder": "粘贴 access_key_id / secret_access_key（或整份 auth 文件内容）"
+    }
+  ],
+  "needs_proxy": false,
+  "order": 28,
+  "refusal_finishes": [],
+  "refusal_markers": []
+}

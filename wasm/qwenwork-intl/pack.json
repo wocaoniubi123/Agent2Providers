@@ -1,0 +1,19 @@
+{
+  "id": "agent2api-wasm-qwenwork-intl",
+  "name": "千问办公 国际版 · Wasm",
+  "description": "独立的 千问办公 国际版 提供商。",
+  "version": "0.1.0",
+  "protocol": 1,
+  "providers": [
+    {
+      "id": "qwenwork-intl",
+      "label": "千问办公 国际版",
+      "order": 25,
+      "default_enabled": true
+    }
+  ],
+  "entry": {
+    "wasm32-unknown-unknown": "qwenwork-intl.wasm"
+  },
+  "homepage": "https://github.com/ProvidersPlugin/Agent2Providers"
+}

@@ -1,0 +1,88 @@
+{
+  "account_features": {
+    "claim": false,
+    "concurrency_default": null,
+    "credit_detail": true,
+    "credit_expiry": false,
+    "default_limiters": null,
+    "edition": false,
+    "email_as_name": true,
+    "expiry": [
+      "expiresAt",
+      "tokenExpiresAt"
+    ],
+    "identifier": [
+      "userId"
+    ],
+    "invite_code": false,
+    "long_lived": false,
+    "plan_channel": false,
+    "usage": true,
+    "usage_detail": false
+  },
+  "admin_panels": [],
+  "capabilities": {
+    "anonymous_default_session": false,
+    "chat": true,
+    "checkin": true,
+    "claims": false,
+    "env_credentials": false,
+    "model_refresh": true,
+    "refresh": true,
+    "refresh_uses_account": true,
+    "sse_model_rewrite": true,
+    "sse_strip_newline_chunks": true,
+    "stateful": false,
+    "supports_default_model": false,
+    "system_proxy_when_unset": false,
+    "usage": true,
+    "web_login": true
+  },
+  "checkin": {
+    "daily": true,
+    "description": "与国内版同一套任务接口 · 站点不同",
+    "exclude_guest": false,
+    "growth": false,
+    "modes": [
+      "checkin"
+    ],
+    "onboarding": false,
+    "plans": false,
+    "ui_hooks": []
+  },
+  "default_models": [
+    {
+      "id": "glm-5.3",
+      "maxInputTokens": 1048576,
+      "maxOutputTokens": 307200,
+      "name": "GLM-5.3",
+      "routeId": "zaicoding_glm-5.3",
+      "supportsImages": false,
+      "supportsReasoning": true,
+      "supportsToolCall": true
+    },
+    {
+      "id": "glm-5.3-flash",
+      "maxInputTokens": 1048576,
+      "maxOutputTokens": 131072,
+      "name": "GLM-5.3-Flash",
+      "routeId": "zai_glm-5.3-flash",
+      "supportsImages": true,
+      "supportsReasoning": true,
+      "supportsToolCall": true
+    }
+  ],
+  "id": "autoclaw-intl",
+  "label": "AutoClaw 国际版",
+  "login_methods": [
+    {
+      "button": "网页登录（Zai / Google）",
+      "hint": "点按钮后先过一次滑块验证（官方风控），随后打开登录页，登录完成即自动添加账号",
+      "kind": "browser"
+    }
+  ],
+  "needs_proxy": false,
+  "order": 11,
+  "refusal_finishes": [],
+  "refusal_markers": []
+}

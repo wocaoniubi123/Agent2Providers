@@ -1,0 +1,73 @@
+{
+  "account_features": {
+    "claim": false,
+    "concurrency_default": null,
+    "credit_detail": true,
+    "credit_expiry": true,
+    "default_limiters": null,
+    "edition": false,
+    "email_as_name": false,
+    "expiry": [
+      "expiresAt",
+      "expiresAtMs"
+    ],
+    "identifier": [
+      "uid"
+    ],
+    "invite_code": false,
+    "long_lived": false,
+    "plan_channel": false,
+    "usage": true,
+    "usage_detail": false
+  },
+  "admin_panels": [],
+  "capabilities": {
+    "anonymous_default_session": false,
+    "chat": true,
+    "checkin": true,
+    "claims": false,
+    "env_credentials": false,
+    "model_refresh": true,
+    "refresh": true,
+    "refresh_uses_account": true,
+    "sse_model_rewrite": false,
+    "sse_strip_newline_chunks": false,
+    "stateful": true,
+    "supports_default_model": false,
+    "system_proxy_when_unset": false,
+    "usage": true,
+    "web_login": true
+  },
+  "checkin": {
+    "daily": true,
+    "description": "Trae 每日签到积分领取 · 按自然日 0 点刷新",
+    "exclude_guest": false,
+    "growth": false,
+    "modes": [
+      "checkin"
+    ],
+    "onboarding": false,
+    "plans": false,
+    "ui_hooks": []
+  },
+  "default_models": [],
+  "id": "trae",
+  "label": "Trae",
+  "login_methods": [
+    {
+      "button": "网页登录",
+      "hint": "打开 Trae 授权页，完成后自动收下账号",
+      "kind": "browser"
+    },
+    {
+      "extra_fields": [],
+      "kind": "token",
+      "label": "登录凭据",
+      "placeholder": "粘贴 CPA auth 文件内容或 accessToken"
+    }
+  ],
+  "needs_proxy": false,
+  "order": 26,
+  "refusal_finishes": [],
+  "refusal_markers": []
+}

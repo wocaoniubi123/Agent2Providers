@@ -1,0 +1,19 @@
+{
+  "id": "agent2api-wasm-astudio",
+  "name": "AStudio · Wasm",
+  "description": "独立的 AStudio 提供商。",
+  "version": "0.1.0",
+  "protocol": 1,
+  "providers": [
+    {
+      "id": "astudio",
+      "label": "AStudio",
+      "order": 32,
+      "default_enabled": true
+    }
+  ],
+  "entry": {
+    "wasm32-unknown-unknown": "astudio.wasm"
+  },
+  "homepage": "https://github.com/ProvidersPlugin/Agent2Providers"
+}

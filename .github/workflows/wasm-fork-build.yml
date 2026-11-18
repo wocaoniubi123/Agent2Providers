@@ -1,0 +1,85 @@
+name: wasm-fork-build
+
+# fork 自建 Wasm 构建：把 wasm/ 下的每个 provider 目录编成独立插件包。
+#
+# 与官方 `wasm-build.yml` 的区别：官方那条只做校验 + 派发给
+# `Agent2Builder/agent2api-providers-releases`（需要只存在于上游的 token），
+# fork 里跑不了。这里自己编、自己上传 artifact，**不签名** —— 网关对
+# `CUSTOM_REPOS` / `agent2api-wasm-*` 这一类自建包本来就豁免验签。
+#
+# 产出的 zip 命名是 `<id>-<version>-wasm32-unknown-unknown.zip`，与网关
+# `plugin_host::update::asset_name()` 的模板逐字一致，可直接挂到 Release 上
+# 让网关自动更新。
+
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: 'wasm/ 下的单个目录名（留空 = 全部）'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wasm-fork-build-${{ github.ref }}-${{ inputs.provider }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # wasm32-unknown-unknown 是网关 `wasm/manifest.rs` 里写死的 TARGET，
+          # 换成任何别的三元组都不会被识别。
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "wasm"
+
+      - name: 逐个构建
+        shell: bash
+        env:
+          INPUT_PROVIDER: ${{ inputs.provider }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${INPUT_PROVIDER}" ]]; then
+            LIST="${INPUT_PROVIDER}"
+          else
+            # sdk 是共享库不是插件包；dist 是输出目录。
+            LIST="$(find wasm -mindepth 1 -maxdepth 1 -type d -printf '%f\n' \
+              | grep -v -E '^(sdk|dist)$' | sort)"
+          fi
+
+          if [[ -z "${LIST}" ]]; then
+            echo "::error::wasm/ 下没有任何 provider 目录"
+            exit 1
+          fi
+
+          fail=0
+          for name in ${LIST}; do
+            echo "=== ${name} ==="
+            if ! node wasm/build.mjs "${name}"; then
+              echo "::error::${name} 构建失败"
+              fail=1
+            fi
+          done
+          exit "${fail}"
+
+      - name: 产物清单
+        shell: bash
+        run: ls -la wasm/dist || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent2api-wasm-packs
+          path: |
+            wasm/dist/*.zip
+            wasm/dist/*.sha256
+          if-no-files-found: error

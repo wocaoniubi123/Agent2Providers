@@ -1,0 +1,218 @@
+//! WorkBuddy 的账号身份与凭证：请求头、临期判定、单次续期。
+//!
+//! 本模块不读写账号库。一次性 refresh token 的并发保护与落盘由
+//! [`crate::account::refresh`] 统一负责，避免上游换发后、写回前再次使用旧凭证。
+//!
+//! ⚠ 本文件含**本 fork 的自用改动**（续期路由补 `plugin` 段），迁移时逐字保留，
+//! 见 [`refresh_session`] 里的注释。
+
+use agent2api_wasm_sdk::{json, Value};
+
+use crate::endpoints::Context;
+use crate::httpio::{self, ApiResponse};
+use crate::util;
+
+/// 临期窗口（与网关 `auth_http::REFRESH_WINDOW_MS` 同值：5 分钟）。
+pub const REFRESH_WINDOW_MS: f64 = 5.0 * 60.0 * 1000.0;
+
+/// 上游「refresh token 已失效」的业务码；插件如实上报，不在这里永久禁用账号。
+///
+/// native 侧它是公开常量（`CODE_REFRESH_TOKEN_INVALID`）供其它模块引用；本包只在
+/// 这里登记同一份取值，调用方读业务码直接比对数字。
+#[allow(dead_code)]
+pub const CODE_REFRESH_TOKEN_INVALID: i64 = 12153;
+
+/// 一次续期的结果（与网关 `RefreshedAuth` 同形）。
+#[derive(Clone, Debug, Default)]
+pub struct RefreshedAuth {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub expires_at: Option<f64>,
+    pub refresh_expires_at: Option<f64>,
+    pub domain: Option<Value>,
+    pub token_type: Option<Value>,
+}
+
+/// 转发请求上的鉴权头（网关 `AuthService::build_auth_headers` 的逐字副本）。
+///
+/// 与计费版的 [`crate::billing::headers::build_headers`] **不能互相替换**：
+/// 那版固定带 `Content-Type` / `Accept`、`X-User-Id` 缺省给空串、无 token 也给
+/// `Bearer `，且不带 `X-Department-Info`。这些差别是上游两个 buildHeaders 各自
+/// 的实现。
+pub fn build_auth_headers(session: &Value) -> Vec<(String, String)> {
+    let mut headers: Vec<(String, String)> = Vec::new();
+    let auth = session.get("auth").cloned().unwrap_or(Value::Null);
+    let account = session.get("account").cloned().unwrap_or(Value::Null);
+
+    if let Some(uid) = account.get("uid").and_then(Value::as_str) {
+        if !uid.is_empty() {
+            headers.push(("X-User-Id".to_string(), uid.to_string()));
+        }
+    }
+    if let Some(token) = auth.get("accessToken").and_then(Value::as_str) {
+        if !token.is_empty() {
+            headers.push(("Authorization".to_string(), format!("Bearer {token}")));
+        }
+    }
+    if let Some(enterprise_id) = account.get("enterpriseId").and_then(Value::as_str) {
+        if !enterprise_id.is_empty() {
+            headers.push(("X-Enterprise-Id".to_string(), enterprise_id.to_string()));
+            headers.push(("X-Tenant-Id".to_string(), enterprise_id.to_string()));
+        }
+    }
+    if let Some(domain) = auth.get("domain").and_then(Value::as_str) {
+        if !domain.is_empty() {
+            headers.push(("X-Domain".to_string(), domain.to_string()));
+        }
+    }
+    if let Some(department) = account.get("departmentFullName").and_then(Value::as_str) {
+        if !department.is_empty() {
+            headers.push(("X-Department-Info".to_string(), department.to_string()));
+        }
+    }
+    headers
+}
+
+/// 凭证是否临期（窗口 [`REFRESH_WINDOW_MS`]）。
+///
+/// 转发链路的懒刷新与后台维护共用这一个判据 —— 两处各写一个窗口，会出现
+/// 「维护认为不需要刷、请求链路却认为临期」的分叉，排障时极难发现。
+pub fn is_token_expiring(expires_at: f64) -> bool {
+    if expires_at <= 0.0 {
+        return false;
+    }
+    expires_at - REFRESH_WINDOW_MS <= util::now_ms() as f64
+}
+
+/// 把刷新响应补上 `expiresAt`（`expiresIn` 秒 → 毫秒时间戳）。
+///
+/// 与网关 `with_expires_at` 同口径：显式给了 `expiresAt` 就用它，否则按
+/// `expiresIn` 现算；两者都没有时留 0（调用方据此保留原值）。
+pub fn with_expires_at(mut auth: Value) -> Value {
+    let now = util::now_ms() as f64;
+    let Some(object) = auth.as_object_mut() else {
+        return auth;
+    };
+    let expires_in = object
+        .get("expiresIn")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let refresh_expires_in = object
+        .get("refreshExpiresIn")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let expires_at = object
+        .get("expiresAt")
+        .and_then(Value::as_f64)
+        .filter(|value| *value != 0.0)
+        .unwrap_or_else(|| {
+            if expires_in != 0.0 {
+                now + expires_in * 1000.0
+            } else {
+                0.0
+            }
+        });
+    let refresh_expires_at = object
+        .get("refreshExpiresAt")
+        .and_then(Value::as_f64)
+        .filter(|value| *value != 0.0)
+        .unwrap_or_else(|| {
+            if refresh_expires_in != 0.0 {
+                now + refresh_expires_in * 1000.0
+            } else {
+                0.0
+            }
+        });
+    if let Some(object) = auth.as_object_mut() {
+        object.insert("expiresAt".to_string(), json!(expires_at));
+        object.insert("refreshExpiresAt".to_string(), json!(refresh_expires_at));
+    }
+    auth
+}
+
+/// 刷新响应 → [`RefreshedAuth`]（字段缺失时给 None，让调用方保留原值）。
+fn refresh_result_from(data: &Value) -> RefreshedAuth {
+    let enriched = with_expires_at(data.clone());
+    RefreshedAuth {
+        access_token: enriched
+            .get("accessToken")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        refresh_token: enriched
+            .get("refreshToken")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        expires_at: enriched
+            .get("expiresAt")
+            .and_then(Value::as_f64)
+            .filter(|value| *value > 0.0),
+        refresh_expires_at: enriched
+            .get("refreshExpiresAt")
+            .and_then(Value::as_f64)
+            .filter(|value| *value > 0.0),
+        domain: data.get("domain").cloned(),
+        token_type: data.get("tokenType").cloned(),
+    }
+}
+
+/// 校验一次上游响应（网关 `auth_http::unwrap_response` 的插件侧等价物）。
+fn unwrap_response(response: &ApiResponse, api_name: &str) -> agent2api_wasm_sdk::Result<Value> {
+    httpio::unwrap_response(response, api_name)
+}
+
+/// 单次续期（网关 `AuthService::refresh_session` 的逐字副本）：不读库、不写回。
+///
+/// `auth` 是会话里的 `auth` 子对象（`refreshToken` / `domain` / `account`）；
+/// `context` 决定打哪个站点（多账号必须用该账号自己的 endpoint）。
+pub fn refresh_session(auth: &Value, context: &Context) -> agent2api_wasm_sdk::Result<RefreshedAuth> {
+    let refresh_token = auth
+        .get("refreshToken")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if refresh_token.is_empty() {
+        return Err(agent2api_wasm_sdk::Error::http(
+            400,
+            "缺少 refreshToken，无法续期，请重新登录",
+        ));
+    }
+    let session = json!({ "auth": auth, "account": auth.get("account").unwrap_or(&Value::Null) });
+    let mut headers = crate::contract::framework_headers(&session, false);
+    headers.push(("X-Refresh-Token".to_string(), refresh_token.to_string()));
+    // ── 本 fork 的自用改动（逐字保留，勿改回上游的 `/auth/token/refresh`）──
+    // 续期路由在 `/v2/plugin/auth/token/refresh`：少了 `plugin` 这一段会命中
+    // 上游网关的兜底路由，返回 404「Route Not Found」（不是 401，也不是凭证问题）。
+    // 实测（2026-11-06）：`/v2/auth/token/refresh` → 404；
+    // `/v2/plugin/auth/token/refresh` → 401（路由存在，仅 token 无效）。国内站
+    // 与国际站结果一致。
+    let url = context.auth_url("/plugin/auth/token/refresh");
+    let response = httpio::send("POST", &url, &headers, Some(&json!({})))
+        .map_err(|error| httpio::transport_error("token 续期", error))?;
+    // ── 404 / 405 单独说清楚（issue #381）─────────────────────────
+    // 续期端点存在（社区实测它回 400「refreshToken is empty」），所以 404 几乎
+    // 只意味着一件事：**这个账号的 endpoint 指错了站点**（例如国内版账号的
+    // endpoint 是空串，本包回落到国际版站点）。这种情况下重新登录、重新导入凭证
+    // 都修不好 —— 必须改端点。原来它和「凭证被作废」共用一句话，把用户往
+    // 错误的方向带。
+    if matches!(response.status, 404 | 405) {
+        return Err(agent2api_wasm_sdk::Error::http(
+            response.status,
+            format!(
+                "续期接口不存在（HTTP {}，请求地址 {url}）：通常是账号的端点（endpoint）\
+                 与账号所在地区不符，而不是凭证失效。请检查该账号的 endpoint 配置\
+                 （国内版应为 https://www.workbuddy.cn）",
+                response.status
+            ),
+        ));
+    }
+    let data = unwrap_response(&response, "auth/token/refresh")?;
+    let next = refresh_result_from(&data);
+    if next.access_token.is_empty() {
+        return Err(agent2api_wasm_sdk::Error::http(
+            502,
+            "token 刷新响应缺少 accessToken",
+        ));
+    }
+    Ok(next)
+}

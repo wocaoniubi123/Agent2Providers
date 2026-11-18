@@ -1,0 +1,19 @@
+{
+  "id": "agent2api-wasm-catpaw",
+  "name": "CatPaw · Wasm",
+  "description": "独立的 CatPaw 提供商。",
+  "version": "0.1.0",
+  "protocol": 1,
+  "providers": [
+    {
+      "id": "catpaw",
+      "label": "CatPaw",
+      "order": 25,
+      "default_enabled": true
+    }
+  ],
+  "entry": {
+    "wasm32-unknown-unknown": "catpaw.wasm"
+  },
+  "homepage": "https://github.com/ProvidersPlugin/Agent2Providers"
+}

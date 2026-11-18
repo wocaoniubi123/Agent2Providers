@@ -2,6 +2,8 @@
 /target/
 /wasm/target/
 /wasm/dist/
+# 临时构建目录（排缓存误判时用的独立 CARGO_TARGET_DIR）
+/wasm/_tmp-target/
 
 # 打包产物（scripts/pack.mjs 产出的 zip）
 /dist/

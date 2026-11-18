@@ -1,0 +1,103 @@
+{
+  "account_features": {
+    "claim": false,
+    "concurrency_default": null,
+    "credit_detail": false,
+    "credit_expiry": false,
+    "default_limiters": null,
+    "edition": false,
+    "email_as_name": false,
+    "expiry": [
+      "tokenExpireAt"
+    ],
+    "identifier": [
+      "uid"
+    ],
+    "invite_code": false,
+    "long_lived": false,
+    "plan_channel": false,
+    "usage": true,
+    "usage_detail": false
+  },
+  "admin_panels": [],
+  "capabilities": {
+    "anonymous_default_session": false,
+    "chat": true,
+    "checkin": false,
+    "claims": false,
+    "env_credentials": false,
+    "model_refresh": false,
+    "refresh": true,
+    "refresh_uses_account": true,
+    "sse_model_rewrite": false,
+    "sse_strip_newline_chunks": false,
+    "stateful": true,
+    "supports_default_model": false,
+    "system_proxy_when_unset": false,
+    "usage": true,
+    "web_login": true
+  },
+  "checkin": null,
+  "default_models": [
+    {
+      "id": "hy4-preview",
+      "name": "Hy4-preview"
+    },
+    {
+      "id": "hy3",
+      "name": "Hy3"
+    },
+    {
+      "id": "kimi-k3",
+      "name": "Kimi-K3"
+    },
+    {
+      "id": "glm-5.3-flash",
+      "name": "GLM-5.3-Flash"
+    },
+    {
+      "id": "glm-5.3",
+      "name": "GLM-5.3"
+    },
+    {
+      "id": "glm-5.2",
+      "name": "GLM-5.2"
+    },
+    {
+      "id": "deepseek-v4.1-flash",
+      "name": "DeepSeek-V4.1-Flash"
+    },
+    {
+      "id": "deepseek-v4-flash",
+      "name": "DeepSeek-V4-Flash"
+    },
+    {
+      "id": "deepseek-v4-pro",
+      "name": "DeepSeek-V4-Pro"
+    }
+  ],
+  "id": "orcaterm",
+  "label": "OrcaTerm",
+  "login_methods": [
+    {
+      "extra_fields": [],
+      "kind": "token",
+      "label": "accessToken",
+      "placeholder": "粘贴 OrcaTerm 的 JWT，或整个 data.bin 的内容"
+    },
+    {
+      "button": "微信扫码登录",
+      "hint": "打开 OrcaTerm 授权页，扫码后自动回填账号",
+      "kind": "browser"
+    },
+    {
+      "button": "导入本机登录态",
+      "hint": "读取 OrcaTerm 桌面客户端已登录的账号",
+      "kind": "desktop"
+    }
+  ],
+  "needs_proxy": false,
+  "order": 4,
+  "refusal_finishes": [],
+  "refusal_markers": []
+}

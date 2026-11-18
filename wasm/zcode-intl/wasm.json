@@ -1,0 +1,26 @@
+{
+  "abi": 1,
+  "verified": false,
+  "requires": [
+    "http.v1",
+    "chat.stream.v1",
+    "accounts.cas.v1",
+    "accounts.identity.v1",
+    "settings.v1",
+    "settings.schema.v1",
+    "sessions.v1",
+    "clock.v1",
+    "random.v1",
+    "checkin.rolling.v1",
+    "errors.v1",
+    "login.forms.v1",
+    "runtime.platform.v1",
+    "runtime.architecture.v1"
+  ],
+  "origins": [
+    "https://api.z.ai",
+    "https://zcode.z.ai"
+  ],
+  "memory_mib": 64,
+  "concurrency": 8
+}

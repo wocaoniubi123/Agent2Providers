@@ -1,0 +1,20 @@
+{
+  "abi": 1,
+  "verified": false,
+  "requires": [
+    "accounts.cas.v1",
+    "catalog.v1",
+    "chat.stream.v1",
+    "checkin.rolling.v1",
+    "clock.v1",
+    "errors.v1",
+    "http.v1",
+    "state.v1"
+  ],
+  "origins": [
+    "https://api-inference.modelscope.cn",
+    "https://modelscope.cn"
+  ],
+  "memory_mib": 64,
+  "concurrency": 8
+}

@@ -1,0 +1,19 @@
+{
+  "id": "agent2api-wasm-officeace",
+  "name": "OfficeAce 果办 · Wasm",
+  "description": "独立的 OfficeAce 果办 提供商。",
+  "version": "0.1.0",
+  "protocol": 1,
+  "providers": [
+    {
+      "id": "officeace",
+      "label": "OfficeAce 果办",
+      "order": 12,
+      "default_enabled": true
+    }
+  ],
+  "entry": {
+    "wasm32-unknown-unknown": "officeace.wasm"
+  },
+  "homepage": "https://github.com/ProvidersPlugin/Agent2Providers"
+}

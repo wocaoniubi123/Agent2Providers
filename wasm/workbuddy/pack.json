@@ -1,0 +1,19 @@
+{
+  "id": "agent2api-wasm-workbuddy",
+  "name": "WorkBuddy 国内版 · Wasm",
+  "description": "独立的 WorkBuddy 国内版 提供商。",
+  "version": "0.1.0",
+  "protocol": 1,
+  "providers": [
+    {
+      "id": "workbuddy",
+      "label": "WorkBuddy 国内版",
+      "order": 15,
+      "default_enabled": true
+    }
+  ],
+  "entry": {
+    "wasm32-unknown-unknown": "workbuddy.wasm"
+  },
+  "homepage": "https://github.com/ProvidersPlugin/Agent2Providers"
+}

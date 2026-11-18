@@ -1,0 +1,33 @@
+{
+  "abi": 1,
+  "verified": false,
+  "requires": [
+    "accounts.cas.v1",
+    "accounts.identity.v1",
+    "catalog.v1",
+    "chat.stream.v1",
+    "checkin.rolling.v1",
+    "claim.doubao-tasks.v1",
+    "clock.v1",
+    "errors.v1",
+    "http.v1",
+    "http.doubao-turn.v1",
+    "http.timeout.v1",
+    "images.v1",
+    "login.forms.v1",
+    "login.interaction.v1",
+    "random.v1",
+    "request.context.v1",
+    "resources.v1",
+    "resources.fetch-public.v1",
+    "runtime.platform.v1",
+    "sessions.v1",
+    "settings.v1",
+    "state.v1"
+  ],
+  "origins": [
+    "https://www.doubao.com"
+  ],
+  "memory_mib": 64,
+  "concurrency": 8
+}

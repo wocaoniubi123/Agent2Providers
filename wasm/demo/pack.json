@@ -1,0 +1,19 @@
+{
+  "id": "agent2api-wasm-demo",
+  "name": "示例提供商 · Wasm",
+  "description": "示例提供商：把插件协议每条能力都走一遍（含本地假上游）。",
+  "version": "0.1.0",
+  "protocol": 1,
+  "providers": [
+    {
+      "id": "demo",
+      "label": "示例提供商",
+      "order": 0,
+      "default_enabled": true
+    }
+  ],
+  "entry": {
+    "wasm32-unknown-unknown": "demo.wasm"
+  },
+  "homepage": "https://github.com/ProvidersPlugin/Agent2Providers"
+}
