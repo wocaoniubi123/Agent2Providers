@@ -159,12 +159,15 @@ pub fn refresh(force: bool) -> Value {
     let record = match sdk::account() {
         Ok(record) => record,
         Err(_) => {
-            let models = fallback_models();
-            let mut value = sdk::catalog::refreshed(models);
-            // 内置清单不是「远程清单」，这里如实标注
-            value["meta"]["remote"] = json!(false);
-            value["meta"]["refreshed_at"] = json!(0);
-            return value;
+            // 没有账号 = 拿不到远程目录。**不能**伪造一个 refreshed ——
+            // 网关 `api/models.rs` 在 `refreshed: true` 时要求
+            // `meta.remote == true` 且 `count == models.len()`，伪造会被判
+            // 「插件刷新缺少同次真实远程模型快照，已保留旧清单」（2026-11-19 实测踩过）。
+            // 如实报失败，并把「内置清单仍可用」写进文案。
+            return sdk::catalog::failed(&format!(
+                "没有可用账号，无法刷新 Command Code 模型目录；内置 {} 个模型仍可直接使用",
+                fallback_models().len()
+            ));
         }
     };
     let api_key = match credentials::api_key_of(&record["secret"]) {
