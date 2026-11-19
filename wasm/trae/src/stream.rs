@@ -247,7 +247,16 @@ fn merge_piece(current: &mut String, incoming: &str) -> Result<()> {
     }
     if incoming.starts_with(current.as_str()) {
         *current = incoming.into();
-    } else if complete_arguments(incoming) && !complete_arguments(&(current.clone() + incoming)) {
+    } else if incoming.starts_with('{') && complete_arguments(incoming)
+        && !complete_arguments(&(current.clone() + incoming))
+    {
+        // 只有「看起来就是一份完整参数对象」时才认为是上游发来的替代版本。
+        // 原先只判断 `complete_arguments(incoming)`，而 `10` / `true` / `"x"` 这类
+        // 分片本身就是合法 JSON —— 工具参数又是从数字、字符串处分片下发的，
+        // 于是 `{"num":10,"query":"Debian 10 ...` 里的那个 `10` 会把已累积的
+        // 前缀整体替换掉，最终拼出 `10 buster LTS ..."}` 这种残缺对象，
+        // flush_tools 报「参数在完成前被截断」（2026-11-20 用真实分片复现）。
+        // 完整参数必然是 JSON 对象，以 `{` 开头，加这个前缀判断即可分辨。
         *current = incoming.into();
     } else {
         if current.len().saturating_add(incoming.len()) > MAX_TOOL_BUFFER {
