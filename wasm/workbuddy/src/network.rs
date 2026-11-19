@@ -47,8 +47,11 @@ pub fn open(
         e
     })
 }
-/// 对话正文的最大字节数：与图片编辑入口的内联数据上限一致。
-const MAX_CHAT_BODY: usize = 14 * 1024 * 1024;
+/// 对话正文的最大字节数。与宿主 `workbuddy_http.rs` 的 `MAX_BODY` 必须一致：
+/// 插件写进资源、宿主取回发送，两道上限不一致时中间会有一段「插件放行、
+/// 宿主拒绝」的死区（先前 8 MB / 14 MB 就留下过 6 MB 空档）。
+/// 现已统一为 15 MB（2026-11-19）。
+const MAX_CHAT_BODY: usize = 15 * 1024 * 1024;
 /// 对话正文先分片写入当前调用资源，再由宿主取原字节发送。
 /// 正文过大时返回明确原因（上下文过大），不再先耗尽实例内存。
 pub fn open_chat(
@@ -61,7 +64,11 @@ pub fn open_chat(
     http::open_json_resource("POST", &endpoints::url(origin, path)?, headers, body, MAX_CHAT_BODY)
         .map_err(|mut error| {
             // 上限错误已带可读原因，只有真正的传输/资源失败才换成笼统文案。
-            if error.code.as_deref() != Some("plugin_request_too_large") {
+            // `bad_params` 是宿主自己写的诊断文案（带判定点标签），必须原样透传，
+            // 否则笼统文案会把唯一的定位线索吞掉（2026-11-19 排查 400 时踩过）。
+            if error.code.as_deref() != Some("plugin_request_too_large")
+                && error.code.as_deref() != Some("bad_params")
+            {
                 error.message = "WorkBuddy网络请求未完成".into();
             }
             error

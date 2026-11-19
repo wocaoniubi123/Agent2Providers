@@ -2,9 +2,10 @@
 //! 已输出后绝不重放；流后半正式quota错误返回主机，冷却记账能力未接，不私改账号状态。
 
 use super::{
-    account, client, credentials, endpoints, errors, events::Decoder, headers, models, payload,
-    refresh, stream::Output, util,
+    account, client, credentials, endpoints, errors, events::{Decoder, Event}, headers, models,
+    payload, refresh, stream::Output, util,
 };
+use super::errors::tag_error;
 use agent2api_wasm_sdk::{http, Error, Result, Value};
 use sha2::Digest;
 
@@ -55,34 +56,76 @@ fn session(params: &Value, record: &Value) -> Result<String> {
     ))
 }
 
-fn consume(mut response: http::Response, output: &mut Output) -> Result<()> {
+fn event_name(event: &Event) -> &'static str {
+    match event {
+        Event::Done { .. } => "done",
+        Event::Error(_) => "error",
+        Event::Usage(_) => "usage",
+        Event::Output { .. } => "output",
+        Event::Other => "other",
+    }
+}
+
+/// 读流并把过程写进 `diag`：上游给了什么状态码、什么 content-type、读了几次、
+/// 一共多少字节、收到哪些 event 名、怎么结束的。
+///
+/// 为什么要这段：2026-11-19 排查 Trae 502 时，同一份请求体直连上游 7 个账号全部
+/// 成功，过网关却只收到 23 字节。凭 `upstreamPayloadBytes` 一个数字分不出是
+/// 「上游没给」还是「宿主没交到插件手上」，这段把过程摊开在错误文案里。
+fn consume(mut response: http::Response, output: &mut Output, diag: &mut String) -> Result<()> {
+    let status = response.status;
+    let content_type = response.headers["content-type"].as_str().unwrap_or("").to_string();
     let mut decoder = Decoder::default();
-    loop {
+    let mut reads = 0usize;
+    let mut total = 0usize;
+    let mut names: Vec<&'static str> = Vec::new();
+    let mut closed = String::from("eof");
+    let outcome = loop {
         let bytes = match response.read() {
-            Ok(Some(bytes)) => bytes,
+            Ok(Some(bytes)) => {
+                reads += 1;
+                total += bytes.len();
+                bytes
+            }
             Ok(None) => {
                 for event in decoder.finish()? {
                     output.apply(event)?;
                 }
-                break;
+                closed = "eof".to_string();
+                break output.end();
             }
             Err(error) => {
+                closed = error.code.clone().unwrap_or_else(|| "err".to_string());
                 output.fail(errors::transport(error))?;
-                break;
+                break output.end();
             }
         };
         for event in decoder.push(&bytes)? {
+            if names.len() < 10 && names.last() != Some(&event_name(&event)) {
+                names.push(event_name(&event));
+            }
             output.apply(event)?;
             // 首内容前业务错误及时交给路由/续期；不消费错误后的正常文本。
             if !output.started && output.failure.is_some() {
+                closed = "early-fail".to_string();
+                *diag = describe(status, &content_type, reads, total, &names, &closed);
                 return output.end();
             }
             if output.terminal {
+                closed = "done".to_string();
+                *diag = describe(status, &content_type, reads, total, &names, &closed);
                 return output.end();
             }
         }
-    }
-    output.end()
+    };
+    *diag = describe(status, &content_type, reads, total, &names, &closed);
+    outcome
+}
+
+fn describe(status: u16, content_type: &str, reads: usize, total: usize,
+    names: &[&'static str], closed: &str) -> String {
+    let ct = if content_type.is_empty() { "<none>" } else { content_type };
+    format!("stream: status={status} ct={ct} reads={reads} bytes={total} events={names:?} end={closed}")
 }
 
 pub fn forward(params: &Value) -> Result<()> {
@@ -137,19 +180,38 @@ pub fn forward(params: &Value) -> Result<()> {
                 .unwrap_or("")
                 .contains("application/json");
             let mut output = Output::new(shown)?;
-            let result = if !(200..300).contains(&status) || json_response {
+            // 三条出站路径各自带诊断码，便于区分「上游真拒绝」与「我们读错了分支」：
+            //   trae_http_status  —— 非 2xx，按上游错误信封分类
+            //   trae_json_stream  —— 2xx 但 content-type 是 application/json（不是 SSE）
+            //   trae_missing_terminal —— SSE 流结束但没有 done（上游静默断流）
+            // 2026-11-19 排查长上下文 502 时，这三条曾共用一句兜底文案，分不出来。
+            let result = if !(200..300).contains(&status) {
                 match client::read(response) {
-                    Ok(reply) => Err(errors::upstream(status, &reply.body)),
-                    Err(error) => Err(error),
+                    Ok(reply) => Err(tag_error(errors::upstream(status, &reply.body), "trae_http_status")),
+                    Err(error) => Err(tag_error(error, "trae_http_status")),
+                }
+            } else if json_response {
+                match client::read(response) {
+                    Ok(reply) => Err(tag_error(errors::upstream(status, &reply.body), "trae_json_stream")),
+                    Err(error) => Err(tag_error(error, "trae_json_stream")),
                 }
             } else {
-                let result = consume(response, &mut output);
-                match result {
-                    Err(error) => {
-                        output.fail(error)?;
-                        output.end()
+                let mut diag = String::new();
+                let outcome = consume(response, &mut output, &mut diag);
+                match outcome {
+                    Err(mut error) => {
+                        // 诊断必须进**返回值**。`output.end()` 返回的是内部 `failure`
+                        // ——那可能是 events 解码时产生的错误（`events.rs` 的
+                        // `Event::Error(errors::upstream(..))`），它不带 diag；
+                        // 先 fail 再 end 会把拼好的诊断丢掉（2026-11-19 踩过）。
+                        if !diag.is_empty() {
+                            error.message = format!("{}（{}）", error.message, diag);
+                        }
+                        let _ = output.fail(error.clone());
+                        let _ = output.end();
+                        Err(error)
                     }
-                    other => other,
+                    ok => ok,
                 }
             };
             if output.started || output.observed_tools() {

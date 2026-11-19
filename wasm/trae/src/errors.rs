@@ -5,6 +5,20 @@
 use super::util;
 use agent2api_wasm_sdk::{json, Error, Value};
 
+/// 给错误文案打一个诊断标签，**不动 `code` 与 `upstream_code`**。
+///
+/// 为什么不用 `with_code`：`code` 参与续期（`trae_session_expired`）与路由重试
+/// （`route_retry` 读 `upstream_code`）的判断，改它会把正常流程改坏。
+/// 标签只进 message，面板上看到 `[tag] 原文案`，用于区分「上游真拒绝」与
+/// 「我们读错了出站分支」（2026-11-19 长上下文 502）。
+///
+/// 为什么用独立函数而不是扩展 trait：trait 方法在 wasm 优化后可能被内联到
+/// 调用点之外，实测标签没出现在最终文案里；普通函数调用行为确定。
+pub fn tag_error(mut error: Error, tag: &str) -> Error {
+    error.message = format!("[{tag}] {}", error.message);
+    error
+}
+
 pub fn code(value: &Value) -> Option<i64> {
     [
         value.pointer("/error/code"),
@@ -143,7 +157,10 @@ pub fn upstream(status: u16, body: &Value) -> Error {
         (
             if status >= 400 { status.min(599) } else { 502 },
             "trae_upstream",
-            "Trae 上游未接受本次请求",
+            // 上下文过长时 Trae 不返回错误码，只回一条 progress_notice 后断流
+            // （2026-11-19 实测：121 KB / 1.15 MB 的请求只换回 23 字节）。
+            // 兜底文案因此补一句可操作的提示，不让用户以为是网络问题。
+            "Trae 上游未接受本次请求（上下文过长时会被静默断流，可压缩会话后重试）",
         )
     };
     let mut error = Error::http(status, message).with_code(marker);
@@ -166,7 +183,16 @@ pub fn classify(status: u16, value: &Value) -> Value {
         Some("trae_content_blocked") => "content_blocked",
         _ => "fatal",
     };
-    json!({ "kind": kind, "status": error.status, "message": error.message, "upstream_code": error.upstream_code, "reset_at": null })
+    // 这条出口返回的是 JSON 而不是 `Error`，宿主拿到 `message` 后直接当错误文案
+    // 用 —— 所有 `tag_error` 在这里都不生效。把宿主给的 status、上游业务码、
+    // 站点域名和响应片段拼进 message，才有希望看清流中途到底发生了什么。
+    let mut body = value.clone();
+    if body.to_string().len() > 200 {
+        body = json!(body.to_string().chars().take(200).collect::<String>());
+    }
+    let message = format!("[trae_classify status={status} code={:?} body={body}] {}", 
+        error.code, error.message);
+    json!({ "kind": kind, "status": error.status, "message": message, "upstream_code": error.upstream_code, "reset_at": null })
 }
 
 pub fn transport(error: Error) -> Error {

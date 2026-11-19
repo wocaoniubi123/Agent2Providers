@@ -4,6 +4,7 @@
 //! 不生成替代设备、不复用已发出但结果未知的refreshToken请求。
 
 use super::{account, client, credentials, device, endpoints, errors, headers, util};
+use super::errors::tag_error;
 use agent2api_wasm_sdk::{self as sdk, json, AccountLock, Error, Result, Value};
 
 pub fn client_ids(secret: &Value) -> Vec<String> {
@@ -120,7 +121,7 @@ fn bound_exchange(secret: &Value) -> Result<Option<Value>> {
         if matches!(reply.status, 404 | 405) || matches!(code, Some(20401 | 20405)) {
             return Ok(None);
         }
-        return Err(errors::upstream(reply.status, &reply.body));
+        return Err(tag_error(errors::upstream(reply.status, &reply.body), "trae_refresh_exchange"));
     }
     Ok(None)
 }
@@ -166,7 +167,7 @@ pub fn exchange(secret: &Value) -> Result<Value> {
             let attribution = reply.status == 400
                 && (errors::code(&reply.body) == Some(10101)
                     || errors::message(&reply.body).contains("not matched to the client"));
-            last = errors::upstream(reply.status, &reply.body);
+            last = tag_error(errors::upstream(reply.status, &reply.body), "trae_refresh_refresh");
             if attribution {
                 mismatch = true;
                 break;

@@ -2,6 +2,7 @@
 //! 大小受限，坏JSON明确失败；只处理本家别名，不复制通用协议转换。
 
 use super::{errors, util};
+use super::errors::tag_error;
 use agent2api_wasm_sdk::{Error, Result, Value};
 
 pub enum Event {
@@ -55,7 +56,7 @@ fn parse(event: &str, data: &str) -> Result<Event> {
     let data = data.trim();
     if data.is_empty() || data == "[DONE]" {
         return Ok(if event == "error" {
-            Event::Error(errors::upstream(502, &Value::Null))
+            Event::Error(tag_error(errors::upstream(502, &Value::Null), "trae_event_empty_error"))
         } else if matches!(event.as_str(), "done" | "response_done" | "stream_done")
             || data == "[DONE]"
         {
@@ -67,11 +68,18 @@ fn parse(event: &str, data: &str) -> Result<Event> {
             Event::Other
         });
     }
-    let mut parsed: Value =
-        serde_json::from_str(data).map_err(|_| Error::http(502, "Trae 流式事件不是有效 JSON"))?;
+    let mut parsed: Value = serde_json::from_str(data)
+        .map_err(|_| tag_error(Error::http(502, "Trae 流式事件不是有效 JSON"), "trae_parse_data"))?;
     if let Some(inner) = parsed.as_str() {
-        parsed =
-            serde_json::from_str(inner).map_err(|_| Error::http(502, "Trae 嵌套流式事件无效"))?;
+        // 上游的心跳帧把 data 包成字符串（`data:"Processing_1795103875"`），
+        // 内层不是嵌套 JSON —— 二次解析必然失败。这类帧必须**静默跳过**，
+        // 与原生实现的 `serde_json::from_str(data).ok()?` 一致。
+        // 报错会直接打断整条对话：实测上游处理 2.4 秒后先发这一帧，插件在
+        // 第一帧就 early-fail，只读到 57 字节，看起来像「上游未接受请求」。
+        match serde_json::from_str::<Value>(inner) {
+            Ok(value) => parsed = value,
+            Err(_) => return Ok(Event::Other),
+        }
     }
     if !parsed.is_object() {
         return Err(Error::http(502, "Trae 流式事件不是对象"));
@@ -82,7 +90,7 @@ fn parse(event: &str, data: &str) -> Result<Event> {
         event
     };
     if kind == "error" || errors::failed(&parsed) {
-        return Ok(Event::Error(errors::upstream(200, &parsed)));
+        return Ok(Event::Error(tag_error(errors::upstream(200, &parsed), "trae_event_payload")));
     }
     Ok(match kind.as_str() {
         "" | "output" | "message" | "delta" | "content" | "text" | "answer" | "chunk"
