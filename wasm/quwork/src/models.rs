@@ -1,214 +1,256 @@
-//! QuWork 模型目录：公开配置 JSON（`img1.rrzuji.cn`）+ 内置兜底。
-//!
-//! ── 为什么目录要校验到这么细 ────────────────────────────────
-//! 这份 JSON 决定「模型名发到哪个地址」与「用哪套 OpenAI 兼容开关」。
-//! native 的校验逐条照搬：`key` / `schemaVersion` / `enabled` 必须对得上，
-//! 提供商必须是 `qurwork` + `openai-completions`，`baseURL` 必须是已知的
-//! 模型网关（**地址被改过就拒收**，不向未确认的地址发凭证），模型名唯一。
-//!
-//! ── 缓存放在哪 ──────────────────────────────────────────────
-//! native 用 `ctx.settings_set` 落用户设置；wasm 插件的设置是「用户覆盖值」，
-//! 写它就是改用户的配置。所以缓存走会话状态（10 分钟 TTL），进程重启后
-//! 首轮重新拉一次 —— 与 native 的 `CACHE_KEY` 同一个有效期。
+//! 无鉴权公开目录；只接受已核对的 qurwork/OpenAI 固定域名。
+//! compat 与 reasoningEfforts 一并进入宿主目录快照，重启后无需私有全局缓存。
 
-use agent2api_wasm_sdk::{self as sdk, json, Result, Value};
+use super::{client, endpoints};
+use agent2api_wasm_sdk::{self as sdk, json, Error, Result, Value};
+use std::collections::HashSet;
 
-use super::upstream;
+const TTL: i64 = 600_000;
+const LEGACY_KEY: &str = "quworkModelCatalog";
 
-/// 会话里的缓存键。
-const CACHE_KEY: &str = "quwork:catalog";
-
-/// 缓存有效期（与大 native 的 `TTL_MS` 同值）。
-const TTL_MS: i64 = 10 * 60_000;
-
-/// 内置兜底目录（官方 1.6.0 的 `qurvis-desktop-model-config`，逐字照搬）。
-const FALLBACK: &str = include_str!("catalog.json");
-
-/// 一份可用目录。
-pub struct Catalog {
-    pub config: Value,
-    pub fetched_at: i64,
+fn invalid() -> Error {
+    Error::http(502, "QuWork 模型目录格式不兼容，已保留现有清单")
 }
 
-/// 兜底目录（永远可用）。
-pub fn fallback() -> Catalog {
-    Catalog {
-        config: serde_json::from_str(FALLBACK).unwrap_or(Value::Null),
-        fetched_at: 0,
-    }
-}
-
-/// 目录校验：任何一条不满足都拒收（见模块头）。
-pub fn validate(config: &Value) -> Result<()> {
-    if config.get("key").and_then(Value::as_str) != Some("qurvis-desktop-model-config")
-        || config.get("schemaVersion").and_then(Value::as_u64) != Some(1)
-        || config.get("enabled").and_then(Value::as_bool).is_none()
+fn list(config: &Value, fetched: i64) -> Result<Value> {
+    if config["key"] != "qurvis-desktop-model-config"
+        || config["schemaVersion"] != 1
+        || !config["enabled"].is_boolean()
     {
-        return Err(sdk::Error::new("QuWork 模型配置格式不兼容"));
+        return Err(invalid());
     }
-    let providers = config
-        .get("providers")
-        .and_then(Value::as_array)
-        .filter(|items| items.len() <= 8)
-        .ok_or_else(|| sdk::Error::new("QuWork 模型提供商配置异常"))?;
-    let mut ids: Vec<String> = Vec::new();
-    for provider in providers {
-        if provider.get("id").and_then(Value::as_str) != Some("qurwork") {
-            continue;
-        }
-        if provider.get("api").and_then(Value::as_str) != Some("openai-completions") {
-            return Err(sdk::Error::new("QuWork 模型接口协议已变化，请更新插件"));
+    let providers = config["providers"]
+        .as_array()
+        .filter(|rows| rows.len() <= 8)
+        .ok_or_else(invalid)?;
+    let mut found = false;
+    let mut ids = HashSet::new();
+    let mut rows = Vec::new();
+    for provider in providers
+        .iter()
+        .filter(|provider| provider["id"] == "qurwork")
+    {
+        found = true;
+        let origin = provider["baseURL"]
+            .as_str()
+            .and_then(endpoints::model_origin);
+        if provider["api"] != "openai-completions" || origin.is_none() {
+            return Err(Error::http(
+                502,
+                "QuWork 模型协议或地址已变化，未向未确认的服务发送凭证",
+            ));
         }
         if provider
-            .get("baseURL")
-            .and_then(Value::as_str)
-            .map(|url| url.trim_end_matches('/'))
-            != Some(upstream::MODEL_ORIGIN)
+            .get("enabled")
+            .is_some_and(|value| !value.is_boolean())
         {
-            return Err(sdk::Error::new("QuWork 模型服务地址已变化，未向未确认的地址发送凭证"));
+            return Err(invalid());
         }
-        let rows = provider
-            .get("models")
-            .and_then(Value::as_array)
+        for row in provider["models"]
+            .as_array()
             .filter(|rows| rows.len() <= 128)
-            .ok_or_else(|| sdk::Error::new("QuWork 模型清单格式异常"))?;
-        for row in rows {
-            let id = row
-                .get("id")
-                .and_then(Value::as_str)
+            .ok_or_else(invalid)?
+        {
+            let id = row["id"]
+                .as_str()
                 .filter(|id| !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control))
-                .ok_or_else(|| sdk::Error::new("QuWork 模型名称格式异常"))?;
-            if ids.iter().any(|known| known == id) {
-                return Err(sdk::Error::new("QuWork 模型清单存在重复名称"));
+                .ok_or_else(invalid)?;
+            if !ids.insert(id.to_ascii_lowercase()) || !row["enabled"].is_boolean() {
+                return Err(invalid());
             }
-            ids.push(id.to_string());
-            if row.get("enabled").and_then(Value::as_bool).is_none() {
-                return Err(sdk::Error::new("QuWork 模型启用状态不明确"));
+            if row["enabled"] == true && config["enabled"] == true && provider["enabled"] != false {
+                rows.push((row, origin.ok_or_else(invalid)?));
             }
         }
     }
-    if !providers
-        .iter()
-        .any(|provider| provider.get("id").and_then(Value::as_str) == Some("qurwork"))
-    {
-        return Err(sdk::Error::new("QuWork 模型配置未包含模型提供商"));
+    if !found {
+        return Err(invalid());
     }
-    Ok(())
+    rows.sort_by_key(|(row, _)| row["sort"].as_i64().unwrap_or(i64::MAX));
+    let default = config["defaultModel"]["modelId"].as_str().unwrap_or("");
+    let models: Vec<Value> = rows
+        .into_iter()
+        .map(|(row, origin)| model(row, default, origin))
+        .collect::<Result<_>>()?;
+    Ok(json!({ "models": models, "meta": { "remote": fetched > 0, "refreshed_at": fetched } }))
 }
 
-/// 当前目录：会话缓存 → 兜底。
-pub fn current() -> Catalog {
-    if let Ok(saved) = sdk::session_get(CACHE_KEY) {
-        if let Some(config) = saved.get("config").filter(|config| validate(config).is_ok()) {
-            return Catalog {
-                config: config.clone(),
-                fetched_at: saved.get("fetchedAt").and_then(Value::as_i64).unwrap_or(0),
-            };
+fn model(row: &Value, default: &str, origin: &str) -> Result<Value> {
+    let id = row["id"].as_str().ok_or_else(invalid)?;
+    let mut value = json!({ "id": id, "name": row["name"].as_str().unwrap_or(id),
+        "supportsToolCall": row["supportsToolCall"].as_bool().unwrap_or(true),
+        "supportsImages": row["supportsImage"].as_bool().unwrap_or(false),
+        "supportsReasoning": false, "isDefault": id == default, "quworkSchema": 1,
+        "quworkModelOrigin": origin });
+    for (target, source) in [
+        ("maxInputTokens", "contextWindow"),
+        ("maxOutputTokens", "maxTokens"),
+    ] {
+        if let Some(number) = row[source].as_u64().filter(|value| *value > 0) {
+            value[target] = json!(number);
         }
+    }
+    let mut compat = json!({});
+    for key in [
+        "supportsStore",
+        "supportsDeveloperRole",
+        "supportsReasoningEffort",
+        "requiresReasoningContentOnAssistantMessages",
+        "supportsStrictMode",
+    ] {
+        if let Some(value) = row["compat"][key].as_bool() {
+            compat[key] = json!(value);
+        }
+    }
+    for key in ["maxTokensField", "thinkingFormat"] {
+        if let Some(value) = row["compat"][key]
+            .as_str()
+            .filter(|value| value.len() <= 64 && !value.chars().any(char::is_control))
+        {
+            compat[key] = json!(value);
+        }
+    }
+    value["compat"] = compat;
+    if let Some(efforts) = row["reasoningEfforts"].as_object() {
+        if efforts.len() > 16 {
+            return Err(invalid());
+        }
+        let mut filtered = json!({});
+        for (key, wire) in efforts {
+            let wire = wire
+                .as_str()
+                .filter(|wire| {
+                    !wire.is_empty() && wire.len() <= 32 && !wire.chars().any(char::is_control)
+                })
+                .ok_or_else(invalid)?;
+            if key.is_empty() || key.len() > 32 || key.chars().any(char::is_control) {
+                return Err(invalid());
+            }
+            filtered[key] = json!(wire);
+        }
+        value["supportsReasoning"] = json!(!efforts.is_empty());
+        value["reasoningLevels"] = json!(efforts.keys().collect::<Vec<_>>());
+        value["reasoningEffortLevels"] = value["reasoningLevels"].clone();
+        value["reasoningEfforts"] = filtered;
+    }
+    Ok(value)
+}
+
+pub fn fallback() -> Result<Value> {
+    let config: Value = serde_json::from_str(include_str!("models.json")).map_err(|_| invalid())?;
+    list(&config, 0)
+}
+
+pub fn defaults() -> Vec<Value> {
+    fallback()
+        .ok()
+        .and_then(|list| list["models"].as_array().cloned())
+        .unwrap_or_default()
+}
+
+fn checked_rows(rows: &[Value]) -> bool {
+    rows.iter().all(|row| {
+        row["quworkSchema"] == 1
+            && row["quworkModelOrigin"]
+                .as_str()
+                .and_then(endpoints::model_origin)
+                .is_some()
+    })
+}
+
+pub fn cached() -> Result<Value> {
+    let cached = sdk::catalog::cached()?;
+    if cached["models"].is_array() && cached["meta"].is_object() {
+        // 真实空目录是禁用事实，不能回落成旧可用模型。
+        if cached["meta"]["remote"] == true
+            && cached["models"].as_array().is_some_and(Vec::is_empty)
+        {
+            return Ok(cached);
+        }
+        if cached["models"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty() && checked_rows(rows))
+        {
+            return Ok(cached);
+        }
+    }
+    // 旧原生缓存保存的是完整config；仅在它不旧于宿主快照时恢复兼容规则。
+    if let Ok(saved) = sdk::host("settings.get", json!({ "key": LEGACY_KEY })) {
+        let at = saved["fetchedAt"].as_i64().unwrap_or(0);
+        let current_at = cached["meta"]["refreshed_at"].as_i64().unwrap_or(0);
+        if cached["meta"]["remote"] != true || at >= current_at {
+            if let Ok(list) = list(&saved["config"], at) {
+                return Ok(list);
+            }
+        }
+    }
+    if cached["meta"]["remote"] == true && cached["models"].is_array() {
+        // 有远程快照但不含必要的兼容规则时保留其模型集合；对话要求先重新刷新。
+        return Ok(cached);
     }
     fallback()
 }
 
-impl Catalog {
-    /// 启用中的模型行（按 `sort` 排序）。
-    pub fn rows(&self) -> Vec<&Value> {
-        if self.config.get("enabled").and_then(Value::as_bool) != Some(true) {
-            return Vec::new();
-        }
-        let mut rows: Vec<&Value> = self
-            .config
-            .get("providers")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|provider| provider.get("id").and_then(Value::as_str) == Some("qurwork"))
-            .flat_map(|provider| provider.get("models").and_then(Value::as_array).into_iter().flatten())
-            .filter(|model| model.get("enabled").and_then(Value::as_bool) == Some(true))
-            .collect();
-        rows.sort_by_key(|row| row.get("sort").and_then(Value::as_i64).unwrap_or(i64::MAX));
-        rows
-    }
-
-    /// 按 id 找一行（对话前的白名单校验）。
-    pub fn model(&self, id: &str) -> Option<&Value> {
-        self.rows()
-            .into_iter()
-            .find(|row| row.get("id").and_then(Value::as_str) == Some(id))
-    }
-
-    /// 对外模型清单（`catalog.v1` 的形状）。
-    pub fn list(&self) -> Value {
-        let default = self
-            .config
-            .pointer("/defaultModel/modelId")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let models: Vec<Value> = self
-            .rows()
-            .into_iter()
-            .map(|row| {
-                let id = row.get("id").and_then(Value::as_str).unwrap_or("");
-                let efforts = row.get("reasoningEfforts").and_then(Value::as_object);
-                let mut model = json!({
-                    "id": id,
-                    "name": row.get("name").and_then(Value::as_str).unwrap_or(id),
-                    "supportsToolCall": true,
-                    "supportsImages": row.get("supportsImage").and_then(Value::as_bool).unwrap_or(false),
-                    "isDefault": id == default,
-                });
-                for (target, source) in [("maxInputTokens", "contextWindow"), ("maxOutputTokens", "maxTokens")] {
-                    if let Some(value) = row.get(source).and_then(Value::as_u64).filter(|value| *value > 0) {
-                        model[target] = json!(value);
-                    }
-                }
-                if let Some(efforts) = efforts {
-                    model["supportsReasoning"] = json!(true);
-                    model["reasoningLevels"] = json!(efforts.keys().collect::<Vec<_>>());
-                }
-                model
-            })
-            .collect();
-        json!({
-            "models": models,
-            "meta": { "remote": self.fetched_at > 0, "refreshed_at": self.fetched_at },
-        })
-    }
-}
-
-/// `models.list`。
-pub fn list() -> Value {
-    current().list()
-}
-
-/// `models.refresh`：拉公开目录并校验；失败如实回 `{refreshed:false,message}`。
 pub fn refresh(force: bool) -> Result<Value> {
-    let catalog = current();
-    if !force && catalog.fetched_at > 0 && sdk::now().saturating_sub(catalog.fetched_at) < TTL_MS {
-        return Ok(if catalog.list()["models"].as_array().is_some_and(|rows| rows.is_empty()) {
-            json!({ "refreshed": false, "message": "QuWork 当前未开放可用模型" })
-        } else {
-            json!({ "refreshed": false, "count": catalog.list()["models"].as_array().map(Vec::len).unwrap_or(0) })
-        });
+    let mut previous = cached()?;
+    if let Some(fields) = previous.as_object_mut() {
+        fields.remove("message");
     }
-    let config = match upstream::public_config() {
-        Ok(config) => config,
-        Err(error) => return Ok(json!({ "refreshed": false, "message": error.message })),
-    };
-    if let Err(error) = validate(&config) {
-        return Ok(json!({ "refreshed": false, "message": error.message }));
+    previous["refreshed"] = json!(false);
+    previous["count"] = json!(previous["models"].as_array().map(Vec::len).unwrap_or(0));
+    let age = sdk::now().saturating_sub(previous["meta"]["refreshed_at"].as_i64().unwrap_or(0));
+    if !force
+        && previous["meta"]["remote"] == true
+        && (0..TTL).contains(&age)
+        && previous["models"]
+            .as_array()
+            .is_some_and(|rows| checked_rows(rows))
+    {
+        return Ok(previous);
     }
-    let catalog = Catalog {
-        config,
-        fetched_at: sdk::now(),
-    };
-    let _ = sdk::session_put(
-        CACHE_KEY,
-        json!({ "config": catalog.config, "fetchedAt": catalog.fetched_at }),
-        TTL_MS,
-    );
-    let count = catalog.list()["models"].as_array().map(Vec::len).unwrap_or(0);
-    if count == 0 {
-        return Ok(json!({ "refreshed": false, "message": "QuWork 当前未开放可用模型，未发送任何模型请求" }));
+    match client::public_config().and_then(|config| list(&config, sdk::now())) {
+        Ok(mut list) => {
+            list["refreshed"] = json!(true);
+            list["count"] = json!(list["models"].as_array().map(Vec::len).unwrap_or(0));
+            Ok(list)
+        }
+        Err(error) => {
+            previous["message"] = json!(error.message);
+            Ok(previous)
+        }
     }
-    Ok(json!({ "refreshed": true, "count": count, "models": catalog.list()["models"] }))
+}
+
+pub fn find(requested: &str) -> Result<Value> {
+    let list = cached()?;
+    let row = list["models"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|row| {
+            row["id"].as_str() == Some(requested) || row["name"].as_str() == Some(requested)
+        })
+        .cloned()
+        .ok_or_else(|| {
+            Error::http(400, "QuWork 当前目录没有这个模型，请先刷新模型列表")
+                .with_code("local_precondition")
+        })?;
+    if row["quworkSchema"] != 1 {
+        return Err(
+            Error::http(400, "QuWork 目录缺少兼容规则，请先刷新模型列表")
+                .with_code("local_precondition"),
+        );
+    }
+    // 旧WASM清单没有来源字段时沿用原固定域名，不把升级变成必须手工刷新。
+    let origin = match row.get("quworkModelOrigin") {
+        Some(value) => value.as_str().and_then(endpoints::model_origin),
+        None => Some(endpoints::LEGACY_MODEL),
+    }
+    .ok_or_else(|| {
+        Error::http(400, "QuWork 模型来源尚未确认，请先刷新模型列表")
+            .with_code("local_precondition")
+    })?;
+    let mut row = row;
+    row["quworkModelOrigin"] = json!(origin);
+    Ok(row)
 }

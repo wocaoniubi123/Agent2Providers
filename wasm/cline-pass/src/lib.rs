@@ -1,57 +1,46 @@
-//! Cline **订阅池**（`cline-pass`）的 Wasm 插件实现。
-//!
-//! 迁移来源：`crates/providers/src/providers/cline/`（native，`ClineProvider::PASS`）。
-//!
-//! ── 与 `cline-free` 是同一份实现 ───────────────────────────
-//! 两个池在上游是**同一个账号上的两个额度池**，差别只在三处（provider id、
-//! 模型 id 前缀、免费池没有默认限流器）。所以本包不复制源码：下面每个
-//! `#[path = "../../cline-free/src/…"]` 都指向免费池那套模块，唯一的注入点是
-//! `POOL = Pool::Pass`。
-//!
-//! 为什么必须是两个包：网关装包要求一个 wasm 包只声明一个 provider
-//! （`provenance.rs:90`），而 cline-free 还有一条专属能力
-//! `credential.cline-free-refresh.v1` 只允许 cline-free 声明。拆包是唯一
-//! 能同时满足两者的形状（规格第 8 节的 A 方案）。
-//!
-//! ── 订阅池的续期 ────────────────────────────────────────────
-//! 与免费池同一条 `POST /api/v1/auth/refresh`；专属的宿主固定换证通道只服务
-//! cline-free，本包不申报 `credential.cline-free-refresh.v1`（申报了也不会
-//! 被 `manifest.rs` 接受 —— 那条能力与 provider id 硬绑定）。
-//!
-//! ── panic=abort ────────────────────────────────────────────
-//! 本模块在对话链路上，绝不 unwrap/expect/panic。
+//! 单独的Cline订阅池。只选本池账号与目录，不修改免费池入口或其余额限制。
+//! 订阅窗口与按量credit独立：credit不足不能默认跳过仍有订阅额度的账号。
 
-#[path = "../../cline-free/src/pool.rs"]
-mod pool;
-#[path = "../../cline-free/src/credentials.rs"]
-mod credentials;
-#[path = "../../cline-free/src/upstream.rs"]
-mod upstream;
-#[path = "../../cline-free/src/refresh.rs"]
-mod refresh;
-#[path = "../../cline-free/src/chat.rs"]
-mod chat;
-#[path = "../../cline-free/src/login.rs"]
-mod login;
-#[path = "../../cline-free/src/account.rs"]
+#[path = "../../cline-common/account.rs"]
 mod account;
-#[path = "../../cline-free/src/balance.rs"]
-mod balance;
-#[path = "../../cline-free/src/models.rs"]
+#[path = "../../cline-common/chat.rs"]
+mod chat;
+#[path = "../../cline-common/client.rs"]
+mod client;
+#[path = "../../cline-common/desktop.rs"]
+mod desktop;
+#[path = "../../cline-common/endpoints.rs"]
+mod endpoints;
+#[path = "../../cline-common/errors.rs"]
+mod errors;
+#[path = "../../cline-common/headers.rs"]
+mod headers;
+#[path = "../../cline-common/i18n.rs"]
+mod i18n;
+#[path = "../../cline-common/login.rs"]
+mod login;
+#[path = "../../cline-common/models.rs"]
 mod models;
+#[path = "../../cline-common/payload.rs"]
+mod payload;
+#[path = "../../cline-common/refresh.rs"]
+mod refresh;
+#[path = "../../cline-common/usage.rs"]
+mod usage;
 
 use agent2api_wasm_sdk::{self as sdk, json, Error, Result, Value};
-
+pub const PROVIDER_ID: &str = "cline-pass";
 sdk::export_provider!(handle);
 
-/// 本包服务的池。
-const POOL: pool::Pool = pool::Pool::Pass;
-
-/// 与 native 侧 `meta()` 逐字段一致（已按装包期硬校验修正过能力位）。
-const METADATA: &str = include_str!("metadata.json");
-
 fn metadata() -> Value {
-    serde_json::from_str(METADATA).unwrap_or(Value::Null)
+    json!({ "id": PROVIDER_ID, "label": "Cline 订阅池", "order": 18,
+        "capabilities": { "chat": true, "stateful": false, "refresh": true, "model_refresh": true,
+            "usage": true, "checkin": false, "claims": false, "web_login": true, "sse_model_rewrite": true,
+            "refresh_uses_account": false, "anonymous_default_session": false, "env_credentials": false },
+        "login_methods": [{ "kind": "browser", "button": "浏览器登录" }],
+        "account_features": { "usage": true, "identifier": ["uid", "account"], "expiry": ["expiresAt"],
+            "default_limiters": [] },
+        "admin_panels": ["upstream_headers"], "default_models": models::defaults() })
 }
 
 fn handle(method: &str, params: Value) -> Result<Value> {
@@ -59,77 +48,44 @@ fn handle(method: &str, params: Value) -> Result<Value> {
         "init" => Ok(json!([metadata()])),
         "ping" => Ok(json!(true)),
         "provider.info" => Ok(metadata()),
-
-        // ── 账号面 ──────────────────────────────────────────
-        "account.normalize" => account::normalize(&params, POOL),
-        "account.view" => Ok(credentials::public(&params["secret"])),
-        "account.identity" => Ok(json!(credentials::identity(&params["secret"]))),
-
-        // ── 凭据 ────────────────────────────────────────────
-        "token.ensure" => {
-            let credentials = refresh::ensure(false)?;
-            Ok(json!(credentials.bearer_token()))
-        }
-        "token.refresh" => {
-            let credentials = refresh::ensure(true)?;
-            Ok(json!(credentials.bearer_token()))
-        }
-        "token.expiring" => {
-            let secret = params.get("secret").cloned().unwrap_or_else(|| params.clone());
-            let credentials = credentials::from_secret(&secret);
-            Ok(json!(credentials.can_refresh() && credentials.is_expiring()))
-        }
-
-        // ── 目录 ────────────────────────────────────────────
-        "models.list" => Ok(models::list(&metadata(), POOL)),
-        "models.refresh" => Ok(models::refresh(params["force"].as_bool().unwrap_or(false), &metadata(), POOL)),
-
-        // ── 额度 ────────────────────────────────────────────
-        "usage.query" => balance::query(POOL),
-
-        // ── 对话 ────────────────────────────────────────────
+        "admin.action" if params["action"] == "auth.methods" => Ok(i18n::methods(
+            params["payload"]["locale"].as_str().unwrap_or("zh-CN"),
+        )),
+        "admin.action" if params["action"] == "headers.preview" => headers::preview(),
+        "admin.action" if params["action"] == "quota.sources" => Ok(usage::sources(
+            params["payload"]
+                .get("report")
+                .unwrap_or(&params["payload"]),
+        )),
+        "account.normalize" => account::normalize(&params),
+        "account.view" => Ok(account::view(&params["secret"])),
+        "account.identity" => Ok(json!(account::identity(&params["secret"]))),
+        "token.ensure" => Ok(json!(refresh::token(false)?)),
+        "token.refresh" => Ok(json!(refresh::token(true)?)),
+        "token.expiring" => Ok(json!(refresh::due()?)),
+        "login.start" => login::start(&params),
+        "login.poll" => login::poll(&params),
+        "login.cancel" => login::cancel(),
+        "models.list" => models::cached(),
+        "models.refresh" => models::refresh(),
+        "usage.query" => usage::query(),
         "conversation" => {
             chat::forward(&params)?;
             Ok(Value::Null)
         }
-
-        // ── 登录 ────────────────────────────────────────────
-        "login.start" => login::start(&params),
-        "login.poll" => login::poll(&params),
-        "login.callback" => login::callback(&params),
-        "login.cancel" => login::cancel(&params),
-
-        // ── 管理动作 ────────────────────────────────────────
-        "admin.action" => admin_action(&params),
-
-        // ── 错误分类与策略 ──────────────────────────────────
-        "classify" => Ok(upstream::classify(
+        "classify" => Ok(errors::classify(
             params["status"].as_u64().unwrap_or(502) as u16,
             &params["body"],
         )),
-        "is_error_response" => Ok(json!(params["status"].as_u64().unwrap_or(0) >= 400)),
-        "error.policy" => Ok(json!({ "stop": false })),
-        "retry_advice" => Ok(Value::Null),
+        "is_error_response" => Ok(json!(params["status"].as_u64().unwrap_or(502) >= 400)),
+        "error.policy" => Ok(json!({ "stop": errors::stop_retry(&params["body"]) })),
         "retry.decision" => Ok(json!({ "action": "default" })),
+        "retry_advice" => Ok(Value::Null),
         "cooldown_models" => Ok(json!({ "models": [] })),
-        "reasoning_patch" => Ok(json!({
-            "action": "skip",
-            "reason": "Cline 的思考档位按请求体白名单透传，插件不额外注入"
-        })),
+        "reasoning_patch" => Ok(
+            json!({ "action": "skip", "reason": "Cline 保留客户端思考参数，未指定时沿用原生high默认值" }),
+        ),
         "images.capabilities" => Ok(json!({ "generation": false, "editing": false })),
-
         _ => Err(Error::unsupported()),
-    }
-}
-
-/// 管理动作：登录方式与额度来源。
-fn admin_action(params: &Value) -> Result<Value> {
-    match params["action"].as_str().unwrap_or("") {
-        "auth.methods" => Ok(login::methods()),
-        "quota.sources" => Ok(json!([])),
-        other => Err(Error::http(
-            400,
-            format!("Cline 不认识管理动作「{other}」（可用：auth.methods / quota.sources）"),
-        )),
     }
 }

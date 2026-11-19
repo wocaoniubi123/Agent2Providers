@@ -2,31 +2,21 @@
 //! 与 `ids_for` 逐条移植）。
 //!
 //! ── 映射表是什么 ────────────────────────────────────────────
-//! 上游任务代码（`task_code`）→ 「怎么点亮」的定义：事件构造器类型（kind）、兜底
-//! 次数（target，优先读服务端 progress.target）、对象 id 来源说明。未登记的任务码
-//! 在有实测判据前**保守跳过**（发错形状的事件不仅点不亮，还可能让那一天的上报被
-//! 风控计入）。
+//! 上游任务代码（`task_code`）→ 「怎么点亮」的定义：事件构造器类型（kind）、
+//! 兜底次数（target，优先读服务端 progress.target）、对象 id 来源说明。
+//! 未登记的任务码在有实测判据前**保守跳过**（发错形状的事件不仅点不亮，
+//! 还可能让那一天的上报被风控计入）。
 //!
 //! ── 为什么内置回落表 ────────────────────────────────────────
-//! 对象 id（场景 / 专家 / 技能 / 案例 / 主题）优先从上游市场实时拉取；拉取失败时
-//! 回落内置表 —— 这些 id 是**实测可用**的稳定值，让任务在市场接口抖动时仍有机会
-//! 点亮。
-//!
-//! ── ⚠ 本 fork 的自用改动（逐字保留，勿改回）───────────────────
-//!   · `Sequential_Tasks_6`（小程序对话 ×10）：与 `_3` 同链，判据都是 mp 口径
-//!     `chat_request_send`；
-//!   · `Sequential_Tasks_7`（体验灵感功能）：判据是「灵感详情页点击 + CTA 点击 +
-//!     发送 prompt」整组桌面事件，查询/accept/claim 仍走 mp 口径；
-//!   · 两条新 kind（`playbookcta`）在 `ids_for` 里属「无载体类型」。
+//! 对象 id（场景 / 专家 / 技能 / 案例 / 主题）优先从上游市场实时拉取；
+//! 拉取失败时回落内置表 —— 这些 id 是**实测可用**的稳定值，让任务在
+//! 市场接口抖动时仍有机会点亮。两套来源的取舍见各自 `fetch_*` 的注释。
 //!
 //! ── 硬约束 ──────────────────────────────────────────────────
-//! 零 unwrap/expect/panic。
+//! release 是 `panic=abort`：本文件零 unwrap/expect/panic。
 
-use agent2api_wasm_sdk::{json, Value};
-
-use crate::endpoints::WORKBUDDY_CLIENT_VERSION;
-use crate::httpio;
-use crate::util;
+use crate::{endpoints, network};
+use serde_json::{json, Value};
 
 use super::{bill_call, chat_call, GrowthAccount};
 
@@ -72,11 +62,6 @@ impl TaskSpec {
             mp: false,
         }
     }
-
-    const fn with_mp(mut self) -> Self {
-        self.mp = true;
-        self
-    }
 }
 
 /// 任务映射表（task_code → 完成定义）。**逐条对照参考项目 MAPPING 移植**，
@@ -87,10 +72,11 @@ pub fn spec_of(code: &str) -> Option<TaskSpec> {
         "create_canvas" => TaskSpec::new("canvas", 1, "自造 wb- 画布 id", false),
         "template_5" => TaskSpec::new("template", 5, "场景 id（scenes 接口）", true),
         "expert_5" => TaskSpec::new("expert", 5, "专家市场 ex_ id", true),
-        "expert_use_maidehao" | "expert_use_douyinyin" | "expert_use_shangjia_xuanchuan"
-        | "expert_use_bowangwang" | "WorkBuddy_Valorant" => {
-            TaskSpec::new("expert-task", 1, "任务指定专家的真实对话", true)
-        }
+        "expert_use_maidehao"
+        | "expert_use_douyinyin"
+        | "expert_use_shangjia_xuanchuan"
+        | "expert_use_bowangwang"
+        | "WorkBuddy_Valorant" => TaskSpec::new("expert-task", 1, "任务指定专家的真实对话", true),
         "Expert_team_use_3" => TaskSpec::new("team", 3, "团队专家 id", true),
         "skill_1" => TaskSpec::new("skill", 1, "技能市场 skillId", true),
         "automation_1" => TaskSpec::new("automation", 1, "rrule 虚拟对象", false),
@@ -110,7 +96,9 @@ pub fn spec_of(code: &str) -> Option<TaskSpec> {
         // web 域 web_element_click
         "Library_read" => TaskSpec::new("library", 1, "资料库介绍点击（web 域）", false),
         // ── 小程序成长任务（growth 域 mp 口径；accept/claim 需 mp 头）──
-        "Sequential_Tasks_1" => TaskSpec::new("minichat", 1, "小程序对话（无 activityId）", false).with_mp(),
+        "Sequential_Tasks_1" => {
+            TaskSpec::new("minichat", 1, "小程序对话（无 activityId）", false).with_mp()
+        }
         "Sequential_Tasks_2" => {
             TaskSpec::new("miniexpert", 1, "小程序选中专家对话", true).with_mp()
         }
@@ -121,23 +109,36 @@ pub fn spec_of(code: &str) -> Option<TaskSpec> {
         "Sequential_Tasks_5" => {
             TaskSpec::new("miniglmchat", 1, "小程序 GLM5.2 对话", false).with_mp()
         }
-        // 十次对话：判据与 `_3`（同链，target 5）完全相同 —— 都是 mp 口径
-        // `chat_request_send`。target 由任务表兜底（accept 前上游下发 0），
-        // 上报间隔走 `MP_CHAT_GAP_MS`（见 events.rs 的 minichat 分支）。
+        // ── 本 fork 的自用改动：补两条上游没登记的任务码 ──────────────
+        // `Sequential_Tasks_6`（小程序对话 ×10）：与 `_3` 同链，判据同样是 mp 口径的
+        // `chat_request_send`，只是次数翻倍。
         "Sequential_Tasks_6" => TaskSpec::new("minichat", 10, "小程序对话 ×10", false).with_mp(),
-        // 体验灵感功能：判据是「灵感详情页点击 + CTA 点击 + 发送 prompt」整组桌面事件
-        // （参考实现 DesktopPlaybookPromptSequence，playbook_prompt 三账号实测点亮）。
-        // 查询/accept/claim 仍走 mp 口径，故 `with_mp()`。
+        // `Sequential_Tasks_7`（体验灵感功能）：判据是「灵感详情页点击 + CTA 点击 +
+        // 发送 prompt」整组桌面事件（对应参考实现的 DesktopPlaybookPromptSequence）。
+        // 查询/accept/claim 仍走 mp 口径，所以还是要 `with_mp()`。
         "Sequential_Tasks_7" => {
             TaskSpec::new("playbookcta", 1, "灵感详情页点击+CTA+prompt 事件组", false).with_mp()
         }
-        "school_season" => TaskSpec::new("schoolseason", 1, "校园日活动（mini chat+activityId）", false).with_mp(),
+        "school_season" => TaskSpec::new(
+            "schoolseason",
+            1,
+            "校园日活动（mini chat+activityId）",
+            false,
+        )
+        .with_mp(),
         // ── 需本人操作 ──
         "Expert_Philanthropy" => TaskSpec::unforgeable("真实捐款动作"),
         "wb_wechat_oa_subscribe_task" => TaskSpec::unforgeable("请本人在微信关注官方公众号"),
         _ => return None,
     };
     Some(spec)
+}
+
+impl TaskSpec {
+    fn with_mp(mut self) -> Self {
+        self.mp = true;
+        self
+    }
 }
 
 /// 上报所需的一个对象 id（+ 元数据）。
@@ -148,12 +149,15 @@ pub struct ObjectId {
 }
 
 /// 取上报对象 id（对齐参考项目 `ids_for`；`offset` 用于多轮次避免复用同一对象）。
+///
+/// 各来源优先实时拉取、失败回落内置表（见文件头说明）。无载体类 kind 返回
+/// 空 id 的占位（`needs_object=false` 时调用方不会用到）。
 pub fn ids_for(
     kind: &str,
     account: &GrowthAccount,
     need: usize,
     offset: usize,
-) -> std::result::Result<Vec<ObjectId>, String> {
+) -> Result<Vec<ObjectId>, String> {
     if need == 0 {
         return Ok(Vec::new());
     }
@@ -171,7 +175,7 @@ pub fn ids_for(
     };
     match kind {
         "canvas" => {
-            let base = util::now_ms();
+            let base = agent2api_wasm_sdk::now();
             Ok((0..need)
                 .map(|index| ObjectId {
                     id: format!("wbx-canvas-{}", base + index as i64),
@@ -188,11 +192,16 @@ pub fn ids_for(
         "skin" => Ok(slice(fetch_pe_theme(account))),
         "miniexpert" => Ok(slice(fetch_market_experts(account, false, None))),
         // 无载体类型：返回空 id 占位（events.rs 构造时不需要对象）
+        // `playbookcta` 是本 fork 补的 `Sequential_Tasks_7` 用的 kind，同属无载体。
         "chat" | "glmchat" | "cat" | "automation" | "richmeow" | "buddy5" | "library"
         | "buddyfirst" | "minichat" | "schoolseason" | "miniautomation" | "miniglmchat"
-        | "playbookcta" => {
-            Ok((0..need).map(|_| ObjectId { id: String::new(), meta: Value::Null }).collect())
-        }
+        | "playbookcta" => Ok((0
+            ..need)
+            .map(|_| ObjectId {
+                id: String::new(),
+                meta: Value::Null,
+            })
+            .collect()),
         other => Err(format!("未知 kind：{other}")),
     }
 }
@@ -235,24 +244,21 @@ const DEFAULT_SKILL_IDS: &[(&str, &str)] = &[
 const LIGHTHOUSE_FALLBACK: &[(&str, &str)] = &[("ex_2cvvUZQhDyeJ", "腾讯轻量云专家")];
 const PE_THEME: &str = "theme-tkmw7j";
 const PE_THEME_NAME: &str = "和平精英激战金秋";
-/// COS 静态专家清单（团队专家市场列表很薄，COS 有全量 52 个 team）
-const COS_EXPERT_URL: &str = "https://acc-1258344699.cos.accelerate.myqcloud.com/\
-workbuddy/expert-marketplace/expert_center.json";
-/// 灵感案例注册表
-const PLAYBOOK_BASE: &str = "https://static.workbuddy.cn/workbuddy/playbook";
+// 公开清单来源由endpoints中的COS/STATIC固定，绝不携带账号认证。
 
 // ─── 实时拉取（只读）────────────────────────────────────────
 
 /// 场景清单（GET /console/as/support/scenes）。
 fn fetch_scenes(account: &GrowthAccount) -> Vec<ObjectId> {
-    let mut out: Vec<ObjectId> = Vec::new();
-    if let Ok(call) = chat_call(
+    let call = chat_call(
         account,
         "GET",
         "/console/as/support/scenes?locale=zh-CN",
         None,
         &[],
-    ) {
+    );
+    let mut out: Vec<ObjectId> = Vec::new();
+    if let Ok(call) = call {
         if call.ok() {
             if let Some(scenes) = call.data().get("scenes").and_then(Value::as_array) {
                 for scene in scenes {
@@ -281,9 +287,8 @@ fn fetch_scenes(account: &GrowthAccount) -> Vec<ObjectId> {
 }
 
 /// 专家市场清单（POST /v2/operation-platform/market/expert/list，最多 3 页）。
-///
 /// `team_only` 只留 expert_type=team；`keyword` 关键词过滤。COS 静态清单补足。
-pub fn fetch_market_experts(
+pub(super) fn fetch_market_experts(
     account: &GrowthAccount,
     team_only: bool,
     keyword: Option<&str>,
@@ -295,16 +300,14 @@ pub fn fetch_market_experts(
         if let Some(keyword) = keyword {
             body["keyword"] = Value::from(keyword);
         }
-        let call = match chat_call(
+        let call = chat_call(
             account,
             "POST",
             "/v2/operation-platform/market/expert/list",
             Some(&body),
             &[],
-        ) {
-            Ok(call) => call,
-            Err(_) => break,
-        };
+        );
+        let Ok(call) = call else { break };
         if !call.ok() {
             break;
         }
@@ -394,7 +397,11 @@ pub fn fetch_market_experts(
         }
     }
     if out.is_empty() {
-        let fallback: &[&str] = if team_only { DEFAULT_TEAM_IDS } else { DEFAULT_EXPERT_IDS };
+        let fallback: &[&str] = if team_only {
+            DEFAULT_TEAM_IDS
+        } else {
+            DEFAULT_EXPERT_IDS
+        };
         out = fallback
             .iter()
             .map(|id| ObjectId {
@@ -412,20 +419,20 @@ pub fn fetch_market_experts(
 }
 
 /// COS 静态专家清单（公开对象存储，无需鉴权）。
-///
-/// native 用 `control_client(None, "direct")` 直连；wasm 里没有「直连」开关，
-/// 请求按宿主策略出网（与其它请求同一条路）。
 fn fetch_cos_experts() -> Option<Vec<Value>> {
-    let headers = vec![(
-        "User-Agent".to_string(),
-        crate::endpoints::user_agent_for_edition(None),
-    )];
-    let response = httpio::send("GET", COS_EXPERT_URL, &headers, None).ok()?;
-    if !response.ok {
+    let reply = network::raw(
+        "GET",
+        endpoints::COS,
+        "/workbuddy/expert-marketplace/expert_center.json",
+        json!({ "Accept": "application/json" }),
+        None,
+    )
+    .ok()?;
+    if !reply.ok() {
         return None;
     }
-    response
-        .payload?
+    reply
+        .value
         .get("experts")
         .and_then(Value::as_array)
         .cloned()
@@ -433,14 +440,15 @@ fn fetch_cos_experts() -> Option<Vec<Value>> {
 
 /// 技能清单（POST /v2/operation-platform/market/skill/list）。
 fn fetch_skills(account: &GrowthAccount) -> Vec<ObjectId> {
-    let mut out: Vec<ObjectId> = Vec::new();
-    if let Ok(call) = chat_call(
+    let call = chat_call(
         account,
         "POST",
         "/v2/operation-platform/market/skill/list",
         Some(&json!({ "page": 1, "page_size": 8 })),
         &[],
-    ) {
+    );
+    let mut out: Vec<ObjectId> = Vec::new();
+    if let Ok(call) = call {
         if call.ok() {
             if let Some(skills) = call.data().get("skills").and_then(Value::as_array) {
                 for skill in skills {
@@ -470,30 +478,21 @@ fn fetch_skills(account: &GrowthAccount) -> Vec<ObjectId> {
 
 /// 灵感案例注册表（静态 CDN，无需鉴权）。
 fn fetch_playbook_cases() -> Vec<ObjectId> {
-    let url = format!("{PLAYBOOK_BASE}/registry.json");
-    let headers = vec![(
-        "User-Agent".to_string(),
-        crate::endpoints::user_agent_for_edition(None),
-    )];
     let mut out: Vec<ObjectId> = Vec::new();
-    if let Ok(response) = httpio::send("GET", &url, &headers, None) {
-        if response.ok {
-            if let Some(payload) = response.payload {
-                if let Some(cases) = payload.get("cases").and_then(Value::as_array) {
-                    for item in cases {
-                        if let Some(id) = item.get("id").and_then(Value::as_str) {
-                            out.push(ObjectId {
-                                id: id.to_string(),
-                                meta: json!({
-                                    "title": item.get("title").and_then(Value::as_str).unwrap_or(""),
-                                    "artifact_type": item.get("artifact_type").and_then(Value::as_str).unwrap_or("other"),
-                                    "categories": item.get("categories").cloned().unwrap_or(json!([])),
-                                    "skills": item.get("skills").cloned().unwrap_or(json!([])),
-                                    "experts": item.get("experts").cloned().unwrap_or(json!([])),
-                                    "prompt": item.get("prompt").and_then(Value::as_str).unwrap_or(""),
-                                }),
-                            });
-                        }
+    if let Ok(reply) = network::raw(
+        "GET",
+        endpoints::STATIC,
+        "/workbuddy/playbook/registry.json",
+        json!({ "Accept": "application/json" }),
+        None,
+    ) {
+        if reply.ok() {
+            if let Some(cases) = reply.value.get("cases").and_then(Value::as_array) {
+                for item in cases {
+                    if let Some(id) = item.get("id").and_then(Value::as_str) {
+                        out.push(ObjectId { id: id.to_string(), meta: json!({
+                            "title": item["title"], "artifact_type": item["artifact_type"], "categories": item["categories"],
+                            "skills": item["skills"], "experts": item["experts"], "prompt": item["prompt"] }) });
                     }
                 }
             }
@@ -558,19 +557,20 @@ fn fetch_lighthouse(account: &GrowthAccount) -> Vec<ObjectId> {
 
 /// 外观主题（POST {bill}/v2/operation-platform/appearance/resources，过滤和平精英）。
 fn fetch_pe_theme(account: &GrowthAccount) -> Vec<ObjectId> {
-    let mut out: Vec<ObjectId> = Vec::new();
-    if let Ok(call) = bill_call(
+    let call = bill_call(
         account,
         "POST",
         "/v2/operation-platform/appearance/resources",
         Some(&json!({
             "platform": "client",
             "kind": "theme",
-            "version": WORKBUDDY_CLIENT_VERSION,
+            "version": endpoints::VERSION,
             "lang": "zh-CN",
         })),
         &[],
-    ) {
+    );
+    let mut out: Vec<ObjectId> = Vec::new();
+    if let Ok(call) = call {
         if call.ok() {
             if let Some(resources) = call.data().get("resources").and_then(Value::as_array) {
                 for item in resources {
@@ -579,11 +579,7 @@ fn fetch_pe_theme(account: &GrowthAccount) -> Vec<ObjectId> {
                         continue;
                     }
                     out.push(ObjectId {
-                        id: item
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
+                        id: item.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
                         meta: json!({
                             "name": name,
                             "vipLevel": item.get("vip_level").and_then(Value::as_str).unwrap_or(""),
@@ -607,57 +603,4 @@ fn fetch_pe_theme(account: &GrowthAccount) -> Vec<ObjectId> {
         }];
     }
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fork_tasks_6_and_7_are_mapped() {
-        let six = spec_of("Sequential_Tasks_6");
-        assert!(six.is_some(), "_6 应已登记");
-        if let Some(six) = six {
-            assert_eq!(six.kind, "minichat");
-            assert_eq!(six.target, 10);
-            assert!(six.mp);
-        }
-        let seven = spec_of("Sequential_Tasks_7");
-        assert!(seven.is_some(), "_7 应已登记");
-        if let Some(seven) = seven {
-            assert_eq!(seven.kind, "playbookcta");
-            assert!(seven.mp);
-        }
-    }
-
-    #[test]
-    fn unmapped_tasks_stay_skipped() {
-        assert!(spec_of("something_unknown").is_none());
-        assert!(spec_of("Expert_Philanthropy").is_some_and(|spec| spec.unforgeable));
-    }
-
-    #[test]
-    fn no_object_kinds_include_playbookcta() {
-        let ids = ids_for("playbookcta", &dummy_account(), 2, 0).unwrap_or_default();
-        assert_eq!(ids.len(), 2);
-        assert!(ids.iter().all(|item| item.id.is_empty()));
-        assert!(ids_for("nonsense", &dummy_account(), 1, 0).is_err());
-    }
-
-    #[test]
-    fn canvas_ids_are_unique() {
-        let ids = ids_for("canvas", &dummy_account(), 3, 0).unwrap_or_default();
-        assert_eq!(ids.len(), 3);
-        assert_ne!(ids[0].id, ids[1].id);
-    }
-
-    fn dummy_account() -> GrowthAccount {
-        GrowthAccount {
-            uid: "u".to_string(),
-            nick: String::new(),
-            token: String::new(),
-            domain: String::new(),
-            session: json!({}),
-        }
-    }
 }

@@ -1,212 +1,122 @@
-//! Qoder 中国版 的 Wasm 插件实现。
-//!
-//! 迁移来源：`crates/providers/src/providers/qoder/`（native，21 个文件）。
-//! 本包只申报 `qoder` 一个 provider id（网关硬性要求 wasm 包的
-//! `providers.len() == 1`）；native 目录里同时导出的 `qoder-intl` / `qwenwork` /
-//! `qwenwork-intl` 不在本包范围内 —— 相关分支（国际版的作业令牌分流、UMID
-//! 设备风控、千问办公的 `qwork` 目录与积分池）整体不迁，原因逐处写在各模块头。
-//!
-//! ── 与 native 的对应关系 ────────────────────────────────────
-//! `meta()` → `metadata()`；`build_chat()` → `chat` / `conversation`；
-//! `ensure_token()` → `token.ensure`；`refresh()` → `token.refresh`；
-//! `expiring()` → `token.expiring`；`classify()` → `classify`；
-//! `models()` → `models.list`；`refresh_models()` → `models.refresh`；
-//! `usage()` → `usage.query`；`checkin()` → `checkin.claim`；
-//! `normalize_account()` → `account.normalize`；`account_view()` → `account.view`；
-//! `account_identity()` → `account.identity`；`login.*` → `login.*`；
-//! `admin.action` → `admin.action`；`claim_status()` / `claim()` →
-//! `claim.status` / `claim`。
-//!
-//! ── 子模块 ─────────────────────────────────────────────────
-//!   site.rs        站点常量（单站点裁剪版 endpoints）
-//!   crypto.rs      纯 Rust 的 base64 / MD5 / AES-128-CBC / RSA / 随机源
-//!   cosy.rs        COSY 请求签名 + 请求体编码
-//!   machine.rs     设备标识
-//!   credentials.rs 凭证格式（兼容 Qoder-Proxy 的 access/refresh）
-//!   auth.rs        PAT 换取令牌 / 用户资料 / 通用请求
-//!   refresh.rs     续期（账号锁 + 比较再写）
-//!   account.rs     账号面（归一化 / 公开视图 / 身份 / ensure）
-//!   models.rs      模型目录（静态兜底 + 远程刷新）
-//!   protocol.rs    OpenAI ↔ Qoder 协议转换（消息/tools/思考档位/上游信封）
-//!   context.rs     上下文档位（200K/400K/1M）
-//!   errors.rs      上游错误分类（状态码 + 业务码表 + 排队态判定）
-//!   stream.rs      上游 SSE 信封解包 + 思考标签拆解（跨分片）
-//!   chat.rs        会话式转发（预读 → 报头 → 翻译 → 收尾）
-//!   usage.rs       额度查询
-//!   checkin.rs     每日签到（campaign 领取）
-//!   claims.rs      活动福利（清单 + 领取 + 台账）
-//!   login.rs       设备授权登录（PKCE 轮询）
-//!
-//! ── 硬约束 ──────────────────────────────────────────────────
-//! 依赖只有 `agent2api-wasm-sdk` / `serde_json` / `sha2` / `chrono`；
-//! 零 unwrap/expect/panic（宿主按 abort 处理）。
-
+//! Qoder 中国版单身份 Wasm。COSY/SSE/设备 PKCE 均通过受控宿主；无 WASI/线程/读盘。
+//! 仅国内分支，签到不装 runtime-info，不复用国际/千问账号、目录或设备风控票据。
 mod account;
 mod auth;
+mod benefits;
+mod campaigns;
+mod catalog;
 mod chat;
 mod checkin;
 mod claims;
+mod client;
+mod config;
 mod context;
 mod cosy;
 mod credentials;
-mod crypto;
+mod endpoints;
 mod errors;
 mod login;
-mod machine;
+mod login_methods;
+mod messages;
 mod models;
+mod output;
 mod protocol;
+mod reasoning;
 mod refresh;
-mod site;
-mod stream;
+mod thinking;
 mod usage;
+mod util;
 
 use agent2api_wasm_sdk::{self as sdk, json, Error, Result, Value};
-
 sdk::export_provider!(handle);
 
-/// 与 native 侧 `meta()` 逐字段一致（`metadata.json` 已按 native 的 `meta()`
-/// 产出：capabilities / login_methods / checkin / account_features / default_models）。
-const METADATA: &str = include_str!("metadata.json");
-
-/// 解析随包的元数据。解析失败给 `Null`（宿主会把它当成「没有元数据」，
-/// 比 abort 好，也不做 unwrap）。
-///
-/// 解析结果只做一次（`OnceLock`）：`models::fallback()` 会在每次 `models.list`
-/// 与模型解析时读 `default_models`，重复解析一份 8 KiB 的 JSON 是白花的开销。
-pub(crate) fn metadata() -> Value {
-    static PARSED: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
-    PARSED
-        .get_or_init(|| serde_json::from_str(METADATA).unwrap_or(Value::Null))
-        .clone()
+fn metadata() -> Value {
+    json!({ "id": endpoints::PROVIDER, "label": endpoints::LABEL, "order": 22,
+        "capabilities": { "chat": true, "stateful": true, "refresh": true, "model_refresh": true,
+            "usage": true, "checkin": true, "claims": true, "web_login": true,
+            "sse_model_rewrite": false, "sse_strip_newline_chunks": false, "anonymous_default_session": false,
+            "system_proxy_when_unset": false, "refresh_uses_account": true, "supports_default_model": false, "env_credentials": false },
+        "login_methods": [{ "kind": "browser", "button": "网页登录", "hint": "Qoder 中国版 PKCE 设备授权，无本机回调" },
+            { "kind": "token", "label": "个人访问令牌（PAT）", "placeholder": "Qoder 中国版 PAT", "extra_fields": [] }],
+        "account_features": { "usage": true, "credit_detail": true, "edition": true,
+            "identifier": ["uid", "userId"], "expiry": ["expiresAt"], "email_as_name": true },
+        "checkin": { "description": "国内每日 Credits 活动领取，每天 10:00 更新；限时福利另行点名领取", "daily": true, "modes": ["checkin"] },
+        "default_models": catalog::public(&catalog::fallback()),
+        "settings_schema": config::schema(), "settings_group": { "label": endpoints::LABEL } })
 }
-
-/// 通用思考档位表（与网关 `EFFORT_LEVELS` 逐字相同）。
-///
-/// 只用于 `reasoning_patch` 判「这个值值不值得注入」—— 本家对未知档位不报错
-/// （回退到模型默认档），所以注入表外值不会弄坏请求，但也不会生效，日志里却
-/// 会出现一行「已注入」。那正是「绑了没生效还查不出」的典型来源。
-const EFFORT_LEVELS: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max"];
-
-/// 映射上绑的思考等级注入到请求体的哪个键。
-///
-/// `protocol::resolve_thinking` 认 `reasoning_effort` / `reasoning` / `thinking`
-/// 三个键，选 `reasoning_effort` 的理由：它是最标准、客户端最常传的那个，
-/// 注入与「客户端已指定」在 body 上同形。
-const REASONING_FIELD: &str = "reasoning_effort";
-
-/// 思考等级绑定 → `reasoning_effort`（值**原样**交给本家的归一逻辑）。
-///
-/// ── 为什么本家不做档位映射 ────────────────────────────────────
-/// 「这一家收哪些档位」在 Qoder 是**模型级**知识：上游目录每个模型条目自己
-/// 声明 `thinking_config.enabled.efforts`（Qwen3.8 系列是 low / medium /
-/// xhigh），`protocol::resolve_thinking` 已经按它归一与回退。在这里再折一层
-/// 等于把同一件事做两遍，而且**必然做错**：适配器这一层只看得到模型名字，
-/// 拿不到那个模型声明的档位表。
-fn reasoning_patch(params: &Value) -> Value {
-    let level = params["level"]
-        .as_str()
-        .or_else(|| params["reasoning"].as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    let body = &params["body"];
-    if protocol::client_specified_reasoning(body) {
-        return json!({
-            "action": "skip",
-            "reason": "客户端请求体里已指定思考档位，绑定不覆盖",
-        });
-    }
-    if level.is_empty() || !EFFORT_LEVELS.iter().any(|known| known.eq_ignore_ascii_case(&level)) {
-        return json!({
-            "action": "skip",
-            "reason": "该等级不在通用候选表内，本家无法判断上游收不收（档位由各模型自己声明）",
-        });
-    }
-    json!({
-        "action": "set",
-        "field": REASONING_FIELD,
-        "value": level,
-    })
-}
-
-/// `admin.action`：厂商专属、网关不该认识的动作。
-///
-/// ── 为什么走这个通道而不加独立方法 ────────────────────────────
-/// 组件（`risk.*`）是**机器级**的，既不是某个账号的属性，也不属于任何一次
-/// 转发。`admin.action` 正是为这类动作准备的通用通道。
-///
-/// ── 本包支持哪些 ────────────────────────────────────────────
-///   - `auth.methods`：添加账号弹窗里的登录方式（按 locale 选文案）；
-///   - `quota.sources`：额度来源申报（本家不上报，回空数组）；
-///   - `risk.status` / `risk.install`：**国际版专用**（UMID 设备风控组件，
-///     靠本机子进程生成 `Cosy-MachineToken`）。中国版不需要风控头就能领签到，
-///     wasm 里也起不了子进程 —— 如实回一句「中国版不需要」。
-fn admin(params: &Value) -> Result<Value> {
-    match params["action"].as_str().unwrap_or("") {
-        "auth.methods" => {
-            let locale = params["payload"]["locale"].as_str().unwrap_or("zh-CN");
-            let _ = locale;
-            Ok(login::methods())
-        }
-        "quota.sources" => Ok(json!([])),
-        "risk.status" | "risk.install" => Err(Error::coded(
-            "Qoder 中国版不需要设备风控组件（UMID 只在国际版签到链路里用到）",
-            "unsupported",
-        )),
-        other => Err(Error::coded(
-            format!("Qoder 中国版 不认识管理动作「{other}」（可用：auth.methods / quota.sources）"),
-            "unsupported",
-        )),
-    }
-}
-
 fn handle(method: &str, params: Value) -> Result<Value> {
+    if params
+        .get("provider")
+        .is_some_and(|value| !value.is_null() && value != "" && value != endpoints::PROVIDER)
+    {
+        return Err(Error::coded("当前插件只处理 Qoder 中国版", "forbidden"));
+    }
     match method {
         "init" => Ok(json!([metadata()])),
         "ping" => Ok(json!(true)),
         "provider.info" => Ok(metadata()),
-        "admin.action" => admin(&params),
         "account.normalize" => account::normalize(&params),
-        "account.view" => Ok(account::view(&params["secret"])),
-        "account.identity" => Ok(json!(account::identity(&params["secret"]))),
-        "token.ensure" => Ok(json!(account::ensure()?)),
-        "token.refresh" => Ok(json!(account::refresh()?)),
-        "token.expiring" => Ok(json!(account::expiring(&params["secret"]))),
-        "models.list" => models::list_response(),
-        "models.refresh" => models::refresh(params["force"].as_bool().unwrap_or(false)),
+        "account.view" => account::view(&params["secret"]),
+        "account.identity" => account::identity(&params["secret"]).map(|id| json!(id)),
+        "token.ensure" => refresh::ensure(false).map(|snapshot| json!(snapshot.credentials.access)),
+        "token.refresh" => refresh::ensure(true).map(|snapshot| json!(snapshot.credentials.access)),
+        "token.expiring" => refresh::due().map(|value| json!(value)),
+        "models.list" => models::list(),
+        "models.refresh" => models::refresh(&params),
         "usage.query" => usage::query(),
         "checkin.claim" => checkin::claim(),
-        "claim.status" => claims::preview(),
-        "claim" => claims::claim(&params),
-        "login.start" => login::start(&params),
-        "login.poll" => login::poll(&params),
-        "login.cancel" => Ok(login::cancel()),
-        "login.callback" => login::callback(),
-        // 有状态家：`conversation` 是正路；`chat` 走同一段实现（两者的参数形状
-        // 只差 `wire_model` / `reasoning` 两个键，本家都不需要）
-        "chat" | "conversation" => {
+        "claim.status" => benefits::preview(),
+        "claim" => benefits::claim(params["claim"].as_str().unwrap_or("")),
+        "conversation" => {
             chat::forward(&params)?;
             Ok(Value::Null)
         }
-        "classify" => Ok(errors::classify(
-            params["status"].as_u64().unwrap_or(502) as u16,
-            &params["body"],
+        "login.start" => login::start(&params),
+        "login.poll" => login::poll(&params),
+        "login.cancel" => login::cancel(&params),
+        "login.callback" => Err(Error::http(
+            400,
+            "Qoder 中国版使用设备授权轮询，不接受授权码或本机回调",
         )),
-        // ── 为什么恒为 false ──────────────────────────────────
-        // 这个方法问的是「HTTP 200 但正文其实是失败话术」。Qoder 的业务错误
-        // 全在 SSE 信封里（`statusCodeValue`），而这里只看得到状态码与响应头、
-        // 拿不到正文 —— 按状态码猜必然误伤（上游成功响应的状态码永远是 200，
-        // 失败也一样）。真正的判定在 `classify` 与流内的 `stream::SseEvent::Error`。
-        "is_error_response" => Ok(json!(false)),
-        // native 没有覆盖 `error_policy` 的默认实现（默认 `Null` = 不附加策略）
-        "error.policy" => Ok(Value::Null),
-        // native 没有实现 `retry_advice`（排队的退避在 `chat.rs` 内部完成）
-        "retry_advice" => Ok(Value::Null),
+        "classify" => Ok(errors::classify(status(&params), &params["body"])),
+        "is_error_response" => Ok(json!(
+            status(&params) >= 400 || errors::has_error(&params["body"])
+        )),
+        "error.policy" => Ok(json!({ "stop": false })),
         "retry.decision" => Ok(json!({ "action": "default" })),
-        // native 的 `CooldownModels::default()`：不连带冷却别的模型名
+        "retry_advice" => Ok(Value::Null),
+        "refusal_markers" => Ok(json!({ "finishes": [], "markers": [] })),
         "cooldown_models" => Ok(json!({ "models": [] })),
-        "reasoning_patch" => Ok(reasoning_patch(&params)),
+        "reasoning_patch" => Ok(reasoning::patch(&params)),
         "images.capabilities" => Ok(json!({ "generation": false, "editing": false })),
+        "admin.action" => admin(&params),
+        _ => Err(Error::unsupported()),
+    }
+}
+fn status(params: &Value) -> u16 {
+    params["status"]
+        .as_u64()
+        .and_then(|status| u16::try_from(status).ok())
+        .unwrap_or(502)
+}
+fn admin(params: &Value) -> Result<Value> {
+    let payload = &params["payload"];
+    match params["action"].as_str().unwrap_or("") {
+        "auth.methods" => Ok(login_methods::methods(
+            payload["locale"].as_str().unwrap_or("zh-CN"),
+        )),
+        "network.user-agent" => Ok(json!({ "accountWide": true })),
+        "quota.sources" => Ok(usage::sources(&payload["report"])),
+        "claim.status" => benefits::preview(),
+        "claim.claim" => benefits::claim(payload["campaignId"].as_str().unwrap_or("")),
+        "risk.status" => Ok(
+            json!({ "available": false, "source": null, "installSupported": false, "installing": false,
+            "message": "Qoder 中国版签到不需要国际版 UMID 组件" }),
+        ),
+        "risk.install" => Err(Error::http(
+            400,
+            "本插件仅提供 Qoder 中国版，不安装或运行国际版组件",
+        )),
         _ => Err(Error::unsupported()),
     }
 }

@@ -1,210 +1,288 @@
-//! 账号面：设备授权收尾 + 归一化 + 公开视图（native `accounts.rs`）。
-//!
-//! ── 两条添加路径 ────────────────────────────────────────────
-//! ```text
-//!   Manual{payload}  粘贴凭证 → 拉资料（account-context）→ 落账号
-//!   Desktop          不支持（wasm 没有文件系统，也没有客户端登录态文件）
-//!   FileText/Base64  不支持（凭证是令牌，不是文件）
-//! ```
-//! 这家**没有 PAT**：`/api/v1/jobToken/exchange` 不存在，所以「填写凭证」里
-//! 粘贴 PAT 会当场被拒（见 `auth::prepare_account`），而不是打一个 404。
-//!
-//! 网页登录（设备授权）由 `login.rs` 走另一条路，收尾时调 [`account_of`]
-//! （与手工粘贴共用同一份落库形态）。
-//!
-//! ── 硬约束 ──────────────────────────────────────────────────
-//! 零 unwrap/expect/panic。
+//! qwenwork-<uid> 旧业务身份由宿主 accounts.identity.v1 在 provider 内匹配，保留旧主键。
+//! 账号读写仅限宿主当前上下文。缺机器编号先锁内一次性补齐并 CAS 保存，不能每次请求重建。
+use super::{
+    auth,
+    credentials::{self, Credentials},
+    endpoints, util,
+};
+use agent2api_wasm_sdk::{self as sdk, json, AccountLock, Error, Result, Value};
 
-use agent2api_wasm_sdk::{self as sdk, json, Error, Result, Value};
-
-use super::auth;
-use super::credentials::{self, Credentials};
-use super::site;
-
-/// 账号名长度上限
-const MAX_NAME_LENGTH: usize = 64;
-
-/// 截断文本（按字符，不按字节 —— 中文名不会被切成半个字）
-fn truncate(text: &str, limit: usize) -> String {
-    if text.chars().count() <= limit {
-        return text.to_string();
+#[derive(Clone)]
+pub struct Snapshot {
+    pub record: Value,
+    pub credentials: Credentials,
+}
+pub fn read() -> Result<Snapshot> {
+    let record = sdk::account()?;
+    credentials::owner(&record)?;
+    if sdk::account_disabled(&record) {
+        return Err(Error::coded("千问办公国际账号已停用", "forbidden"));
     }
-    text.chars().take(limit).collect()
-}
-
-/// 添加账号入口。
-pub fn normalize(params: &Value) -> Result<Value> {
-    let source = &params["source"];
-    let payload = match source["kind"].as_str() {
-        Some("manual") => {
-            let payload = &source["payload"];
-            if payload["inputs"].is_object() {
-                payload["inputs"].clone()
-            } else {
-                payload.clone()
-            }
-        }
-        Some("desktop") => return Err(Error::http(400, "千问办公请使用网页登录添加")),
-        Some("file_text") | Some("file_base64") => {
-            return Err(Error::http(
-                400,
-                "千问办公没有可导入的凭证文件，请用网页登录或粘贴账号记录",
-            ))
-        }
-        _ => return Err(Error::http(400, "千问办公请使用网页登录或手动填写令牌")),
-    };
-    let payload = if let Some(raw) = payload.as_str() {
-        json!({ "accessToken": raw })
-    } else {
-        payload
-    };
-    let credentials = auth::prepare_account(&payload)?;
-    let name = params["name"]
-        .as_str()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| truncate(value, MAX_NAME_LENGTH));
-    Ok(account_of(&credentials, "manual", name))
-}
-
-/// 凭证 → 可落库的账号（网页登录与手工粘贴两条路共用）。
-///
-/// 记录字段就是 `Credentials::to_value()` 的产出（`accessToken` / `refreshToken`
-/// / `mode` / `userId` / `machineId` / `expiresAt` …）。
-pub fn account_of(credentials: &Credentials, source: &str, explicit_name: Option<String>) -> Value {
-    let mut secret = match credentials.to_value() {
-        Value::Object(map) => map,
-        _ => serde_json::Map::new(),
-    };
-    secret.insert("mode".to_string(), Value::String(site::MODE.to_string()));
-    secret.insert("source".to_string(), Value::String(source.to_string()));
-    let name = explicit_name
-        .or_else(|| {
-            let upstream = credentials.name.trim();
-            if upstream.is_empty() {
-                None
-            } else {
-                Some(upstream.to_string())
-            }
-        })
-        .unwrap_or_else(|| default_name(credentials));
-    secret.insert("name".to_string(), Value::String(name));
-    let secret = Value::Object(secret);
-    json!({
-        "secret": secret.clone(),
-        "public": view(&secret),
-        "identity": identity(&secret),
-        "desktop": false,
+    let credentials = Credentials::parse(&record["secret"])?;
+    if credentials.user.is_empty() {
+        return Err(Error::http(
+            400,
+            "千问办公旧记录缺少用户身份，请重新导入完整记录",
+        ));
+    }
+    Ok(Snapshot {
+        record,
+        credentials,
     })
 }
-
-/// 没给名字时怎么命名（native `default_name` 的千问办公分支）。
-///
-/// 千问办公的账号上下文里通常没有昵称（`name` 多为空），它自己的客户端是按
-/// **邮箱**认号的；拿不到邮箱才退到 uid，再退到展示名。
+pub fn ready() -> Result<Snapshot> {
+    let before = read()?;
+    if !before.credentials.machine.is_empty() {
+        return Ok(before);
+    }
+    let _lock = AccountLock::acquire()?;
+    let current = read()?;
+    if !same(&before, &current) {
+        return Err(changed());
+    }
+    if !current.credentials.machine.is_empty() {
+        return Ok(current);
+    }
+    let mut next = current.credentials.clone();
+    next.complete()?;
+    if !same(&current, &read()?) {
+        return Err(changed());
+    }
+    if !save(&current, &next)? {
+        return Err(changed());
+    }
+    read()
+}
+pub fn same(left: &Snapshot, right: &Snapshot) -> bool {
+    left.record["id"] == right.record["id"]
+        && left.record["provider"] == right.record["provider"]
+        && left.record["identity"] == right.record["identity"]
+        && left.record["desktop"] == right.record["desktop"]
+        && left.record["secret"] == right.record["secret"]
+}
+pub fn changed() -> Error {
+    Error::http(409, "千问办公账号已删除、重新导入或身份变化，请重试").with_code("identity_changed")
+}
+pub fn unchanged(snapshot: &Snapshot) -> Result<()> {
+    if same(snapshot, &read()?) {
+        Ok(())
+    } else {
+        Err(changed())
+    }
+}
+pub fn identity(value: &Value) -> Result<String> {
+    let credentials = Credentials::parse(value)?;
+    if credentials.user.is_empty() {
+        return Err(Error::http(400, "千问办公缺少稳定用户身份"));
+    }
+    if credentials.is_biz==Some(true) {
+        let pool=util::hash(&json!([credentials.organization,credentials.team,credentials.realm]).to_string());
+        return Ok(format!("qwenwork-{}-biz-{}",credentials.user,&pool[..24]));
+    }
+    Ok(format!("qwenwork-{}", credentials.user))
+}
 fn default_name(credentials: &Credentials) -> String {
-    let email = credentials.email.trim();
-    if !email.is_empty() {
-        return truncate(email, MAX_NAME_LENGTH);
-    }
-    if credentials.user_id.is_empty() {
-        site::display_name().to_string()
+    if !credentials.name.is_empty() {
+        credentials.name.clone()
+    } else if !credentials.email.is_empty() {
+        credentials.email.chars().take(64).collect()
+    } else if !credentials.user.is_empty() {
+        format!("{} {}", endpoints::LABEL, credentials.user)
     } else {
-        format!("{} {}", site::display_name(), credentials.user_id)
+        endpoints::LABEL.into()
     }
 }
-
-/// 账号公开视图（界面账号页读的那几个键）。
-///
-/// **绝不能含 accessToken / refreshToken 本体** —— 只留令牌尾号与
-/// 「有没有令牌」两个布尔。这条是安全边界。
-pub fn view(secret: &Value) -> Value {
-    let access_token = credentials::text(secret, &["accessToken", "access_token", "token"]);
-    let user_id = credentials::text(secret, &["userId", "user_id"]);
-    let explicit_name = credentials::text(secret, &["name"]);
-    let name = if !explicit_name.is_empty() {
-        explicit_name
-    } else if !user_id.is_empty() {
-        format!("{} {}", site::PRODUCT, user_id)
+pub fn view(value: &Value) -> Result<Value> {
+    let value = credentials::decode(value)?;
+    let mut credentials = Credentials::parse(&value)?;
+    let name = util::text(&value, &["name"]);
+    credentials.name = if name.is_empty() {
+        default_name(&credentials)
     } else {
-        site::display_name().to_string()
+        name
     };
-    let email = credentials::text(secret, &["email"]);
-    let tail: String = access_token
-        .chars()
-        .rev()
-        .take(6)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    let mut view = json!({
-        "name": name,
-        "uid": user_id,
-        "tokenTail": tail,
-        // 站点身份（徽章显示用；值就是落盘的 provider id）
-        "edition": site::PROVIDER_ID,
-        "editionLabel": site::LABEL,
-        "source": credentials::text(secret, &["source"]),
-        "hasSession": !access_token.is_empty(),
-        // 有刷新令牌 = 能续期（网页登录与 PAT 都带）
-        "hasAccessToken": !access_token.is_empty(),
-        "hasRefreshToken": !credentials::text(secret, &["refreshToken", "refresh_token"]).is_empty(),
-        "canRefresh": !credentials::text(secret, &["refreshToken", "refresh_token"]).is_empty(),
-        "desktop": false,
-    });
-    if !email.is_empty() {
-        view["email"] = Value::String(email);
-    }
-    let expires_at = secret
-        .get("expiresAt")
-        .and_then(Value::as_i64)
-        .filter(|value| *value > 0);
-    if let Some(expires_at) = expires_at {
-        view["expiresAt"] = Value::from(expires_at);
-    }
-    view
-}
-
-/// 账号的稳定身份（没有 userId 时返回空串让网关按凭证去重）。
-///
-/// 前缀按产品分：`qoder-<uid>` / `qwenwork-<uid>`（这里取 `site::IDENTITY_PREFIX`）。
-/// 它是**同 provider 内**的去重键，跨产品不会相撞；改前缀会让存量账号在下次
-/// 导入时被当成新账号。
-pub fn identity(secret: &Value) -> String {
-    let user_id = credentials::text(secret, &["userId", "user_id"]);
-    if user_id.is_empty() {
-        return String::new();
-    }
-    format!("{}-{user_id}", site::IDENTITY_PREFIX)
-}
-
-/// 取一个现在能用的 token（临期主动续期）。
-pub fn ensure() -> Result<String> {
-    let (_, credentials) = super::refresh::snapshot()?;
-    if credentials.expiring() {
-        return refresh();
-    }
-    Ok(credentials.access_token)
-}
-
-/// 强制续期一次并返回新 token。
-pub fn refresh() -> Result<String> {
-    let credentials = super::refresh::ensure_fresh(true)?;
-    Ok(credentials.access_token)
-}
-
-/// 临期判定（给 `token.expiring`）。`secret` 缺失时读当前账号。
-pub fn expiring(secret: &Value) -> bool {
-    let owned;
-    let secret = if secret.is_object() {
-        secret
+    credentials.validate_public()?;
+    let tail = if credentials.access.chars().count() > 4 {
+        credentials
+            .access
+            .chars()
+            .rev()
+            .take(4)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<String>()
     } else {
-        owned = sdk::account().unwrap_or(Value::Null)["secret"].clone();
-        &owned
+        String::new()
     };
-    match Credentials::from_payload(secret) {
-        Ok(credentials) => credentials.expiring(),
-        Err(_) => false,
+    let source = util::text(&value, &["source"]);
+    let source = if matches!(source.as_str(), "web" | "manual") {
+        source
+    } else {
+        String::new()
+    };
+    let mut public_guard = credentials.clone();
+    public_guard.name = source.clone();
+    public_guard.validate_public()?;
+    let mut view = json!({ "name": credentials.name, "uid": credentials.user, "userId": credentials.user,
+        "tokenTail": tail, "edition": endpoints::PROVIDER, "editionLabel": "国际版",
+        "source": source, "hasSession": true, "hasAccessToken": true,
+        "hasRefreshToken": credentials.can_refresh(), "canRefresh": credentials.can_refresh() && credentials.is_biz != Some(true), "desktop": false,
+        "isBiz":credentials.is_biz,"organizationId":credentials.organization,"teamId":credentials.team });
+    if !credentials.email.is_empty() {
+        view["email"] = json!(credentials.email);
     }
+    if let Some(at) = credentials.expires {
+        view["expiresAt"] = json!(at);
+    }
+    Ok(view)
+}
+pub fn normalized(mut credentials: Credentials, source: &str, name: &str) -> Result<Value> {
+    credentials.complete()?;
+    let mut secret = credentials.value();
+    secret["source"] = json!(source);
+    let name = if name.trim().is_empty() {
+        default_name(&credentials)
+    } else {
+        name.trim().chars().take(64).collect()
+    };
+    secret["name"] = json!(name);
+    Ok(
+        json!({ "identity": identity(&secret)?, "desktop": false, "public": view(&secret)?, "secret": secret }),
+    )
+}
+pub fn normalize(params: &Value) -> Result<Value> {
+    let source = &params["source"];
+    let value = match source["kind"].as_str() {
+        Some("manual") => {
+            let payload = &source["payload"];
+            credentials::owner(payload)?;
+            if payload.get("methodIndex").is_some()
+                && !matches!(payload["methodIndex"].as_u64(), Some(1 | 2))
+            {
+                return Err(Error::http(400, "设备授权请从网页登录入口发起"));
+            }
+            let value = if payload["inputs"].is_object() {
+                &payload["inputs"]
+            } else {
+                payload
+            };
+            credentials::owner(value)?;
+            if payload["methodIndex"] == 2
+                && value["credentialJson"].as_str().is_none_or(str::is_empty)
+                && payload["credentialJson"].as_str().is_none_or(str::is_empty)
+            {
+                return Err(Error::http(400, "请粘贴完整千问办公国际凭据 JSON"));
+            }
+            if let Some(raw) = value["credentialJson"]
+                .as_str()
+                .filter(|value| !value.is_empty())
+            {
+                credentials::decode(&json!(raw))?
+            } else if let Some(raw) = payload["credentialJson"]
+                .as_str()
+                .filter(|value| !value.is_empty())
+            {
+                credentials::decode(&json!(raw))?
+            } else {
+                credentials::decode(value)?
+            }
+        }
+        Some("file_text") => credentials::decode(&source["content"])?,
+        Some("desktop") => {
+            return Err(Error::http(
+                400,
+                "千问办公国际版不读取本机凭据，请使用设备授权或凭据文本",
+            ))
+        }
+        _ => {
+            return Err(Error::http(
+                400,
+                "千问办公请使用设备授权、手工凭据或 JSON 文本",
+            ))
+        }
+    };
+    normalized(
+        auth::prepare(&value)?,
+        "manual",
+        &util::text(params, &["name"]),
+    )
+}
+pub fn save(current: &Snapshot, fresh: &Credentials) -> Result<bool> {
+    fresh.validate_public()?;
+    if fresh.user != current.credentials.user
+        || !current.credentials.machine.is_empty() && fresh.machine != current.credentials.machine
+        || fresh.is_biz != current.credentials.is_biz || fresh.organization != current.credentials.organization
+        || fresh.team != current.credentials.team || fresh.realm != current.credentials.realm
+    {
+        return Err(changed());
+    }
+    let mut next = credentials::decode(&current.record["secret"])?;
+    let fresh_value = fresh.value();
+    for (key, value) in fresh_value.as_object().into_iter().flatten() {
+        if value.is_null() || value == "" {
+            if key != "expiresAt" {
+                continue;
+            }
+        }
+        next[key] = value.clone();
+        if let Some(auth) = next["auth"].as_object_mut() {
+            auth.insert(key.clone(), value.clone());
+        }
+    }
+    // 同一凭据的旧别名一并回写，不能把新 accessToken 与旧 access/device_token 同时留在记录里。
+    for (canonical, aliases) in [
+        (
+            "accessToken",
+            &[
+                "access",
+                "token",
+                "access_token",
+                "device_token",
+                "deviceToken",
+            ][..],
+        ),
+        ("refreshToken", &["refresh", "refresh_token"][..]),
+        (
+            "expiresAt",
+            &["expires", "expires_at", "tokenExpiresAt"][..],
+        ),
+        ("userId", &["user_id", "uid"][..]),
+        ("machineId", &["machine_id", "loginDeviceId"][..]),
+    ] {
+        if fresh_value[canonical].is_null() || fresh_value[canonical] == "" {
+            if canonical != "expiresAt" {
+                continue;
+            }
+        }
+        for alias in aliases {
+            if next.get(*alias).is_some() {
+                next[*alias] = fresh_value[canonical].clone();
+            }
+            if let Some(auth) = next["auth"].as_object_mut() {
+                if auth.contains_key(*alias) {
+                    auth.insert((*alias).to_string(), fresh_value[canonical].clone());
+                }
+            }
+        }
+    }
+    if next.get("user").is_some_and(Value::is_object) {
+        next["user"]["id"] = json!(fresh.user);
+        if !fresh.name.is_empty() {
+            next["user"]["name"] = json!(fresh.name);
+        }
+        if !fresh.email.is_empty() {
+            next["user"]["email"] = json!(fresh.email);
+        }
+    }
+    if let Some(name) = current.record["public"]["name"].as_str() {
+        next["name"] = json!(name);
+    }
+    unchanged(current)?;
+    let public = view(&next)?;
+    Ok(sdk::host(
+        "account.update",
+        json!({ "expect": current.record["secret"], "secret": next, "public": public }),
+    )?["updated"]
+        == true)
 }

@@ -1,33 +1,79 @@
-//! WorkBuddy 的计费域：积分 / 额度查询、签到、运营活动。
-//!
-//! ── 这一层搬了什么（对照 native `billing/`）──────────────────
-//! ```text
-//!   usage.rs      积分查询与两种摊平形状（简报 / 逐份明细）—— 逐字保留
-//!   ops.rs        签到状态 / 领取 / 一次性奖励 / banner / 大使 —— 逐字保留
-//!   checkin.rs    国内版每日签到（协议层 `checkin.claim` 的执行体）
-//!   commodity.rs  积分包商品码与套餐分类 —— 逐字保留
-//!   tools.rs      JS 语义工具（Number() / parseTime / String(floor(n))）
-//!   headers.rs    计费接口的头集合（与转发头**不同**）—— 逐字保留
-//!   call.rs       一次计费调用（网关 call_billing 的插件侧等价物）
-//!   resources.rs  积分包分页与企业额度
-//! ```
-//!
-//! ── 输出形状为什么一字不改 ──────────────────────────────────
-//! `{kind, unlimited, totalLeft, planLeft, bonusLeft}` 是账号页余额列的既有契约
-//! （前端 `usageSummary` 与后端 `usage_records::extract_remaining` 都认
-//! `totalLeft`）。把它包装成「统一钱包形状」会让那一格的显示退化。所以这里是
-//! **加**不是换：五个既有键原样，另挂 `credits[]` 与 `subscription` 两项。
-//!
-//! ── 硬约束 ──────────────────────────────────────────────────
-//! 零 unwrap/expect/panic。
-
-pub mod call;
-pub mod checkin;
-pub mod commodity;
-pub mod headers;
-pub mod ops;
+//! 国际积分查询保留kind/unlimited/totalLeft/planLeft/bonusLeft，追加套餐与资源包。
+//! 仅国际账号出口，原生共享商品码按国际返回值解读；不请求国内奖励站点。
+mod commodity;
+pub mod operations;
 mod resources;
-pub mod tools;
-pub mod usage;
+mod usage;
 
-pub use usage::{credit_packs_from, credits_summary_from, query_usage, subscription_of};
+use crate::{
+    headers, network,
+    session::{self, Session},
+};
+use agent2api_wasm_sdk::{self as sdk, json, Error, Result, Value};
+
+pub(super) struct QueryBudget(i64);
+
+impl QueryBudget {
+    fn new() -> Self { Self(sdk::now().saturating_add(55_000)) }
+
+    pub(super) fn raw(&self, current: &Session, method: &str, path: &str, body: Option<&Value>) -> Result<network::Reply> {
+        let remaining = self.0.saturating_sub(sdk::now());
+        if remaining < 1000 {
+            return Err(Error::http(408, "国际积分查询已到本轮时间上限，保留上次读数")
+                .with_code("usage_timeout"));
+        }
+        let empty = json!({});
+        let body = if matches!(method, "GET" | "HEAD") { None } else { Some(body.unwrap_or(&empty)) };
+        let mut headers = headers::framework(&current.secret)?;
+        headers["Accept-Language"] = json!("en");
+        network::raw_timeout(method, &current.endpoint()?, path, headers, body, (remaining as u64).min(20_000))
+    }
+
+    pub(super) fn request(&self, current: &Session, method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
+        self.raw(current, method, path, body)?.checked(&current.secrets())
+    }
+}
+
+pub fn request(current: &Session, method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
+    raw(current, method, path, body)?.checked(&current.secrets())
+}
+pub fn raw(
+    current: &Session,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+) -> Result<network::Reply> {
+    let empty = json!({});
+    let body = if matches!(method, "GET" | "HEAD") {
+        None
+    } else {
+        Some(body.unwrap_or(&empty))
+    };
+    let mut headers = headers::framework(&current.secret)?;
+    headers["Accept-Language"] = json!("en");
+    network::raw_timeout(method, &current.endpoint()?, path, headers, body, 20_000)
+}
+pub fn query() -> Result<Value> {
+    let budget = QueryBudget::new();
+    let current = session::ensure(false)?;
+    let usage = usage::query_usage(&current, &budget)?;
+    let mut value = usage::credits_summary_from(&usage);
+    let packs = usage::credit_packs_from(&usage);
+    if !packs.is_empty() {
+        value["credits"] = json!(packs);
+    }
+    if let Some(subscription) = usage::subscription_of(&usage) {
+        value["subscription"] = subscription;
+    }
+    value["quotaSources"] = json!([{ "id": "credits", "label": "国际可用积分", "provider": "workbuddy-intl", "unit": "积分",
+        "remaining": value["totalLeft"], "total": null, "used": null, "unlimited": value["unlimited"] }]);
+    session::check(&current)?;
+    Ok(value)
+}
+pub fn sources(report: &Value) -> Value {
+    report["quotaSources"]
+        .as_array()
+        .cloned()
+        .map(Value::Array)
+        .unwrap_or_else(|| json!([]))
+}

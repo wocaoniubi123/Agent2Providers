@@ -1,69 +1,67 @@
-//! Trae 目录与聊天请求使用同一套客户端版本头。
-//!
-//! 上游按版本提供模型目录，不能只更新聊天版本而让目录沿用另一套头。
-//! 这里沿用参考项目 magpie Trae 适配所记录的 0.1.69 / 20260917 组合；
-//! 账号的 uid / machineId / deviceId 保持登录时的值。
+//! 原生聊天三令牌头与UG独立画像。设备值只来自凭据，OS族来自runtime.platform。
+//! 不冒充Windows 11 Pro/83DG/真实电脑名；完整OS与硬件型号没有可用主机事实，省略。
 
-pub const IDE_VERSION: &str = "0.1.69";
-/// 与模型目录表绑定。
-pub const IDE_VERSION_CODE: &str = "20260917";
-pub const APP_ID: &str = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8";
-pub const DEVICE_BRAND: &str = "83DG";
-pub const OS_VERSION: &str = "Windows 11 Pro";
-pub const CLIENT_USER_AGENT: &str = "Trae/0.1.69";
+use super::{credentials, endpoints, util};
+use agent2api_wasm_sdk::{self as sdk, json, Error, Result, Value};
 
-/// 一份凭据里与头有关的四个值（其余字段不参与组头）。
-pub struct HeaderIdentity<'a> {
-    pub access_token: &'a str,
-    pub uid: &'a str,
-    pub machine_id: &'a str,
-    pub device_id: &'a str,
+pub fn platform() -> Result<&'static str> {
+    match sdk::host("runtime.platform", json!({}))?.as_str() {
+        Some("win") => Ok("windows"),
+        Some("mac") => Ok("mac"),
+        Some("linux") => Ok("linux"),
+        Some("other") => Ok("other"),
+        _ => Err(Error::http(503, "主程序未提供有效平台类型")),
+    }
 }
 
-/// `llm_utils_chat` / `get_detail_param` 要的头集合。
-///
-/// 三条容易漏的：
-/// * 同一个 accessToken 要出现在**三个头**里（`Authorization` 带
-///   `Cloud-IDE-JWT ` 前缀、`X-Cloudide-Token` 与 `X-Ide-Token` 是裸串）；
-/// * `X-Uid` / `X-Machine-Id` / `X-Device-Id` **为空就不发这个头**，
-///   发一个空值头上游会当成"另一个身份"；
-/// * `Accept` 随流式与否变（`text/event-stream` / `application/json`）。
-pub fn solo_headers(identity: &HeaderIdentity<'_>, stream: bool) -> Vec<(String, String)> {
-    let mut headers: Vec<(String, String)> = Vec::new();
-    headers.push((
-        "Accept".to_string(),
-        if stream { "text/event-stream" } else { "application/json" }.to_string(),
-    ));
-    headers.push(("Content-Type".to_string(), "application/json".to_string()));
-    headers.push(("User-Agent".to_string(), CLIENT_USER_AGENT.to_string()));
-    headers.push((
-        "Authorization".to_string(),
-        format!("Cloud-IDE-JWT {}", identity.access_token),
-    ));
-    headers.push(("X-Cloudide-Token".to_string(), identity.access_token.to_string()));
-    headers.push(("X-Ide-Token".to_string(), identity.access_token.to_string()));
-    if !identity.uid.is_empty() {
-        headers.push(("X-Uid".to_string(), identity.uid.to_string()));
+pub fn oauth(token: Option<&str>) -> Value {
+    let mut value = json!({ "accept": "application/json", "content-type": "application/json",
+        "user-agent": format!("Trae/{}", endpoints::IDE_VERSION) });
+    if let Some(token) = token {
+        value["x-cloudide-token"] = json!(token);
     }
-    if !identity.machine_id.is_empty() {
-        headers.push(("X-Machine-Id".to_string(), identity.machine_id.to_string()));
+    value
+}
+
+pub fn chat(secret: &Value, stream: bool) -> Result<Value> {
+    let token = credentials::token(secret)?;
+    let request = util::uuid()?;
+    let mut h = json!({ "accept": if stream { "text/event-stream" } else { "application/json" },
+        "content-type": "application/json", "user-agent": format!("Trae/{}", endpoints::IDE_VERSION),
+        "authorization": format!("Cloud-IDE-JWT {token}"), "x-cloudide-token": token, "x-ide-token": token,
+        "x-app-id": endpoints::APP_ID, "x-app-version": endpoints::IDE_VERSION, "x-ide-version": endpoints::IDE_VERSION,
+        "x-ide-version-code": endpoints::VERSION_CODE, "x-app-version-code": endpoints::VERSION_CODE,
+        "x-ide-version-type": "stable", "x-device-type": platform()?,
+        "x-request-id": request, "x-trae-request-id": request,
+        "x-plugin-channel": "icube-ai", "request-traffic-type": "prod" });
+    for (field, header) in [
+        ("uid", "x-uid"),
+        ("machineId", "x-machine-id"),
+        ("deviceId", "x-device-id"),
+    ] {
+        let value = util::header(&util::text(secret, &[field]), 480)?;
+        if !value.is_empty() {
+            h[header] = json!(value);
+        }
     }
-    if !identity.device_id.is_empty() {
-        headers.push(("X-Device-Id".to_string(), identity.device_id.to_string()));
+    Ok(h)
+}
+
+pub fn ug(secret: &Value, device: &str, bearer: bool) -> Result<Value> {
+    let token = credentials::token(secret)?;
+    let request = util::uuid()?;
+    let compact = request.replace('-', "");
+    let trace = format!("00-{}-{}-01", util::random_hex(16)?, &compact[..16]);
+    let mut h = json!({ "content-type": "application/json", "accept": "*/*",
+        "user-agent": if credentials::variant(secret) == "cn" { "VSCode 1.107.1 (TRAE CN)" } else { "VSCode 1.107.1 (TRAE SOLO CN)" },
+        "x-user-region": "CN", "accept-language": "zh-CN", "package-type": "stable_cn",
+        "x-lgw-req-sdk-type": "3", "x-market-client-id": "VSCode 1.107.1", "x-device-type": platform()?,
+        "x-app-version": endpoints::IDE_VERSION, "app-version": endpoints::IDE_VERSION,
+        "x-request-id": request, "x-tt-trace-id": trace,
+        "sec-fetch-dest": "empty", "sec-fetch-mode": "no-cors", "sec-fetch-site": "none",
+        "authorization": format!("{} {token}", if bearer { "Bearer" } else { "Cloud-IDE-JWT" }) });
+    if !device.is_empty() {
+        h["x-device-id"] = json!(util::header(device, 256)?);
     }
-    headers.push(("X-App-Id".to_string(), APP_ID.to_string()));
-    headers.push(("X-App-Version".to_string(), IDE_VERSION.to_string()));
-    headers.push(("X-Ide-Version".to_string(), IDE_VERSION.to_string()));
-    headers.push(("X-Ide-Version-Code".to_string(), IDE_VERSION_CODE.to_string()));
-    headers.push(("X-App-Version-Code".to_string(), IDE_VERSION_CODE.to_string()));
-    headers.push(("X-Ide-Version-Type".to_string(), "stable".to_string()));
-    headers.push(("X-Device-Type".to_string(), "windows".to_string()));
-    headers.push(("X-OS-Version".to_string(), OS_VERSION.to_string()));
-    headers.push(("X-Device-Brand".to_string(), DEVICE_BRAND.to_string()));
-    let request_id = super::device::uuid_v4();
-    headers.push(("X-Request-Id".to_string(), request_id.clone()));
-    headers.push(("X-Trae-Request-Id".to_string(), request_id));
-    headers.push(("X-Plugin-Channel".to_string(), "icube-ai".to_string()));
-    headers.push(("Request-Traffic-Type".to_string(), "prod".to_string()));
-    headers
+    Ok(h)
 }

@@ -1,72 +1,58 @@
-//! 思考档位的**通用口径**（与网关 `core/model_rules::reasoning` 逐字一致）。
-//!
-//! ── 为什么插件要自带一份 ────────────────────────────────────
-//! 「哪些等级可以翻译给上游」「客户端是不是已经显式指定了档位」是跨家共用的
-//! 规则。插件不认识主程序的配置层，这份规则只能跟着插件走 —— 但口径必须与
-//! 主程序一致，否则同一份映射在搬家前后会给出不同的注入结果。
-//!
-//! ── 表为什么是这八个值 ──────────────────────────────────────
-//! 它们是主程序「思考等级」下拉的全部可选项（由弱到强，`off` 在最前）。
-//! `off` / `none` 在本项目**一律不注入**（没有安全的表达方式）：调用方据此把
-//! 「关闭思考」与「表外值」分开措辞 —— 两者都不注入，但用户看到的原因不同。
+//! 沿用原生六档到 low/medium/high 的映射，客户端显式指定时不覆盖。
 
-/// 可以翻译给上游的正向档位（不含 `off` / `none`）。
-///
-/// 数组顺序 = 强弱顺序，[`effort_rank`] 直接拿它当下标用。
-pub const EFFORT_LEVELS: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max"];
+use agent2api_wasm_sdk::{json, Value};
 
-/// 等级字符串的长度上限（与主程序同口径）
-const MAX_CHARS: usize = 32;
-
-/// 归一化一个思考等级：去首尾空白 → 过长或空串返回 None（= 不覆盖）。
-pub fn normalize(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed.chars().count() > MAX_CHARS {
-        return None;
-    }
-    Some(trimmed.to_string())
+fn normalize(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty() && value.chars().count() <= 32).then_some(value)
 }
 
-/// 该等级是不是「关闭思考」两档（`off` / `none`），忽略大小写。
-pub fn is_thinking_off(level: &str) -> bool {
-    let trimmed = level.trim();
-    trimmed.eq_ignore_ascii_case("off") || trimmed.eq_ignore_ascii_case("none")
-}
-
-/// 正向档位 → 序号（0 = 最弱，5 = 最强）。`off` / `none` / 表外值一律 None。
-///
-/// 返回 None 的含义是「**这个值不该被注入上游**」，不是「这个值不合法」。
-pub fn effort_rank(level: &str) -> Option<usize> {
-    let trimmed = level.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    EFFORT_LEVELS
-        .iter()
-        .position(|known| trimmed.eq_ignore_ascii_case(known))
-}
-
-/// 从**下游请求体**里读客户端显式指定的思考等级。
-///
-/// 取值链是各家的并集（`reasoning_effort` → `reasoningEffort` → `effort`
-/// → `reasoning`（对象形态取 `effort` 子键）→ `thinking`）。它只服务
-/// 「绑定让位」这一个判据：客户端写了档位，映射上的默认值就不覆盖它。
-pub fn read_client_level(body: &serde_json::Value) -> Option<String> {
-    use serde_json::Value;
-    for key in ["reasoning_effort", "reasoningEffort", "effort", "reasoning", "thinking"] {
+fn client_level(body: &Value) -> Option<&str> {
+    for key in [
+        "reasoning_effort",
+        "reasoningEffort",
+        "effort",
+        "reasoning",
+        "thinking",
+    ] {
         match body.get(key) {
-            Some(Value::String(text)) => return normalize(text),
-            // responses API 的对象形态：reasoning: { effort: "high" }
-            Some(Value::Object(object)) if key == "reasoning" => {
-                if let Some(Value::String(effort)) = object.get("effort") {
-                    if let Some(level) = normalize(effort) {
-                        return Some(level);
-                    }
+            Some(Value::String(value)) => return normalize(value),
+            Some(Value::Object(value)) if key == "reasoning" => {
+                if let Some(value) = value
+                    .get("effort")
+                    .and_then(Value::as_str)
+                    .and_then(normalize)
+                {
+                    return Some(value);
                 }
             }
-            // null / 布尔 / 数字 / 其它对象不构成「档位」，继续后面的键
             _ => {}
         }
     }
     None
+}
+
+fn explicit_off(body: &Value) -> bool {
+    body["enable_thinking"] == false
+        || body["chat_template_kwargs"]["enable_thinking"] == false
+        || body["thinking"] == false
+        || body["thinking"]["type"] == "disabled"
+}
+
+pub fn patch(level: &str, body: &Value) -> Value {
+    let level = level.trim().to_ascii_lowercase();
+    let skip = |reason: &str| json!({ "action": "skip", "reason": reason });
+    if matches!(level.as_str(), "off" | "none") {
+        return skip("Loomy 没有关闭思考的可靠表达，跳过注入");
+    }
+    if explicit_off(body) || client_level(body).is_some() {
+        return skip("客户端请求体已指定思考设置，绑定让位");
+    }
+    let effort = match level.as_str() {
+        "minimal" | "low" => "low",
+        "medium" | "high" => "medium",
+        "xhigh" | "max" => "high",
+        _ => return skip("该等级不在通用档位表内，Loomy 不注入未知档位"),
+    };
+    json!({ "action": "set", "field": "reasoning_effort", "value": effort })
 }

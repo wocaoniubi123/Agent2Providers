@@ -1,9 +1,10 @@
-//! 积分包商品码与套餐分类（对照 Node 版 `workbuddy-endpoints.mjs` 的
-//! COMMODITY_CODES / COMMODITY_LABELS / DAILY_CREDITS 与 `workbuddy-billing.mjs`
+//! 积分包商品码与套餐分类（对照 Node 版 workbuddy-endpoints.mjs 的
+//! COMMODITY_CODES / COMMODITY_LABELS / DAILY_CREDITS 与 workbuddy-billing.mjs
 //! 里的 planPriority / PLAN_BASE_PACKAGES / BONUS_PACKAGES）。
 //!
 //! 为什么放在 billing 子模块而不是 endpoints.rs：这些常量只服务于「积分查询结果
-//! 的解读」，端点表那边一个都用不到。
+//! 的解读」，端点表那边一个都用不到；混在 endpoints.rs 里会让那个「接口清单
+//! 唯一事实来源」的文件掺进业务语义。`/api/endpoints` 不需要输出它们。
 
 /// 积分包商品码（账单里 PackageCode 的含义）
 pub mod codes {
@@ -21,16 +22,15 @@ pub mod codes {
     pub const BONUS28: &str = "TCACA_code_028_NtpWi0jzXs";
     pub const BONUS29: &str = "TCACA_code_029_6wCGEWquYy";
     pub const BONUS30: &str = "TCACA_code_030_BjSt89qTvr";
-    pub const FREE_MON_INTL: &str = "TCACA_code_035_ArVxJcGDsm";
-    pub const EXTRA_INTL: &str = "TCACA_code_036_lupO5WgNdG";
-    pub const BONUS_INTL: &str = "TCACA_code_037_WxOD3MpI2o";
     pub const EXTRA38: &str = "TCACA_code_038_OhvqZtiPKr";
     pub const PRO_TRIAL_MON: &str = "TCACA_code_039_KRcQj7wUat";
     pub const PRO_TRIAL_YEAR: &str = "TCACA_code_040_mi9rCYg46x";
 }
 
-/// 商品码 → 展示名。**只在上游没给 `PackageName` 时兜底**（上游原文优先，见
-/// issue #239 —— 这张表是照抄 Node 版的手抄品，上游改名/换档位后不会跟着变）。
+/// 商品码 → 展示名。**只在上游没给 `PackageName` 时兜底**（名单见
+/// `usage::get_personal_usage`：上游原文优先，见 issue #239 —— 这张表是照抄
+/// Node 版的手抄品，上游改名/换档位后不会跟着变，`FREE_MON` 就曾把
+/// 「CodeBuddy个人体验版」写成「专业版日额度」）。
 pub fn label_of(code: &str) -> Option<&'static str> {
     use codes::*;
     Some(match code {
@@ -48,9 +48,6 @@ pub fn label_of(code: &str) -> Option<&'static str> {
         BONUS28 => "赠送积分（28）",
         BONUS29 => "赠送积分（29）",
         BONUS30 => "赠送积分（30）",
-        FREE_MON_INTL => "国际版月额度",
-        EXTRA_INTL => "国际版加油包",
-        BONUS_INTL => "国际版赠送积分",
         EXTRA38 => "积分加油包（38）",
         PRO_TRIAL_MON => "专业版试用（月）",
         PRO_TRIAL_YEAR => "专业版试用（年）",
@@ -67,7 +64,7 @@ pub fn is_daily_credit(code: &str) -> bool {
 pub const UNLIMITED_USAGE_SENTINEL: &str = "unlimited";
 
 /// 套餐优先级（与桌面端 getPriority 一致）：
-///   1 订阅/试用类  2 赠送 28 类  3 加油包  4 活动/赠送 29-30/礼包  6 免费日额度 7 其他
+///   1 订阅/试用类  2 赠送 28 类  3 加油包  4 活动/赠送 29-30/礼包  6 免费日额度  7 其他
 ///
 /// 列表按这个优先级 + 到期时间升序排，前端从上往下读第一个「当前生效套餐」
 /// （所以日额度包即使金额小、到期最晚，也不会被误判成免费版）。
@@ -77,17 +74,24 @@ pub fn plan_priority(code: Option<&str>) -> i32 {
         return 7;
     };
     if [
-        PRO_MON, PRO_MON_PLUS, PRO_YEAR, YOUTH, ADVANCED, FLAGSHIP, FREE_MON_INTL,
-        PRO_TRIAL_MON, PRO_TRIAL_YEAR, FREE_MON,
+        PRO_MON,
+        PRO_MON_PLUS,
+        PRO_YEAR,
+        YOUTH,
+        ADVANCED,
+        FLAGSHIP,
+        PRO_TRIAL_MON,
+        PRO_TRIAL_YEAR,
+        FREE_MON,
     ]
     .contains(&code)
     {
         return 1;
     }
-    if [BONUS28, BONUS_INTL].contains(&code) {
+    if [BONUS28].contains(&code) {
         return 2;
     }
-    if [EXTRA, EXTRA_INTL, EXTRA38].contains(&code) {
+    if [EXTRA, EXTRA38].contains(&code) {
         return 3;
     }
     if [ACTIVITY, BONUS29, BONUS30, GIFT].contains(&code) {
@@ -106,8 +110,17 @@ pub fn is_plan_base(code: Option<&str>) -> bool {
         return false;
     };
     [
-        FLAGSHIP, ADVANCED, YOUTH, PRO_MON, PRO_YEAR, PRO_MON_PLUS, PRO_TRIAL_MON,
-        PRO_TRIAL_YEAR, GIFT, FREE, FREE_MON, FREE_MON_INTL,
+        FLAGSHIP,
+        ADVANCED,
+        YOUTH,
+        PRO_MON,
+        PRO_YEAR,
+        PRO_MON_PLUS,
+        PRO_TRIAL_MON,
+        PRO_TRIAL_YEAR,
+        GIFT,
+        FREE,
+        FREE_MON,
     ]
     .contains(&code)
 }
@@ -118,5 +131,5 @@ pub fn is_bonus(code: Option<&str>) -> bool {
     let Some(code) = code else {
         return false;
     };
-    [ACTIVITY, BONUS28, BONUS29, BONUS30, BONUS_INTL].contains(&code)
+    [ACTIVITY, BONUS28, BONUS29, BONUS30].contains(&code)
 }

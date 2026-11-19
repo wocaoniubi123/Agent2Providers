@@ -1,9 +1,10 @@
-//! 积分包商品码与套餐分类（对照 Node 版 `workbuddy-endpoints.mjs` 的
-//! COMMODITY_CODES / COMMODITY_LABELS / DAILY_CREDITS 与 `workbuddy-billing.mjs`
+//! 积分包商品码与套餐分类（对照 Node 版 workbuddy-endpoints.mjs 的
+//! COMMODITY_CODES / COMMODITY_LABELS / DAILY_CREDITS 与 workbuddy-billing.mjs
 //! 里的 planPriority / PLAN_BASE_PACKAGES / BONUS_PACKAGES）。
 //!
 //! 为什么放在 billing 子模块而不是 endpoints.rs：这些常量只服务于「积分查询结果
-//! 的解读」，端点表那边一个都用不到。
+//! 的解读」，端点表那边一个都用不到；混在 endpoints.rs 里会让那个「接口清单
+//! 唯一事实来源」的文件掺进业务语义。`/api/endpoints` 不需要输出它们。
 
 /// 积分包商品码（账单里 PackageCode 的含义）
 pub mod codes {
@@ -29,8 +30,10 @@ pub mod codes {
     pub const PRO_TRIAL_YEAR: &str = "TCACA_code_040_mi9rCYg46x";
 }
 
-/// 商品码 → 展示名。**只在上游没给 `PackageName` 时兜底**（上游原文优先，见
-/// issue #239 —— 这张表是照抄 Node 版的手抄品，上游改名/换档位后不会跟着变）。
+/// 商品码 → 展示名。**只在上游没给 `PackageName` 时兜底**（名单见
+/// `usage::get_personal_usage`：上游原文优先，见 issue #239 —— 这张表是照抄
+/// Node 版的手抄品，上游改名/换档位后不会跟着变，`FREE_MON` 就曾把
+/// 「CodeBuddy个人体验版」写成「专业版日额度」）。
 pub fn label_of(code: &str) -> Option<&'static str> {
     use codes::*;
     Some(match code {
@@ -67,7 +70,7 @@ pub fn is_daily_credit(code: &str) -> bool {
 pub const UNLIMITED_USAGE_SENTINEL: &str = "unlimited";
 
 /// 套餐优先级（与桌面端 getPriority 一致）：
-///   1 订阅/试用类  2 赠送 28 类  3 加油包  4 活动/赠送 29-30/礼包  6 免费日额度 7 其他
+///   1 订阅/试用类  2 赠送 28 类  3 加油包  4 活动/赠送 29-30/礼包  6 免费日额度  7 其他
 ///
 /// 列表按这个优先级 + 到期时间升序排，前端从上往下读第一个「当前生效套餐」
 /// （所以日额度包即使金额小、到期最晚，也不会被误判成免费版）。
@@ -77,8 +80,16 @@ pub fn plan_priority(code: Option<&str>) -> i32 {
         return 7;
     };
     if [
-        PRO_MON, PRO_MON_PLUS, PRO_YEAR, YOUTH, ADVANCED, FLAGSHIP, FREE_MON_INTL,
-        PRO_TRIAL_MON, PRO_TRIAL_YEAR, FREE_MON,
+        PRO_MON,
+        PRO_MON_PLUS,
+        PRO_YEAR,
+        YOUTH,
+        ADVANCED,
+        FLAGSHIP,
+        FREE_MON_INTL,
+        PRO_TRIAL_MON,
+        PRO_TRIAL_YEAR,
+        FREE_MON,
     ]
     .contains(&code)
     {
@@ -106,8 +117,18 @@ pub fn is_plan_base(code: Option<&str>) -> bool {
         return false;
     };
     [
-        FLAGSHIP, ADVANCED, YOUTH, PRO_MON, PRO_YEAR, PRO_MON_PLUS, PRO_TRIAL_MON,
-        PRO_TRIAL_YEAR, GIFT, FREE, FREE_MON, FREE_MON_INTL,
+        FLAGSHIP,
+        ADVANCED,
+        YOUTH,
+        PRO_MON,
+        PRO_YEAR,
+        PRO_MON_PLUS,
+        PRO_TRIAL_MON,
+        PRO_TRIAL_YEAR,
+        GIFT,
+        FREE,
+        FREE_MON,
+        FREE_MON_INTL,
     ]
     .contains(&code)
 }

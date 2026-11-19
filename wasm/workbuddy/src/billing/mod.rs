@@ -1,33 +1,53 @@
-//! WorkBuddy 的计费域：积分 / 额度查询、签到、运营活动。
-//!
-//! ── 这一层搬了什么（对照 native `billing/`）──────────────────
-//! ```text
-//!   usage.rs      积分查询与两种摊平形状（简报 / 逐份明细）—— 逐字保留
-//!   ops.rs        签到状态 / 领取 / 一次性奖励 / banner / 大使 —— 逐字保留
-//!   checkin.rs    国内版每日签到（协议层 `checkin.claim` 的执行体）
-//!   commodity.rs  积分包商品码与套餐分类 —— 逐字保留
-//!   tools.rs      JS 语义工具（Number() / parseTime / String(floor(n))）
-//!   headers.rs    计费接口的头集合（与转发头**不同**）—— 逐字保留
-//!   call.rs       一次计费调用（网关 call_billing 的插件侧等价物）
-//!   resources.rs  积分包分页与企业额度
-//! ```
-//!
-//! ── 输出形状为什么一字不改 ──────────────────────────────────
-//! `{kind, unlimited, totalLeft, planLeft, bonusLeft}` 是账号页余额列的既有契约
-//! （前端 `usageSummary` 与后端 `usage_records::extract_remaining` 都认
-//! `totalLeft`）。把它包装成「统一钱包形状」会让那一格的显示退化。所以这里是
-//! **加**不是换：五个既有键原样，另挂 `credits[]` 与 `subscription` 两项。
-//!
-//! ── 硬约束 ──────────────────────────────────────────────────
-//! 零 unwrap/expect/panic。
-
-pub mod call;
+//! 国内积分既有五键保持不变，追加资源包/套餐；网络与账号均经宿主。
 pub mod checkin;
-pub mod commodity;
-pub mod headers;
-pub mod ops;
+mod commodity;
 mod resources;
-pub mod tools;
-pub mod usage;
+pub mod rewards;
+mod usage;
 
-pub use usage::{credit_packs_from, credits_summary_from, query_usage, subscription_of};
+use crate::{
+    headers, network,
+    session::{self, Session},
+};
+use agent2api_wasm_sdk::{json, Result, Value};
+pub fn request(current: &Session, method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
+    let empty = json!({});
+    let body = if matches!(method, "GET" | "HEAD") {
+        None
+    } else {
+        Some(body.unwrap_or(&empty))
+    };
+    let mut headers = headers::framework(&current.secret)?;
+    headers["Accept-Language"] = json!("zh-CN");
+    network::request(
+        method,
+        &current.endpoint()?,
+        path,
+        headers,
+        body,
+        &current.secrets(),
+    )
+}
+pub fn query() -> Result<Value> {
+    let current = session::ensure(false)?;
+    let usage = usage::query_usage(&current)?;
+    let mut value = usage::credits_summary_from(&usage);
+    let packs = usage::credit_packs_from(&usage);
+    if !packs.is_empty() {
+        value["credits"] = json!(packs);
+    }
+    if let Some(subscription) = usage::subscription_of(&usage) {
+        value["subscription"] = subscription;
+    }
+    session::check(&current)?;
+    value["quotaSources"] = json!([{ "id": "credits", "label": "可用积分", "provider": "workbuddy", "unit": "积分",
+        "remaining": value["totalLeft"], "total": null, "used": null, "unlimited": value["unlimited"] }]);
+    Ok(value)
+}
+pub fn sources(report: &Value) -> Value {
+    report["quotaSources"]
+        .as_array()
+        .cloned()
+        .map(Value::Array)
+        .unwrap_or_else(|| json!([]))
+}

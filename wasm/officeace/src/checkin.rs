@@ -1,96 +1,93 @@
-//! 签到：只触发当天奖励结算，**不代替**套餐开通或协议确认。
-//!
-//! ── 一次 claim 全领 ─────────────────────────────────────────
-//! `POST /v1/subscription/bonus/claim` 是「立即触发今天的结算」：上游按天结算一批
-//! （官方客户端每小时自动打这一发），已在官方客户端结算过时返回空列表
-//! `{"bonus_skus": []}`。所以签到与新手任务是**同一个上游动作**，幂等由上游保证。
-//!
-//! ── 为什么签到前要先查一次订阅 ──────────────────────────────
-//! 未开通 / 已到期 / 被冻结的账号去 claim，上游只会给一句模糊的拒绝。先读
-//! `subscribe_status` 能把三种情形分开，用户拿到的下一步动作完全不同（去开通 /
-//! 去官方客户端 / 直接重试）。
-//!
-//! ── 台账（`dailyCheckin`）在这个动作里干什么 ────────────────
-//! 只回答「今天经本网关签到过没有」。上游的 `success: true` 覆盖两种情形（真的
-//! 领到 / 今天已领过），所以 `gained` 为 0 时要归 `done` 而不是 `claimed` —— 那
-//! 决定调度链要不要记一笔「今天签到了」。
-//!
-//! ── panic=abort ────────────────────────────────────────────
-//! 本文件零 unwrap/expect/panic。
+//! 签到=今天奖励结算，不代替套餐开通/协议确认；日台账与奖励台账均保持旧键名。
+//! 领取响应可能重复带回旧活动，先读账本再按同活动剩余增量计入本次收益，不把旧余额当新领取。
 
-use agent2api_wasm_sdk::{json, Error, Result, Value};
+use super::{control, ledger, models, subscription, util};
+use agent2api_wasm_sdk::{
+    self as sdk, json,
+    state::{self, Scope, Snapshot},
+    Error, Result, Value,
+};
 
-use super::{control, subscription, util};
+const ATTEMPT: &str = "bonus-claim-attempt";
 
-/// 签到台账的键名（`ledger.get` / `ledger.put` 的 `kind`）。
-pub const LEDGER_KIND: &str = "dailyCheckin";
-
-/// 签到结果 → 协议档位（`checkin.claim` 的返回）。
-///
-/// 本家的 `success: true` 覆盖两种情形（真的领到 / 今天已领过），所以 `gained`
-/// 为 0 时要归 `Done` 而不是 `Claimed`。
-pub fn claim() -> Result<Value> {
-    let previous = control::ledger_get(LEDGER_KIND);
-    let result = claim_inner();
-    let (completed, status, message) = match &result {
-        Ok(value) => (
-            true,
-            if value.get("gained").and_then(Value::as_f64).unwrap_or(0.0) > 0.0 {
-                "claimed"
-            } else {
-                "done"
-            },
-            value
-                .get("msg")
-                .and_then(Value::as_str)
-                .unwrap_or("已签到")
-                .to_string(),
-        ),
-        Err(error) => (false, "failed", error.message.clone()),
-    };
-    let already_completed = previous
-        .get("completed")
-        .and_then(Value::as_bool)
-        == Some(true)
-        && previous
-            .get("at")
-            .and_then(Value::as_i64)
-            .and_then(util::date_key_of_ms)
-            .is_some_and(|day| day == util::beijing_today_key());
-    // 之前已经签过、这次又失败：不要把「今天签过了」那条记录改成失败
-    if !completed && already_completed {
-        return result;
+fn attempt() -> Result<Snapshot> {
+    let value = state::get(Scope::Account, ATTEMPT, 1)?;
+    if !value.compatible {
+        return Err(uncertain());
     }
-    let daily = json!({
-        "kind": "daily",
-        "at": util::now_ms(),
-        "completed": completed,
-        "status": status,
-        "message": message,
-        "completedCount": usize::from(completed),
-        "totalCount": 1,
-        "sourcesComplete": completed,
-    });
-    // 台账写不进去不改签到结果：上游那边可能已经发下来了，把成功报成失败本末倒置
-    let _ = control::ledger_put(LEDGER_KIND, &daily);
-    result
+    Ok(value)
 }
 
-fn claim_inner() -> Result<Value> {
-    let mut credential = control::credential_of()?;
-    let before = control::subscription_of(&mut credential)?;
-    match before.get("subscribe_status").and_then(Value::as_str) {
+fn put_attempt(old: &Snapshot, value: Value) -> Result<()> {
+    if !state::compare_exchange(Scope::Account, ATTEMPT, 1, old.revision, value, 0)? {
+        return Err(uncertain());
+    }
+    Ok(())
+}
+
+fn uncertain() -> Error {
+    Error::http(
+        409,
+        "OfficeAce 奖励结算结果未确认，未自动重复提交；请先查询官方积分与今日签到状态",
+    )
+    .with_code("officeace_bonus_uncertain")
+}
+
+pub fn attempted() -> Result<bool> {
+    let context = super::account::snapshot()?.1;
+    let value = attempt()?.value;
+    Ok(value["day"] == util::day(sdk::now())
+        && value["binding"] == models::binding(&context)
+        && matches!(value["status"].as_str(), Some("submitting" | "uncertain")))
+}
+
+pub fn claim() -> Result<Value> {
+    let mut context = control::Context::acquire()?;
+    let result = inner(&mut context);
+    match result {
+        Ok(mut value) => {
+            context.verify()?;
+            if ledger::daily(
+                true,
+                value["gained"].as_f64().unwrap_or(0.0),
+                value["msg"].as_str().unwrap_or("已签到"),
+            )
+            .is_err()
+            {
+                util::warning(&mut value, "奖励结算已确认，但签到台账未能保存");
+            }
+            Ok(value)
+        }
+        Err(error) => {
+            if context.verify().is_ok() {
+                let _ = ledger::daily(false, 0.0, &error.message);
+            }
+            Err(error)
+        }
+    }
+}
+
+fn inner(context: &mut control::Context) -> Result<Value> {
+    let today = ledger::today()?;
+    if today["all"] == true {
+        context.verify()?;
+        return Ok(
+            json!({ "success": true, "msg": "今天已通过本网关结算过全部奖励", "gained": 0, "rewards": [] }),
+        );
+    }
+    let before = context.subscription()?;
+    match before["subscribe_status"].as_str() {
         Some("UNSUBSCRIBED") => {
             return Err(Error::http(
                 409,
-                "果办尚未开通体验套餐，请先到签到中心开通零元体验套餐，再领取奖励",
+                "果办尚未开通体验套餐，请先在签到中心确认零元体验套餐，再领取奖励",
             )
             .with_code("officeace_subscription_required"))
         }
         Some("EXPIRED" | "FROZEN") => {
             return Err(Error::http(
                 409,
-                "果办套餐已到期或被冻结，请到官方客户端处理；这里不会自动续费",
+                "果办套餐已到期或被冻结，请在官方客户端处理；这里不会自动续费",
             ))
         }
         Some("SUBSCRIBED") => {}
@@ -101,106 +98,126 @@ fn claim_inner() -> Result<Value> {
             ))
         }
     }
-    control::resolve_project(&mut credential)?;
-    let claimed = control::claim_bonus(&mut credential)?;
-    let items = claimed
-        .get("bonus_skus")
-        .and_then(Value::as_array)
-        .ok_or_else(|| Error::http(502, "官方未返回有效的奖励领取结果，请查询积分后再操作"))?;
-    let bonuses = subscription::bonuses_of(&claimed);
-    let gained: f64 = bonuses.iter().map(subscription::Bonus::remaining).sum();
-    // 条目数与解出来的活动数对不上，说明有我们没认出来的形状 —— 不能报成功
-    if items.len() != bonuses.len() || !gained.is_finite() || !items.is_empty() && gained <= 0.0 {
+    let old_bonuses = subscription::bonuses(&before);
+    if before["bonus_skus"]
+        .as_array()
+        .is_none_or(|rows| rows.len() != old_bonuses.len())
+    {
         return Err(Error::http(
             502,
-            "官方返回了奖励条目，但未能确认到账积分，请查询积分明细",
+            "领取前的奖励账本无法确认，未提交重复结算请求",
         ));
     }
-    super::onboarding::mark_claimed(&bonuses);
+    if subscription::checked_in_today(&before) {
+        context.verify()?;
+        return Ok(
+            json!({ "success": true, "msg": "官方已确认今日奖励到账，无需重复结算", "gained": 0, "rewards": [] }),
+        );
+    }
+    context.verify()?;
+    let mark = attempt()?;
+    let binding = models::binding(&context.credential);
+    let day = util::day(sdk::now());
+    if mark.value["day"] == day && mark.value["binding"] == binding {
+        match mark.value["status"].as_str() {
+            Some("confirmed") => {
+                return Ok(
+                    json!({ "success": true, "msg": "今天的奖励结算已确认", "gained": 0, "rewards": [] }),
+                )
+            }
+            Some("submitting" | "uncertain") => return Err(uncertain()),
+            _ => {}
+        }
+    }
+    context.resolve_project()?;
+    context.verify()?;
+    put_attempt(
+        &mark,
+        json!({ "day": day, "binding": binding, "status": "submitting", "at": sdk::now() }),
+    )?;
+    let reserved = attempt()?;
+    let claimed = match context.bonus() {
+        Ok(value) => value,
+        Err(error) => {
+            // 只有确定在出站前拒绝或明确上游拒绝才能重试；传输/回读不明继续保留一次提交。
+            if super::errors::permission(&error)
+                || error.code.as_deref() != Some(super::errors::UNCERTAIN)
+                    && error.code.as_deref() != Some("officeace_account_changed")
+            {
+                let _ = put_attempt(&reserved, Value::Null);
+            }
+            return Err(error);
+        }
+    };
+    let items = claimed["bonus_skus"]
+        .as_array()
+        .ok_or_else(|| Error::http(502, "官方没有返回有效奖励结算结果，请先查询积分"))?;
+    let bonuses = subscription::bonuses(&claimed);
+    let mut rewards = Vec::new();
+    let mut gained = 0.0;
+    if items.len() != bonuses.len() {
+        return Err(Error::http(
+            502,
+            "官方奖励条目格式未知，请先查询明细，不要重复提交",
+        ));
+    }
+    for bonus in &bonuses {
+        let after = bonus
+            .remaining()
+            .ok_or_else(|| Error::http(502, "官方奖励余额未能确认，请先查询积分明细"))?;
+        let previous = old_bonuses.iter().find(|old| old.id == bonus.id);
+        let delta = match previous {
+            Some(previous) => {
+                after
+                    - previous
+                        .remaining()
+                        .ok_or_else(|| Error::http(502, "领取前奖励余额未知，无法确认新增积分"))?
+            }
+            None => after,
+        }
+        .max(0.0);
+        gained += delta;
+        if delta > 0.0 {
+            rewards.push(json!({ "key": bonus.id, "title": bonus.name, "ok": true, "already": false, "gained": delta }));
+        }
+    }
+    if !gained.is_finite() {
+        return Err(Error::http(502, "官方奖励积分读数无效，请查询后再操作"));
+    }
+    let ids: Vec<String> = bonuses.iter().map(|bonus| bonus.id.clone()).collect();
     let message = if gained > 0.0 {
         format!("已领取 {gained:.0} 积分")
     } else {
-        "今天没有可领的奖励（或已领过）".to_string()
+        "今天没有可领的奖励（或已领过）".into()
     };
-    let rewards: Vec<Value> = bonuses
-        .iter()
-        .map(|bonus| {
-            json!({
-                "key": bonus.activity_id,
-                "title": bonus.name,
-                "ok": true,
-                "already": false,
-                "gained": bonus.remaining(),
-            })
-        })
-        .collect();
-    Ok(json!({ "success": true, "msg": message, "gained": gained, "rewards": rewards }))
-}
-
-/// 把 `{success, msg, gained}` 翻成网关认的四档结论（`checkin.claim` 的最终形态）。
-///
-/// 与 [`claim`] 的分工：那个返回本家的原始形状（`onboarding::claim_all` 读它），
-/// 这个把它翻成 `{outcome, credit, streak, message}`。
-pub fn report_of(claim: &Value) -> Value {
-    let success = claim.get("success").and_then(Value::as_bool).unwrap_or(false);
-    let message = claim
-        .get("msg")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .map(str::to_string);
-    let gained = claim
-        .get("gained")
-        .and_then(Value::as_f64)
-        .filter(|points| *points > 0.0);
-    let credit = gained.map(|points| format!("{points:.0} 积分"));
-    // 没有增量读数（领取前那次查询失败）时按 `success` 判：上游说成了就是成了
-    let outcome = if !success {
-        "failed"
-    } else if gained.is_some() || claim.get("gained").is_none() {
-        "claimed"
-    } else {
-        // `gained: 0` = 今天没有可领的（上游已结算过）
-        "done"
-    };
-    json!({
-        "outcome": outcome,
-        "credit": credit,
-        "streak": Value::Null,
-        "message": message,
-    })
-}
-
-/// `checkin.claim` 的实现入口：跑一次签到并翻成协议档位。
-pub fn checkin() -> Result<Value> {
-    match claim() {
-        Ok(value) => Ok(report_of(&value)),
-        Err(error) => Ok(json!({
-            "outcome": "failed",
-            "credit": Value::Null,
-            "streak": Value::Null,
-            "message": error.message,
-        })),
+    let mut value =
+        json!({ "success": true, "msg": message, "gained": gained, "rewards": rewards });
+    context.verify()?;
+    if put_attempt(
+        &reserved,
+        json!({ "day": day, "binding": binding, "status": "confirmed", "at": sdk::now() }),
+    )
+    .is_err()
+    {
+        util::warning(
+            &mut value,
+            "奖励结算已确认，但一次提交状态未能保存；请先查询再操作",
+        );
     }
+    if ledger::mark_claimed(&ids).is_err() {
+        util::warning(&mut value, "奖励已由官方确认到账，但本地奖励台账未保存");
+    }
+    Ok(value)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn report_maps_gained_zero_to_done() {
-        let report = report_of(&json!({ "success": true, "msg": "今天没有可领的奖励", "gained": 0.0 }));
-        assert_eq!(report["outcome"], json!("done"));
-        assert_eq!(report["credit"], Value::Null);
-        let report = report_of(&json!({ "success": true, "msg": "已领取 1000 积分", "gained": 1000.0 }));
-        assert_eq!(report["outcome"], json!("claimed"));
-        assert_eq!(report["credit"], json!("1000 积分"));
-        // 没有增量读数时按 success 判
-        let report = report_of(&json!({ "success": true, "msg": "已签到" }));
-        assert_eq!(report["outcome"], json!("claimed"));
-        let report = report_of(&json!({ "success": false, "msg": "套餐已到期" }));
-        assert_eq!(report["outcome"], json!("failed"));
-        assert_eq!(report["message"], json!("套餐已到期"));
+pub fn report() -> Result<Value> {
+    let value = claim()?;
+    let gained = value["gained"].as_f64().unwrap_or(0.0);
+    let mut report = json!({ "outcome": if gained > 0.0 { "claimed" } else { "done" },
+        "credit": if gained > 0.0 { Some(format!("{gained:.0} 积分")) } else { None },
+        "streak": null, "message": value["msg"] });
+    if let Some(warnings) = value.get("warnings") {
+        report["warnings"] = warnings.clone();
     }
+    Ok(report)
 }

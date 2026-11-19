@@ -1,188 +1,20 @@
-//! Accio 额度查询：归一成账号页的统一形状（`usage.query` 的契约）。
-//!
-//! ── 上游给的是什么 ──────────────────────────────────────────
-//! `GET /api/entitlement/quota?accessToken=…` → `{usagePercent, refreshCountdownSeconds}`
-//! （桌面端本地路由 `/auth/quota` 就是把它算成这两个数给界面用的）。
-//! 另有 `GET /api/entitlement/currentSubscription?accessToken=…` 给订阅详情
-//! （套餐名 / 到期时间 / 剩余额度），它可能不存在（免费账号），失败就当没有。
-//!
-//! ── 双限额：百分比 + 积分 ────────────────────────────────────
-//! Accio 的额度是**两重闸门**，两个都要看：
-//!   · `/api/entitlement/quota` → `usagePercent`：百分比窗口，`refreshCountdownSeconds`
-//!     后重置（实测 24 小时）。这是「这一轮还能不能用」。
-//!   · `currentSubscription` → `remainQuota` / `totalQuota`：积分余额（实测国内版
-//!     600 / 600）。这是「账户里还剩多少额度」，花完不会随窗口重置。
-//! 只显示百分比会让用户看不到积分余量，而积分才是会被真正扣完的那一侧。
-//! 因此 `wallets` 里两条都给：`额度余量`（%）与 `积分`（绝对数）。
-//!
-//! ── 为什么 available 给 null ────────────────────────────────
-//! `/quota` 不暴露「还剩多少积分」的绝对数，只有一个**已用百分比**；而积分
-//! 只在订阅接口里、可能整条不存在（免费账号）。`available` 是「可用总量」这
-//! 一个数的位置，两种单位混不进同一个字段，所以按契约给 null（判不出就给 null）。
-//!   - `unit` = `"%"`；
-//!   - `wallets[0]` = 「额度余量」= `100 - usagePercent`，重置倒计时写进 `detail`；
-//!   - `wallets[1]` = 「积分」，仅在订阅接口真给了 `remainQuota` 时出现；
-//!   - `subscription` 用 `remainQuota / totalQuota` 承载同一件事。
-//!
-//! ── 401 为什么原样透出 ──────────────────────────────────────
-//! 契约要求：调用方据此走「刷新后重试一次」。
-//!
-//! ── 硬约束 ──────────────────────────────────────────────────
-//! release 是 `panic=abort`：零 unwrap/expect/panic。
+//! 原生 Accio 双读数：quota 百分比窗口 + 可选订阅积分。不把国内 600 分套到国际。
+//! 未返回的积分为空，不能补 0；来源 id/单位分开，修正旧钱包循环把积分也当百分比的行为。
 
-use agent2api_wasm_sdk::{json, Result, Value};
+use crate::{endpoints, errors, network, refresh, util};
+use agent2api_wasm_sdk::{json, Error, Result, Value};
 
-use super::credential;
-use super::region;
-use super::upstream;
-
-/// 查一个账号的额度 / 订阅，归一成统一形状。
-pub fn query() -> Result<Value> {
-    let record = credential::record()?;
-    let credentials = credential::credential(&record)?;
-
-    // ── 额度用量 ────────────────────────────────────────────────
-    let quota = upstream::get_with_token(region::QUOTA_PATH, &credentials.access_token, &[])?;
-    let quota = upstream::unwrap_data(quota);
-    let usage_percent = quota
-        .get("usagePercent")
-        .or_else(|| quota.get("usage_percent"))
-        .and_then(Value::as_f64)
-        .filter(|value| value.is_finite() && (0.0..=100.0).contains(value))
-        .ok_or_else(|| {
-            agent2api_wasm_sdk::Error::http(502, "Accio 额度查询未返回有效用量，无法确认剩余额度")
-        })?;
-    let countdown = quota
-        .get("refreshCountdownSeconds")
-        .or_else(|| quota.get("refresh_countdown_seconds"))
-        .and_then(Value::as_f64);
-    let remain = (100.0 - usage_percent).max(0.0);
-
-    // ── 订阅（可选，失败不影响额度的展示）──────────────────────
-    let subscription = match upstream::get_with_token(
-        region::SUBSCRIPTION_PATH,
-        &credentials.access_token,
-        &[],
-    ) {
-        Ok(payload) => subscription_shape(&upstream::unwrap_data(payload)),
-        // 免费账号可以没有订阅；鉴权失败仍需触发调用方的刷新重试。
-        Err(_) => Value::Null,
-    };
-
-    let mut wallet = json!({
-        "type": "entitlement",
-        "displayName": "额度余量",
-        "balance": remain,
-        "unit": "%",
-        "usedPercent": usage_percent,
-    });
-    if let Some(seconds) = countdown.filter(|value| *value > 0.0) {
-        wallet["detail"] = Value::String(format!("{} 后重置", humanize_seconds(seconds)));
-    }
-    let mut wallets = vec![wallet];
-
-    // ── 积分（第二重限额）────────────────────────────────────
-    // Accio 是**双限额**：`/quota` 给的是百分比闸门，`currentSubscription`
-    // 里的 `remainQuota` / `totalQuota` 是积分闸门（实测国内版 600 / 600）。
-    // 只显示百分比会让「还剩多少积分」这件事完全看不到 —— 而积分是真正会
-    // 被扣完的那一侧，百分比窗口每天还会重置。
-    //
-    // 只在上游确实给了积分读数时才加这一行：免费账号没有订阅、或上游换了
-    // 字段名时，凭空补一条「积分 0」比不显示更糟（会被读成「已经用完了」）。
-    let credits = credit_reading(&subscription);
-    if let Some((remain_credits, total_credits)) = credits {
-        let mut wallet = json!({
-            "type": "credits",
-            "displayName": "积分",
-            "balance": remain_credits,
-            "unit": "积分",
-        });
-        if let Some(total) = total_credits {
-            wallet["total"] = json!(total);
-            // 上游给了总量就一并报已用比例：明细面板能并排显示两个数。
-            if total > 0.0 {
-                wallet["usedPercent"] =
-                    json!(((total - remain_credits) / total * 100.0).clamp(0.0, 100.0));
-            }
-        }
-        wallets.push(wallet);
-    }
-
-    Ok(json!({
-        // 上游的 `/quota` 只有百分比、没有绝对剩余量，所以 `available` 给 null：
-        // 两种单位（% 与积分）混不进同一个数值字段。
-        "available": Value::Null,
-        // 余额列只有几十像素宽、只画一行，所以这一家的两重限额在这里合成一句
-        // （「可用 100% · 600 积分」）。不带积分时退回纯百分比。
-        "availableView": match credits {
-            Some((remain_credits, _)) => format!("{remain:.0}% · {} 积分", compact_number(remain_credits)),
-            None => format!("{remain:.0}%"),
-        },
-        "unit": "%",
-        "wallets": wallets,
-        "subscription": subscription,
-        "raw": {
-            "quota": quota,
-            "region": region::REGION.edition(),
-            "account": credentials.user_id,
-        },
-    }))
+fn number(value: Option<&Value>) -> Option<f64> {
+    value
+        .and_then(|value| {
+            value
+                .as_f64()
+                .or_else(|| value.as_str()?.trim().parse().ok())
+        })
+        .filter(|value| value.is_finite())
 }
 
-/// 从 `subscription` 形状里取积分读数：`(剩余, 总量)`。
-///
-/// 判据是**结构**不是 provider：`remainQuota` 存在且是有限数才算读到。
-/// 总量缺失或为 0 时只回剩余（不编造分母）。
-fn credit_reading(subscription: &Value) -> Option<(f64, Option<f64>)> {
-    let remain = subscription.get("remainQuota").and_then(Value::as_f64)?;
-    if !remain.is_finite() || remain < 0.0 {
-        return None;
-    }
-    let total = subscription
-        .get("totalQuota")
-        .and_then(Value::as_f64)
-        .filter(|value| value.is_finite() && *value > 0.0);
-    Some((remain, total))
-}
-
-/// 订阅响应 → 契约里的 `subscription` 形状（字段名宽口径）。
-fn subscription_shape(payload: &Value) -> Value {
-    let text = |keys: &[&str]| -> Value {
-        keys.iter()
-            .find_map(|key| payload.get(*key).and_then(Value::as_str))
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| Value::String(value.to_string()))
-            .unwrap_or(Value::Null)
-    };
-    let number = |keys: &[&str]| -> Value {
-        keys.iter()
-            .find_map(|key| payload.get(*key).and_then(Value::as_f64))
-            .map(|value| json!(value))
-            .unwrap_or(Value::Null)
-    };
-    let expire = ["expireAt", "expiresAt", "endTime", "end_time"]
-        .iter()
-        .find_map(|key| payload.get(*key))
-        .cloned()
-        .unwrap_or(Value::Null);
-    json!({
-        "planName": text(&["planName", "plan_name", "productName", "name"]),
-        "status": text(&["status", "state"]),
-        "expireAt": expire,
-        "remainQuota": number(&["remainQuota", "remain", "remaining", "leftQuota"]),
-        "totalQuota": number(&["totalQuota", "total", "quota"]),
-    })
-}
-
-/// 积分读数 → 紧凑展示串（`600` / `1.2 万`）。
-///
-/// 余额列只有几十像素宽，五位以上的整数会把它撑爆；万位以上折成「万」，
-/// 与界面别处的紧凑口径一致。整数直接不带小数点。
-fn compact_number(value: f64) -> String {
-    if !value.is_finite() {
-        return "0".to_string();
-    }
-    let value = value.max(0.0);
+fn compact(value: f64) -> String {
     if value >= 10_000.0 {
         format!("{:.1} 万", value / 10_000.0)
     } else if value.fract() == 0.0 {
@@ -192,41 +24,182 @@ fn compact_number(value: f64) -> String {
     }
 }
 
-/// 秒 → 「3 小时 20 分」这类人话（界面直接显示）
-fn humanize_seconds(seconds: f64) -> String {
-    let total = seconds.max(0.0) as i64;
-    let days = total / 86_400;
-    let hours = (total % 86_400) / 3_600;
-    let minutes = (total % 3_600) / 60;
-    if days > 0 {
-        format!("{days} 天 {hours} 小时")
-    } else if hours > 0 {
-        format!("{hours} 小时 {minutes} 分")
-    } else if minutes > 0 {
-        format!("{minutes} 分")
+fn duration(value: f64) -> String {
+    let total = value.max(0.0) as i64;
+    if total >= 86_400 {
+        format!("{} 天 {} 小时", total / 86_400, (total % 86_400) / 3600)
+    } else if total >= 3600 {
+        format!("{} 小时 {} 分", total / 3600, (total % 3600) / 60)
+    } else if total >= 60 {
+        format!("{} 分", total / 60)
     } else {
         format!("{total} 秒")
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+fn subscription(value: &Value) -> Value {
+    let read = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|key| number(value.get(*key)))
+            .filter(|value| *value >= 0.0)
+    };
+    let expires = ["expireAt", "expiresAt", "endTime", "end_time"]
+        .iter()
+        .find_map(|key| util::timestamp(value.get(*key)));
+    json!({ "planName": util::text(value, &["planName", "plan_name", "productName", "name"]),
+        "status": util::text(value, &["status", "state"]), "expireAt": expires,
+        "remainQuota": read(&["remainQuota", "remain", "remaining", "leftQuota"]),
+        "totalQuota": read(&["totalQuota", "total", "quota"]), "entitlement": buckets(value) })
+}
 
-    /// 积分只在上游真给了 `remainQuota` 时出现；只有总量不算读到。
-    #[test]
-    fn credit_reading_requires_remaining() {
-        assert_eq!(None, credit_reading(&json!({ "totalQuota": 600.0 })));
-        assert_eq!(Some((600.0, Some(600.0))), credit_reading(&json!({ "remainQuota": 600.0, "totalQuota": 600.0 })));
-        assert_eq!(None, credit_reading(&json!({ "remainQuota": -1.0 })));
+fn buckets(value: &Value) -> Value {
+    let mut result = json!({});
+    for key in ["daily", "monthly", "referral"] {
+        let bucket = &value["entitlement"][key];
+        let Some(remaining) = number(bucket.get("remaining")).filter(|value| *value >= 0.0) else {
+            continue;
+        };
+        result[key] = json!({ "remaining": remaining,
+            "total": number(bucket.get("total")).filter(|value| *value >= 0.0),
+            "used": number(bucket.get("used")).filter(|value| *value >= 0.0) });
     }
+    result
+}
 
-    /// 倒计时按人话分档。
-    #[test]
-    fn humanize_seconds_buckets() {
-        assert_eq!("2 天 3 小时", humanize_seconds(183_600.0));
-        assert_eq!("3 小时 20 分", humanize_seconds(12_000.0));
-        assert_eq!("45 分", humanize_seconds(2_700.0));
-        assert_eq!("30 秒", humanize_seconds(30.0));
+fn read(session: &refresh::Session) -> Result<Value> {
+    refresh::check(session)?;
+    let credential = &session.credentials;
+    let quota_result = network::get(credential, endpoints::QUOTA);
+    let quota = match &quota_result {
+        Ok(value) => network::data(value.clone()),
+        Err(error) if errors::host_stop(error) || error.status == Some(401) => {
+            return Err(error.clone())
+        }
+        Err(_) => Value::Null,
+    };
+    refresh::check(session)?;
+    let percent = number(
+        quota
+            .get("usagePercent")
+            .or_else(|| quota.get("usage_percent")),
+    )
+    .filter(|value| (0.0..=100.0).contains(value));
+    let remaining = percent.map(|percent| 100.0 - percent);
+    let countdown = number(
+        quota
+            .get("refreshCountdownSeconds")
+            .or_else(|| quota.get("refresh_countdown_seconds")),
+    )
+    .filter(|value| *value >= 0.0 && *value <= 31_536_000.0);
+    let expires = countdown
+        .map(|seconds| util::now().map(|now| now.saturating_add((seconds * 1000.0) as i64)))
+        .transpose()?;
+    let subscription = match network::get(credential, endpoints::SUBSCRIPTION) {
+        Ok(value) => subscription(&network::data(value)),
+        Err(error) if errors::host_stop(&error) || error.status == Some(401) => return Err(error),
+        // 免费账号可没有订阅，但不能伪造积分读数。
+        Err(_) => Value::Null,
+    };
+    refresh::check(session)?;
+    let mut wallet = json!({ "type": "entitlement", "displayName": "额度余量", "balance": remaining,
+        "unit": "%", "usedPercent": percent, "resetsAt": expires });
+    if let Some(seconds) = countdown.filter(|value| *value > 0.0) {
+        wallet["detail"] = json!(format!("{} 后重置", duration(seconds)));
     }
+    let mut wallets = if percent.is_some() {
+        vec![wallet]
+    } else {
+        Vec::new()
+    };
+    for (key, label) in [
+        ("daily", "每日积分"),
+        ("monthly", "每月积分"),
+        ("referral", "推荐积分"),
+    ] {
+        let bucket = &subscription["entitlement"][key];
+        let Some(balance) = number(bucket.get("remaining")) else {
+            continue;
+        };
+        let total = number(bucket.get("total")).filter(|value| *value > 0.0);
+        let used =
+            number(bucket.get("used")).or_else(|| total.map(|total| (total - balance).max(0.0)));
+        let mut wallet = json!({ "type": "credits", "sourceId": key, "displayName": label,
+            "balance": balance, "unit": "积分", "total": total, "used": used });
+        if let Some((total, used)) = total.zip(used) {
+            wallet["usedPercent"] = json!((used / total * 100.0).clamp(0.0, 100.0));
+        }
+        if key == "daily" {
+            wallet["resetsAt"] = json!(expires);
+        }
+        wallets.push(wallet);
+    }
+    let credits = number(subscription.get("remainQuota")).filter(|value| *value >= 0.0);
+    if let Some(credits) =
+        credits.filter(|_| !wallets.iter().any(|wallet| wallet["type"] == "credits"))
+    {
+        let total = number(subscription.get("totalQuota")).filter(|total| *total > 0.0);
+        let mut wallet =
+            json!({ "type": "credits", "displayName": "积分", "balance": credits, "unit": "积分" });
+        if let Some(total) = total {
+            wallet["total"] = json!(total);
+            wallet["usedPercent"] = json!(((total - credits) / total * 100.0).clamp(0.0, 100.0));
+        }
+        wallets.push(wallet);
+    }
+    let credits = credits.or_else(|| {
+        let values: Vec<f64> = wallets
+            .iter()
+            .filter(|wallet| wallet["type"] == "credits")
+            .filter_map(|wallet| number(wallet.get("balance")))
+            .collect();
+        (!values.is_empty()).then(|| values.iter().sum::<f64>())
+    });
+    if wallets.is_empty() {
+        return Err(quota_result.err().unwrap_or_else(|| {
+            Error::http(
+                502,
+                "Accio 额度未返回有效用量或积分，不能把未知剩余量显示为零",
+            )
+        }));
+    }
+    let view = match (remaining, credits) {
+        (Some(remaining), Some(credits)) => format!("{remaining:.0}% · {} 积分", compact(credits)),
+        (Some(remaining), None) => format!("{remaining:.0}%"),
+        (None, Some(credits)) => format!("{} 积分", compact(credits)),
+        _ => String::new(),
+    };
+    let mut report = json!({ "available": null, "availableView": view,
+        "unit": if percent.is_some() { "%" } else { "积分" }, "wallets": wallets, "subscription": subscription,
+        "raw": { "quota": { "usagePercent": percent, "refreshCountdownSeconds": countdown }, "region": endpoints::EDITION, "account": credential.user } });
+    report["quotaSources"] = sources(&report);
+    Ok(errors::sanitize(&report, &credential.secrets()))
+}
+
+pub fn query() -> Result<Value> {
+    // 余额本身先用只读凭据；明确 401 才续期一次，防止每次查看余额都消耗刷新链。
+    let session = refresh::snapshot()?;
+    match read(&session) {
+        Err(error) if error.status == Some(401) && !session.credentials.refresh.is_empty() => {
+            read(&refresh::after_rejection(&session.credentials)?)
+        }
+        result => result,
+    }
+}
+
+pub fn sources(report: &Value) -> Value {
+    let mut sources = Vec::new();
+    for wallet in report["wallets"].as_array().into_iter().flatten() {
+        match wallet["type"].as_str() {
+            Some("entitlement") => sources.push(json!({ "provider": endpoints::ID, "id": "entitlement", "label": "额度余量",
+                "unit": "%", "remainingPercent": wallet["balance"], "resetsAt": wallet["resetsAt"] })),
+            Some("credits") => sources.push(json!({ "provider": endpoints::ID,
+                "id": wallet["sourceId"].as_str().unwrap_or("credits"),
+                "label": wallet["displayName"].as_str().unwrap_or("积分"), "unit": "积分",
+                "remaining": wallet["balance"], "total": wallet.get("total"), "resetsAt": wallet.get("resetsAt"),
+                "used": number(wallet.get("used")).or_else(|| number(wallet.get("total"))
+                    .zip(number(wallet.get("balance"))).map(|(total, remaining)| (total - remaining).max(0.0))) })),
+            _ => {}
+        }
+    }
+    json!(sources)
 }

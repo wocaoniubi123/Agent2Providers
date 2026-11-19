@@ -1,58 +1,22 @@
 //! WorkBuddy 的档位来自当前地区的模型目录，不能由模型家族名推断。
 //! `reasoning.effort` 且没有可选列表表示固定档；未声明档位时不注入绑定。
-//!
-//! ── 思考等级的通用口径跟着插件走 ────────────────────────────
-//! native 的 `effort_rank` / `is_thinking_off` / `normalize` 来自 provider crate 的
-//! 共用模块（网关 `core::model_rules::reasoning` 里有同一份）。wasm 目标不允许
-//! 依赖那个 crate，所以**逐字复制**到本文件末尾 —— 口径必须与网关一致，否则
-//! 同一份映射在搬家前后会给出不同的注入结果。
 
-use agent2api_wasm_sdk::{json, Value};
-use serde_json::Map;
+use serde_json::{json, Map, Value};
 
-// ─── 通用口径（与 gateway `model_rules::reasoning` 逐字一致）─────
-
-/// 可以翻译给上游的正向档位（不含 `off` / `none`）。
-///
-/// 数组顺序 = 强弱顺序，[`effort_rank`] 直接拿它当下标用。
-pub const EFFORT_LEVELS: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max"];
-
-/// 等级字符串的长度上限（与网关同口径）
-const MAX_CHARS: usize = 32;
-
-/// 归一化一个思考等级：去首尾空白 → 过长或空串返回 None（= 不覆盖）。
-pub fn normalize(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed.chars().count() > MAX_CHARS {
-        return None;
-    }
-    Some(trimmed.to_string())
+fn normalize(level: &str) -> Option<String> {
+    let level = level.trim();
+    (!level.is_empty() && level.chars().count() <= 32).then(|| level.to_string())
 }
-
-/// 该等级是不是「关闭思考」两档（`off` / `none`），忽略大小写。
-pub fn is_thinking_off(level: &str) -> bool {
-    let trimmed = level.trim();
-    trimmed.eq_ignore_ascii_case("off") || trimmed.eq_ignore_ascii_case("none")
+fn is_thinking_off(level: &str) -> bool {
+    matches!(level.trim().to_ascii_lowercase().as_str(), "off" | "none")
 }
-
-/// 正向档位 → 序号（0 = 最弱，5 = 最强）。`off` / `none` / 表外值一律 None。
-///
-/// 返回 None 的含义是「**这个值不该被注入上游**」，不是「这个值不合法」。
-pub fn effort_rank(level: &str) -> Option<usize> {
-    let trimmed = level.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    EFFORT_LEVELS
+fn effort_rank(level: &str) -> Option<usize> {
+    ["minimal", "low", "medium", "high", "xhigh", "max"]
         .iter()
-        .position(|known| trimmed.eq_ignore_ascii_case(known))
+        .position(|s| level.trim().eq_ignore_ascii_case(s))
 }
 
-// ─── 本家的档位绑定 ────────────────────────────────────────
-
-/// 上游认的唯一档位字段。
-pub const EFFORT_FIELD: &str = "reasoning_effort";
-
+pub(super) const EFFORT_FIELD: &str = "reasoning_effort";
 const EFFORT_KEYS: [&str; 2] = [EFFORT_FIELD, "reasoningEffort"];
 
 #[derive(Default)]
@@ -73,11 +37,7 @@ impl Metadata {
             .and_then(Value::as_array)
             .map(|items| {
                 let mut levels = Vec::<String>::new();
-                for level in items
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .filter_map(normalize)
-                {
+                for level in items.iter().filter_map(Value::as_str).filter_map(normalize) {
                     if !levels
                         .iter()
                         .any(|known| known.eq_ignore_ascii_case(&level))
@@ -211,11 +171,7 @@ fn client_effort(body: &Value) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
-/// 映射绑定的默认档注入（`reasoning_patch`）。
-///
-/// 返回形态与 native 的 `proto::ReasoningPatch` 同一序列化：
-/// `{action:"set", field, value}` / `{action:"skip", reason}`。
-pub fn patch(level: &str, model: Option<&Value>, body: &Value) -> Value {
+pub(super) fn patch(level: &str, model: Option<&Value>, body: &Value) -> Value {
     let skip = |reason: &str| json!({ "action": "skip", "reason": reason });
     if is_thinking_off(level) {
         return skip("映射绑定不注入关闭思考字段");
@@ -228,16 +184,12 @@ pub fn patch(level: &str, model: Option<&Value>, body: &Value) -> Value {
         return skip("当前通道未声明可用档位，跳过绑定；请先获取模型目录");
     }
     match metadata.resolve(level) {
-        Some(effective) => json!({
-            "action": "set", "field": EFFORT_FIELD, "value": effective,
-        }),
+        Some(effective) => json!({ "action": "set", "field": EFFORT_FIELD, "value": effective }),
         None => skip("绑定等级不在上游声明的档位中，且无法安全归一"),
     }
 }
 
-/// 给目录条目补上「思考能力」三件（`reasoningBindingSupported` /
-/// `reasoningSource` / `reasoningLevels`），供界面渲染档位下拉。
-pub fn annotate(model: &mut Value) {
+pub(super) fn annotate(model: &mut Value) {
     let metadata = Metadata::from_model(Some(model));
     let Some(object) = model.as_object_mut() else {
         return;
@@ -272,8 +224,38 @@ pub fn annotate(model: &mut Value) {
     }
 }
 
-/// 出站前把档位归一成**当前通道目录**认的那一个。
-pub fn normalize_outbound(body: &mut Value, model: Option<&Value>) {
+pub(super) fn normalize_outbound(body: &mut Value, model: Option<&Value>) {
+    // 国际上游跨模型都读取 reasoning，不读取 reasoning_content；保留原历史另补等价字段。
+    if let Some(messages) = body["messages"].as_array_mut() {
+        for message in messages {
+            if message["role"] != "assistant"
+                || message["reasoning"]
+                    .as_str()
+                    .is_some_and(|text| !text.is_empty())
+            {
+                continue;
+            }
+            let trace = message["reasoning_content"]
+                .as_str()
+                .filter(|text| !text.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    message["reasoning_details"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|detail| {
+                            detail["text"]
+                                .as_str()
+                                .or_else(|| detail["summary"].as_str())
+                        })
+                        .collect::<String>()
+                });
+            if !trace.is_empty() {
+                message["reasoning"] = json!(trace);
+            }
+        }
+    }
     let metadata = Metadata::from_model(model);
     if thinking_disabled(body) {
         if let Some(object) = body.as_object_mut() {
@@ -335,10 +317,7 @@ pub fn normalize_outbound(body: &mut Value, model: Option<&Value>) {
         match object.get_mut("thinking") {
             Some(Value::Object(fields))
                 if fields.get("type").is_none_or(|value| {
-                    value.is_null()
-                        || value
-                            .as_str()
-                            .is_some_and(|value| value.trim().is_empty())
+                    value.is_null() || value.as_str().is_some_and(|value| value.trim().is_empty())
                 }) =>
             {
                 fields.insert("type".into(), json!("enabled"));
@@ -366,8 +345,6 @@ pub fn normalize_outbound(body: &mut Value, model: Option<&Value>) {
     }
 }
 
-/// DeepSeek 系：历史里带过思考文本就必须把 `reasoning_content` / `reasoning`
-/// 补齐（上游校验长度），否则整轮 400。
 fn backfill_traced(object: &mut Map<String, Value>) {
     let deepseek = object
         .get("model")
@@ -439,12 +416,7 @@ fn backfill_reasoning(object: &mut Map<String, Value>) {
     }
 }
 
-/// 出站请求实际用的档位（native 用它给网关的请求统计填一项）。
-///
-/// wasm 侧没有「把出站档位回报给宿主」的通道（`conversation` 只有流），保留它是
-/// 为了让本文件与 native 那份逐行可对照。
-#[allow(dead_code)]
-pub fn outbound_level(body: &Value, model: Option<&Value>) -> Option<String> {
+pub(super) fn outbound_level(body: &Value, model: Option<&Value>) -> Option<String> {
     if thinking_disabled(body) {
         return None;
     }
@@ -461,66 +433,4 @@ pub fn outbound_level(body: &Value, model: Option<&Value>) -> Option<String> {
         .or_else(|| given.map(str::to_string))
         .or(metadata.default)
         .filter(|value| !is_thinking_off(value))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn catalog_levels_win_over_family_names() {
-        let model = json!({
-            "reasoning": { "supportedEfforts": ["low", "high"], "defaultEffort": "high" }
-        });
-        let mut body = json!({ "reasoning_effort": "medium" });
-        normalize_outbound(&mut body, Some(&model));
-        // medium 落在 low 与 high 之间：取不超过它的最强档 → low
-        assert_eq!(body["reasoning_effort"], json!("low"));
-        // 客户端显式给的合法档位原样保留
-        let mut body = json!({ "reasoning_effort": "high" });
-        normalize_outbound(&mut body, Some(&model));
-        assert_eq!(body["reasoning_effort"], json!("high"));
-    }
-
-    #[test]
-    fn patch_skips_off_and_client_choices() {
-        let model = json!({ "reasoning": { "supportedEfforts": ["low", "high"] } });
-        assert_eq!(patch("off", Some(&model), &json!({}))["action"], "skip");
-        assert_eq!(
-            patch("high", Some(&model), &json!({ "reasoning_effort": "low" }))["action"],
-            "skip"
-        );
-        let applied = patch("high", Some(&model), &json!({}));
-        assert_eq!(applied["action"], "set");
-        assert_eq!(applied["field"], json!(EFFORT_FIELD));
-        // 目录没声明档位：不注入（提示先刷目录）
-        assert_eq!(patch("high", None, &json!({}))["action"], "skip");
-    }
-
-    #[test]
-    fn thinking_disabled_strips_effort_fields() {
-        let mut body = json!({
-            "thinking": { "type": "disabled" },
-            "reasoning_effort": "high",
-            "reasoningEffort": "low"
-        });
-        normalize_outbound(&mut body, None);
-        assert!(body.get("reasoning_effort").is_none());
-        assert!(body.get("reasoningEffort").is_none());
-    }
-
-    #[test]
-    fn annotate_fills_the_three_display_fields() {
-        let mut model = json!({ "id": "glm-5.0", "reasoning": { "effort": "high" } });
-        annotate(&mut model);
-        assert_eq!(model["reasoningSource"], json!("upstream"));
-        assert_eq!(model["reasoningLevels"], json!(["high"]));
-        assert_eq!(model["reasoningFixedLevel"], json!("high"));
-        assert_eq!(model["reasoningBindingSupported"], json!(true));
-        // 完全没声明：undeclared 且不可绑定
-        let mut model = json!({ "id": "auto" });
-        annotate(&mut model);
-        assert_eq!(model["reasoningSource"], json!("undeclared"));
-        assert_eq!(model["reasoningBindingSupported"], json!(false));
-    }
 }

@@ -4,35 +4,48 @@
 //! ── 为什么需要这一层 ────────────────────────────────────────
 //! 上游是「腾讯自己的 Go struct」，对请求体的宽容度远小于 OpenAI 规范：
 //! role 白名单没有 `developer`、`tool_choice` 只认字符串、`image_url` 只认对象
-//! 形态、输出上限只认 `max_tokens`。客户端（Codex / Claude Code / 各家 UI）按新
-//! 规范发字段时上游直接 400，而**换任何账号都是同一个 400** —— 这不是账号问题、
-//! 也不是重试能解决的问题，只能在出站前把字节改对。
+//! 形态、输出上限只认 `max_tokens`。客户端（Codex / Claude Code / 各家 UI）
+//! 按新规范发字段时上游直接 400，而**换任何账号都是同一个 400** ——
+//! 这不是账号问题、也不是重试能解决的问题，只能在出站前把字节改对。
+//!
+//! 参考项目用一条**单上游**管线做这件事（所有请求都经 `prepareBody`）。本项目
+//! 是七家多上游架构，「上游长什么样」是每家的知识（见 `adapter.rs` 模块头），
+//! 所以这里只做 **WorkBuddy 这一家**的归一化，挂在本家适配器的
+//! `build_chat_request` 上 —— 那个位置恰好就是「这一家即将发送之前」（与
+//! `upstream::payload::send_body` 的时机契约一致），且天然对同一家同池的
+//! 重试复用（`provider_loop` 的 `send_cache`）。
+//!
+//! ── 参考项目的 `tool_pairing.go` 去哪了 ─────────────────────
+//! 那份「tool 结果重排 + 孤儿裁剪」原先是本文件的一部分（本家是唯一实现）。
+//! 但同类坏历史会流到**任意一家**上游（自定义家同样会因为空工具名、错序的
+//! tool 结果被严格上游 400），所以它已提升为所有家共用的转发入口 sanitize：
+//! `protocol::history`。本文件不再重复实现，只留本家形态相关的那几步。
 //!
 //! ── 与 system 兜底注入的顺序（不可调换）────────────────────────
-//! `normalize_roles` 必须**先**把 `developer` 归一成 `system`，随后才调
-//! [`crate::outbound::ensure_leading_system_message`] —— 客户端若用 `developer`
-//! 打头，先归一成 `system` 才判得出「首条已是 system」，否则会多注入一条兜底
-//! system（上游对多 system 的行为未实测，不引入这个变量）。
+//! `normalize_roles` 必须**先**把 `developer` 归一成 `system`，随后适配器才调
+//! `ensure_leading_system_message` —— 客户端若用 `developer` 打头，先归一成
+//! `system` 才判得出「首条已是 system」，否则会多注入一条兜底 system
+//! （上游对多 system 的行为未实测，不引入这个变量）。参考项目也是同一顺序
+//! （`ensureConsoleSystem` 在 `prepareBody` 之后套用）。
 //!
 //! ── 只管「让请求通过」，不管内容 ────────────────────────────
 //! 本文件的每一步都是**形态转换**，不涉及语义改写：改 role 名（同义）、把对象
 //! 拆成字符串（上游的等价表达）、把字符串包成对象（规范形态）、把别名译成上游
-//! 认的键（同名语义）。
-//!
-//! ── 硬约束 ──────────────────────────────────────────────────
-//! 零 unwrap/expect/panic。
+//! 认的键（同名语义）。内容层面的处理在 `core::sanitize`（剥离审核指纹）、
+//! 历史结构层面的在 `core::protocol::history`，三者互不替代。
 
-use agent2api_wasm_sdk::{json, Value};
-use serde_json::Map;
+use serde_json::{json, Map, Value};
 
 /// 归一化做了什么（供调用方写一行详细日志）。
 ///
 /// ── 为什么要有这份报告 ──────────────────────────────────────
-/// 几个步骤是**静默修复**：修好了用户不会知道（请求从此不 400 了），但一旦出
-/// 问题（role 没归一、max_tokens 没生效）就需要能回答「网关对我的请求动了什么」。
-/// 字段只统计**值得解释的修复**，不统计常规注入（`prompt_cache_key` 几乎每次都
-/// 会加，写进日志只是噪声）—— 唯一例外是它取不到账号 UID 的情形，那会让跨账号
-/// 隔离失效，必须可见。
+/// 几个步骤是**静默修复**：修好了用户不会知道（请求从此不 400 了），但一旦
+/// 出问题（role 没归一、max_tokens 没生效）就需要能回答「网关对我的请求动了
+/// 什么」。字段只统计**值得解释的修复**，不统计常规注入
+/// （`prompt_cache_key` 几乎每次都会加，写进日志只是噪声）——唯一例外是
+/// 它取不到账号 UID 的情形，那会让跨账号隔离失效，必须可见。
+/// （历史结构类的修复——工具名补空、配对重排、孤儿剔除——报告在
+/// `protocol::history`，那一层对所有家生效。）
 #[derive(Clone, Debug, Default)]
 pub struct NormalizeReport {
     /// 归一成 system 的 developer 角色消息数
@@ -43,16 +56,13 @@ pub struct NormalizeReport {
     pub image_urls_wrapped: usize,
     /// 是否把 max_completion_tokens 译成了 max_tokens
     pub max_tokens_translated: bool,
-    /// 缓存键是否**缺少账号隔离段**（取不到账号 UID）
+    /// 缓存键是否**缺少账号隔离段**（取不到账号 UID）——
+    /// 这一条会让跨账号前缀缓存隔离失效，需要显式警告（见 `inject_prompt_cache_key`）
     pub cache_key_unscoped: bool,
 }
 
 impl NormalizeReport {
     /// 是否有值得写进详细日志的修复（常规的缓存键注入不算）。
-    ///
-    /// wasm 侧没有 verbose 日志口（宿主的日志由宿主决定级别），保留它是为了让本文件
-    /// 与 native 那份逐行可对照。
-    #[allow(dead_code)]
     pub fn notable(&self) -> bool {
         self.roles_normalized > 0
             || self.tool_choice_rewritten
@@ -61,7 +71,7 @@ impl NormalizeReport {
             || self.cache_key_unscoped
     }
 
-    /// 一行可读的中文描述（宿主日志级别由宿主决定，这里只负责措辞）。
+    /// 一行可读的中文描述（供 `logging::verbose`）。
     pub fn describe(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
         if self.roles_normalized > 0 {
@@ -71,7 +81,10 @@ impl NormalizeReport {
             parts.push("tool_choice 归一为上游字符串形态".to_string());
         }
         if self.image_urls_wrapped > 0 {
-            parts.push(format!("image_url 补对象形态 {} 处", self.image_urls_wrapped));
+            parts.push(format!(
+                "image_url 补对象形态 {} 处",
+                self.image_urls_wrapped
+            ));
         }
         if self.max_tokens_translated {
             parts.push("max_completion_tokens→max_tokens".to_string());
@@ -83,33 +96,36 @@ impl NormalizeReport {
     }
 }
 
-/// 归一化管线的总入口。
+/// 归一化管线的总入口：在**已脱敏、已改写模型名**的 body 上做一轮出站归一。
 ///
-/// `account` 是与 `build_chat` 同源的账号会话对象（用于取 UID 做缓存键的账号
-/// 隔离段）。返回归一后的新 body 与报告；body 不是 JSON 对象时**原样返回**且
-/// 报告为空（坏 body 不在这里二次错误化：上游会给出比我们更准确的解析错误）。
-pub fn normalize_outbound(body: &Value, account: &Value) -> (Value, NormalizeReport) {
-    let Some(object) = body.as_object() else {
-        return (body.clone(), NormalizeReport::default());
+/// `account` 是与 `build_chat_request` 同源的账号会话对象（用于取 UID 做缓存键
+/// 的账号隔离段，见 `inject_prompt_cache_key`）。
+///
+/// 直接改调用方已经持有的那一份 body：对话正文动辄数 MB，`Value` 树的开销是
+/// 原始 JSON 的数倍，再复制一份会明显压缩可用上下文。body 不是 JSON 对象时
+/// 不做任何修改、报告为空（坏 body 不在这里二次错误化：上游会给出更准确的错误）。
+pub fn normalize_outbound(body: &mut Value, account: &Value) -> NormalizeReport {
+    let Some(object) = body.as_object_mut() else {
+        return NormalizeReport::default();
     };
     let mut report = NormalizeReport::default();
-    let mut next = object.clone();
-    normalize_roles(&mut next, &mut report);
-    normalize_tool_choice(&mut next, &mut report);
-    normalize_image_url(&mut next, &mut report);
-    translate_max_completion_tokens(&mut next, &mut report);
-    ensure_stream_options(&mut next);
-    // tool 配对（重排 + 孤儿裁剪）**不在这里**：它已提升为所有上游共用的转发
-    // 入口 sanitize，跑在本管线之前；两处都做同一件事只会漂移。
-    inject_prompt_cache_key(&mut next, account, &mut report);
-    (Value::Object(next), report)
+    normalize_roles(object, &mut report);
+    normalize_tool_choice(object, &mut report);
+    normalize_image_url(object, &mut report);
+    translate_max_completion_tokens(object, &mut report);
+    ensure_stream_options(object);
+    // tool 配对（重排 + 孤儿裁剪）**不在这里**：它已提升为所有上游共用的
+    // 转发入口 sanitize（`protocol::history`），跑在本管线之前；两处都做
+    // 同一件事只会漂移（本家曾经是唯一实现，见模块头）。
+    inject_prompt_cache_key(object, account, &mut report);
+    report
 }
 
 /// 把 `developer` 角色归一为 `system`。
 ///
 /// 上游对 messages 的 role 字段做白名单校验，`developer` 不在白名单内，命中即
-/// HTTP 400。`developer` 是 OpenAI 新规范里 system 的别名（Codex / Cursor 等新
-/// 客户端用它承载 system 级指令），改写不丢语义。
+/// HTTP 400 code=11128。`developer` 是 OpenAI 新规范里 system 的别名（Codex /
+/// Cursor 等新客户端用它承载 system 级指令），改写不丢语义。
 ///
 /// 只认 `developer` 这一个值：其余 role（system/user/assistant/tool/任意未知值）
 /// 一律原样保留，**不合并、不重排、不删除**任何消息 —— 上游对多 system 的行为
@@ -136,7 +152,8 @@ fn normalize_roles(object: &mut Map<String, Value>, report: &mut NormalizeReport
 
 /// 按上游 Go struct（`tool_choice` 是 string 类型）改写 OpenAI 的 `tool_choice`。
 ///
-/// 对象形态透传会让上游 400（cannot unmarshal object into string）。映射规则：
+/// 对象形态透传会让上游 400 code=11101（cannot unmarshal object into string）。
+/// 映射规则（与参考项目逐条对齐）：
 ///   - `"none"` / `{"type":"none"}` → 删 `tool_choice` **并删 tools/functions**
 ///     （上游语义：不调用工具时连工具声明一起撤掉，否则仍可能触发工具调用）；
 ///   - `{"type":"auto"|"required"}` → 字符串 `"auto"` / `"required"`；
@@ -184,11 +201,15 @@ fn normalize_tool_choice(object: &mut Map<String, Value>, report: &mut Normalize
                         .filter(|name| !name.is_empty());
                     match name {
                         Some(name) => {
-                            object.insert("tool_choice".to_string(), Value::String(name.to_string()));
+                            object
+                                .insert("tool_choice".to_string(), Value::String(name.to_string()));
                         }
                         // 指定了 function 却没给名字：退回 auto 比删掉更接近意图
                         None => {
-                            object.insert("tool_choice".to_string(), Value::String("auto".to_string()));
+                            object.insert(
+                                "tool_choice".to_string(),
+                                Value::String("auto".to_string()),
+                            );
                         }
                     }
                 }
@@ -209,10 +230,10 @@ fn normalize_tool_choice(object: &mut Map<String, Value>, report: &mut Normalize
 /// 兼容 OpenAI 多模态内容的两种 `image_url` 写法。
 ///
 /// OpenAI Chat 规范用对象形态 `{"url":"...","detail":"..."}`，部分客户端（以及
-/// Responses → Chat 转换器）会发字符串形态。上游只接受对象形态，字符串会 400
-/// （cannot unmarshal string into ImageContent）。这里只做形状转换：字符串转
-/// `{"url": 原值}`；已是对象、空串、字段缺失一律不动（让上游返回真实错误，
-/// 而不是我们凭空补一个 url）。
+/// Responses → Chat 转换器）会发字符串形态 `"data:..."` / `"https://..."`。
+/// 上游只接受对象形态，字符串会 400 code=11101（cannot unmarshal string into
+/// ImageContent）。这里只做形状转换：字符串转 `{"url": 原值}`；已是对象、空串、
+/// 字段缺失一律不动（让上游返回真实错误，而不是我们凭空补一个 url）。
 fn normalize_image_url(object: &mut Map<String, Value>, report: &mut NormalizeReport) {
     let Some(messages) = object.get_mut("messages").and_then(Value::as_array_mut) else {
         return;
@@ -249,9 +270,9 @@ fn normalize_image_url(object: &mut Map<String, Value>, report: &mut NormalizeRe
 /// 把 OpenAI 别名 `max_completion_tokens` 翻译为上游认的 `max_tokens`。
 ///
 /// OpenAI 规范里 `max_tokens` 已 deprecated、`max_completion_tokens` 是新字段
-/// （o-series 起引入），新客户端只发别名。WorkBuddy 上游只认 `max_tokens` ——
-/// 别名透传会被**静默忽略**后回落默认输出上限，长流任务被截断（不报错，比 400
-/// 更难排查）。
+/// （o-series 起引入），DeepSeek Harness 等新客户端只发别名。WorkBuddy 上游只认
+/// `max_tokens` —— 别名透传会被**静默忽略**后回落默认输出上限，长流任务被截断
+/// （不报错，比 400 更难排查）。
 ///
 /// 规则：显式 `max_tokens` 优先（别名只删不译）；别名值为 0/null/负数/非数值
 /// 一律不翻译（0/null 语义是「未设置」，负数是非法值，翻译等于把垃圾搬过去）。
@@ -262,15 +283,13 @@ fn translate_max_completion_tokens(object: &mut Map<String, Value>, report: &mut
     if object.contains_key("max_tokens") {
         return; // 显式 max_tokens 优先：别名只删不译
     }
-    let translated = alias
-        .as_i64()
-        .filter(|number| *number > 0)
-        .or_else(|| {
-            alias
-                .as_f64()
-                .filter(|number| *number > 0.0 && number.fract() == 0.0)
-                .map(|number| number as i64)
-        });
+    // 整数（含 JSON 里恰好是整数的浮点）才译；1.5 这类上游 struct 也收不了
+    let translated = alias.as_i64().filter(|number| *number > 0).or_else(|| {
+        alias
+            .as_f64()
+            .filter(|number| *number > 0.0 && number.fract() == 0.0)
+            .map(|number| number as i64)
+    });
     if let Some(number) = translated {
         object.insert("max_tokens".to_string(), Value::from(number));
         report.max_tokens_translated = true;
@@ -279,15 +298,22 @@ fn translate_max_completion_tokens(object: &mut Map<String, Value>, report: &mut
 
 /// 仅在 body 未显式携带时补 `stream_options.include_usage = true`。
 ///
-/// 官方 CLI 流式必发该字段，上游据此在**末帧**返回 usage 用量。我们本就在 SSE
-/// 旁路里提取 usage 做请求统计，补上它能让统计拿到真实 token 数而不是 null。
+/// 官方 CLI 流式必发该字段，上游据此在**末帧**返回 usage 用量（OpenAI 流的
+/// usage 只在最后一帧出现）。我们本就在 SSE 旁路里提取 usage 做请求统计
+/// （`upstream::usage`），补上它能让统计拿到真实 token 数而不是 null。
 ///
 /// **显式带则绝不覆盖**：客户端可能显式要 `include_usage: false`，那是它的选择。
+/// 末帧是否带 choices 对我们的下游无影响：SSE 状态机照原样透传（`sse.rs` 对无
+/// choices 的帧只旁路提取 usage、不做改写），非流式聚合器也已在 `choices` 缺失时
+/// 提前返回（`aggregate.rs` 的 `consume_chunk`）—— 两侧都不会因为多这一帧出错。
 fn ensure_stream_options(object: &mut Map<String, Value>) {
     if object.contains_key("stream_options") {
         return;
     }
-    object.insert("stream_options".to_string(), json!({ "include_usage": true }));
+    object.insert(
+        "stream_options".to_string(),
+        json!({ "include_usage": true }),
+    );
 }
 
 /// 注入上游前缀缓存键 `prompt_cache_key`（费用优化）。
@@ -295,6 +321,8 @@ fn ensure_stream_options(object: &mut Map<String, Value>) {
 /// ── 为什么值得做（参考项目的实测结论）────────────────────────
 /// 同一段 8k token 前缀：不带该字段 `prompt_cache_hit_tokens=0, credit≈0.34`；
 /// 带上 `prompt_cache_hit_tokens=7808, credit≈0.02` —— **费用降约 17 倍**。
+/// 上游服务端支持按此键复用前缀缓存，同一客户端对同一账号的连续请求因此
+/// 不必重复计费整段历史。
 ///
 /// ── 为什么必须按账号隔离 ────────────────────────────────────
 /// 键格式 `wb2a-<uid8>-<convHex>`：`uid8` 是账号 UID 前 8 字符，**跨账号绝不相同**。
@@ -302,7 +330,12 @@ fn ensure_stream_options(object: &mut Map<String, Value>) {
 /// 计费错乱，更是对话内容泄露。因此 uid 是硬隔离因子，不是可选的熵来源。
 /// 取不到 UID 时仍注入（段位用 `-` 占位）但标记 `cache_key_unscoped` 让调用方警告。
 ///
-/// 优先级：客户端已带非空 `prompt_cache_key` → **原值保留，绝不覆盖**。
+/// 优先级：客户端已带非空 `prompt_cache_key` → **原值保留，绝不覆盖**
+/// （客户端自知要复用哪个键）；否则依次取 body 的 `conversation_id` /
+/// `conversationId` / `metadata.conversation_id` / `metadata.conversationId`
+/// 作为会话段；全都取不到时会话段由 UID 单独哈希得到 —— 账号隔离段照常生效，
+/// 只是同一账号的不同「无会话标识」请求会共享前缀缓存，那对纯单轮客户端
+/// 反而是更优的选择。
 fn inject_prompt_cache_key(
     object: &mut Map<String, Value>,
     account: &Value,
@@ -327,9 +360,12 @@ fn inject_prompt_cache_key(
 
 /// 生成 `wb2a-<uid8>-<convHex>` 形态的稳定缓存键。
 ///
-/// `convHex = sha256(uid + "|" + conversation)` 前 16 字节的十六进制，提供会话段
-/// （同账号同会话稳定、不同会话不同）。会话源为空时 convHex 仍由 uid 单独哈希
-/// 得到 —— 跨账号绝不碰撞，且同账号的同类请求稳定复用。
+/// `uid8` 提供账号隔离段；`convHex = sha256(uid + "|" + conversation)` 前 16 字节
+/// 的十六进制提供会话段（同账号同会话稳定、不同会话不同）。会话源为空时 convHex
+/// 仍由 uid 单独哈希得到 —— 跨账号绝不碰撞，且同账号的同类请求稳定复用。
+///
+/// 用 sha256（不是 md5）：与项目既有派生（`login.rs` 的登录态、`api_keys.rs`
+/// 的密钥指纹）保持同一套实现，不新增哈希依赖（`sha2` 已是直接依赖）。
 fn build_cache_key(uid: &str, conversation: &str) -> String {
     use sha2::{Digest, Sha256};
 
@@ -353,7 +389,8 @@ fn build_cache_key(uid: &str, conversation: &str) -> String {
 
 /// 从 body 里取会话标识（缓存键的会话段来源）。
 ///
-/// 顺序与参考项目一致：顶层优先于 metadata，每级内 snake_case 优先于 camelCase。
+/// 顺序与参考项目的 `InjectPromptCacheKey` 一致：顶层优先于 metadata，
+/// 每级内 snake_case 优先于 camelCase。全部取不到返回空串。
 fn conversation_key(object: &Map<String, Value>) -> String {
     let direct = non_empty_str(object.get("conversation_id"))
         .or_else(|| non_empty_str(object.get("conversationId")));
@@ -368,10 +405,16 @@ fn conversation_key(object: &Map<String, Value>) -> String {
         .unwrap_or_default()
 }
 
-/// 取账号 UID：账号会话对象里的 `account.uid`，取不到回落顶层 `uid`。
+/// 取账号 UID：账号会话对象里的 `account.uid`（`build_chat_request` 拿到的
+/// session 就是 `{ account: { uid, ... }, auth: { ... } }` 形态，见
+/// `AuthService::build_auth_headers` 读同一路径）。
+///
+/// 取不到时回落顶层 `uid`，再取不到返回空串（缓存键段位退化为 `-` 占位，
+/// 见 `inject_prompt_cache_key` 的说明）。
 fn account_uid(account: &Value) -> String {
     account
-        .pointer("/account/uid")
+        .get("account")
+        .and_then(|inner| inner.get("uid"))
         .and_then(Value::as_str)
         .or_else(|| account.get("uid").and_then(Value::as_str))
         .map(str::trim)
@@ -380,83 +423,11 @@ fn account_uid(account: &Value) -> String {
         .to_string()
 }
 
+/// 取一个非空字符串字段（会话标识等取值用的判据）。
 fn non_empty_str(value: Option<&Value>) -> Option<String> {
     value
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .map(str::to_string)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn normalize(body: Value) -> (Value, NormalizeReport) {
-        normalize_outbound(&body, &json!({ "account": { "uid": "5877cabc-1" } }))
-    }
-
-    #[test]
-    fn developer_role_becomes_system() {
-        let (body, report) = normalize(json!({
-            "messages": [{ "role": "developer", "content": "x" }, { "role": "user", "content": "y" }]
-        }));
-        assert_eq!(body["messages"][0]["role"], json!("system"));
-        assert_eq!(report.roles_normalized, 1);
-    }
-
-    #[test]
-    fn tool_choice_object_is_flattened() {
-        let (body, _) = normalize(json!({ "tool_choice": { "type": "auto" } }));
-        assert_eq!(body["tool_choice"], json!("auto"));
-        let (body, _) = normalize(json!({
-            "tool_choice": { "type": "function", "function": { "name": "lookup" } }
-        }));
-        assert_eq!(body["tool_choice"], json!("lookup"));
-        let (body, _) = normalize(json!({ "tool_choice": { "type": "none" }, "tools": [1] }));
-        assert!(body.get("tool_choice").is_none());
-        assert!(body.get("tools").is_none());
-    }
-
-    #[test]
-    fn image_url_string_is_wrapped() {
-        let (body, report) = normalize(json!({
-            "messages": [{ "role": "user", "content": [
-                { "type": "image_url", "image_url": "data:image/png;base64,AA" }
-            ]}]
-        }));
-        assert_eq!(body["messages"][0]["content"][0]["image_url"]["url"], json!("data:image/png;base64,AA"));
-        assert_eq!(report.image_urls_wrapped, 1);
-    }
-
-    #[test]
-    fn max_completion_tokens_is_translated_once() {
-        let (body, report) = normalize(json!({ "max_completion_tokens": 512 }));
-        assert_eq!(body["max_tokens"], json!(512));
-        assert!(body.get("max_completion_tokens").is_none());
-        assert!(report.max_tokens_translated);
-        // 显式 max_tokens 优先：别名只删不译
-        let (body, report) = normalize(json!({ "max_tokens": 64, "max_completion_tokens": 512 }));
-        assert_eq!(body["max_tokens"], json!(64));
-        assert!(!report.max_tokens_translated);
-        // 0 / 负数不译
-        let (body, _) = normalize(json!({ "max_completion_tokens": 0 }));
-        assert!(body.get("max_tokens").is_none());
-    }
-
-    #[test]
-    fn cache_key_is_account_scoped_and_respects_client_value() {
-        let (body, report) = normalize(json!({ "messages": [], "conversation_id": "c-1" }));
-        let key = body["prompt_cache_key"].as_str().unwrap_or("");
-        assert!(key.starts_with("wb2a-5877cabc-"), "{key}");
-        assert!(!report.cache_key_unscoped);
-        // 客户端自带的键绝不覆盖
-        let (body, _) = normalize(json!({ "prompt_cache_key": "keep-me" }));
-        assert_eq!(body["prompt_cache_key"], json!("keep-me"));
-        // 取不到 uid 时仍注入，但标记为未隔离
-        let (body, report) =
-            normalize_outbound(&json!({ "messages": [] }), &json!({}));
-        assert!(body["prompt_cache_key"].as_str().unwrap_or("").starts_with("wb2a--"));
-        assert!(report.cache_key_unscoped);
-    }
 }

@@ -1,67 +1,49 @@
-//! 上游 SSE 方言与内容块的解析。
-//!
-//! ── 迁移来源 ────────────────────────────────────────────────
-//! native `crates/providers/src/providers/doubaowork/stream.rs`。
-//!
-//! ── 生图为什么也在这条流里 ──────────────────────────────────
-//! 豆包工作**没有**「提交一次请求、返回图片地址」的图片接口：出图是对话里派给
-//! agent 的一次 `image_gen` 任务，结果挂在同一条 SSE 流里（native 2026-11-03
-//! 客户端抓包 + 本机复现）。实测两种块：
-//!   · `10010` `content.gen_image_block.images[]` —— 交付结果，`uri` 给的是
-//!     **带水印**的压缩预览（`~tplv-…-downsize_watermark…`）；
-//!   · `10084` `content.rich_media_layout_block.media[].creation.image` —— 画布
-//!     渲染，这里同时给了 `key`（对象键）与 `image_ori_raw`（**无水印原图**）。
-//! 后者总在稍后到达 —— 所以图片**不随块即时发出**：先记下来，流末由
-//! [`Decoder::drain_images`] 统一交出去，才交得到无水印那份。
-//!
-//! 同一张图会随进度重复下发，按对象键合并；一张只交一次。
+use std::collections::{BTreeMap, BTreeSet};
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use agent2api_wasm_sdk::{Error, Result, Value};
 
-use agent2api_wasm_sdk::{json, Error, Result, Value};
+use crate::{endpoints::ReadEndpoint, errors, restriction, util};
 
-use super::api;
-
-const MAX_OUTPUT: usize = 16 * 1024 * 1024;
 const MAX_EVENT: usize = 2 * 1024 * 1024;
+const MAX_OUTPUT: usize = 16 * 1024 * 1024;
 
 #[derive(Default)]
-pub struct SseParser {
+pub struct Parser {
     pending: Vec<u8>,
 }
 
-impl SseParser {
+impl Parser {
     pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<(String, String)>> {
         self.pending.extend_from_slice(bytes);
         let mut frames = Vec::new();
         loop {
-            let separator = [
+            let boundary = [
                 self.pending
                     .windows(2)
-                    .position(|value| value == b"\n\n")
+                    .position(|bytes| bytes == b"\n\n")
                     .map(|at| (at, 2)),
                 self.pending
                     .windows(4)
-                    .position(|value| value == b"\r\n\r\n")
+                    .position(|bytes| bytes == b"\r\n\r\n")
                     .map(|at| (at, 4)),
             ]
             .into_iter()
             .flatten()
             .min_by_key(|(at, _)| *at);
-            let Some((at, length)) = separator else {
+            let Some((at, len)) = boundary else {
                 break;
             };
             if at > MAX_EVENT {
-                return Err(Error::http(502, "豆包工作流式事件过大"));
+                return Err(errors::protocol("豆包工作流式事件超过 2 MiB"));
             }
-            let raw = self.pending.drain(..at + length).collect::<Vec<_>>();
-            let block = std::str::from_utf8(&raw[..at])
-                .map_err(|_| Error::http(502, "豆包工作流式事件不是有效 UTF-8"))?;
+            let bytes = self.pending.drain(..at + len).collect::<Vec<_>>();
+            let text = std::str::from_utf8(&bytes[..at])
+                .map_err(|_| errors::protocol("豆包工作事件不是有效文本"))?;
             let mut event = String::new();
             let mut data = Vec::new();
-            for line in block.lines() {
+            for line in text.lines() {
                 if let Some(value) = line.strip_prefix("event:") {
-                    event = value.trim_start().to_string();
+                    event = value.trim().to_string();
                 } else if let Some(value) = line.strip_prefix("data:") {
                     data.push(value.strip_prefix(' ').unwrap_or(value));
                 }
@@ -71,339 +53,363 @@ impl SseParser {
             }
         }
         if self.pending.len() > MAX_EVENT {
-            return Err(Error::http(502, "豆包工作流式事件过大"));
+            return Err(errors::protocol("豆包工作事件超过大小限制"));
         }
         Ok(frames)
     }
 
-    /// 连接结束时把缓冲里没带分隔符的尾巴按一行一帧处理。
-    pub fn finish(&mut self) -> Option<(String, String)> {
-        let pending = std::mem::take(&mut self.pending);
-        if pending.is_empty() {
-            return None;
+    pub fn finish(&self) -> Result<()> {
+        if self.pending.iter().all(u8::is_ascii_whitespace) {
+            Ok(())
+        } else {
+            Err(errors::protocol("豆包工作流末事件未完整接收"))
         }
-        let block = std::str::from_utf8(&pending).ok()?;
-        let mut event = String::new();
-        let mut data = Vec::new();
-        for line in block.lines() {
-            if let Some(value) = line.strip_prefix("event:") {
-                event = value.trim_start().to_string();
-            } else if let Some(value) = line.strip_prefix("data:") {
-                data.push(value.strip_prefix(' ').unwrap_or(value));
-            }
-        }
-        (!data.is_empty()).then(|| (event, data.join("\n")))
     }
 }
 
-const IMAGE_BLOCK: u64 = 10010;
-const MEDIA_BLOCK: u64 = 10084;
-
-/// 流里收到的一张图（同一张图两种块都会报，按对象键合并）。
-#[derive(Default)]
-struct Image {
-    /// 对象键（`tos-cn-i-…/rc_gen_image/x.jpeg`）：两种块都用它标识同一张图。
-    key: String,
-    /// 无水印原图（`~tplv-…-image_raw.png`）。
-    ///
-    /// 实测同一张图：流里这份 `image_raw` 与官方
-    /// `/creativity/resource/get_without_watermark` 返回的 `cgen_wm0` **字节完全
-    /// 相同**（4624288 字节、同一 md5）。流里既然就有，就不必再发第二次请求。
-    raw: Option<String>,
-    /// 带水印的预览（`uri` / `thumb_url` / `image_ori`），拿不到原图时的兜底。
-    preview: String,
+pub enum Delta {
+    Text(String),
+    Reasoning(String),
 }
-
-/// 图片地址 → 对象键：`https://host/tos-cn-i-…/rc_gen_image/x.jpeg~tplv-…?…`
-/// 的对象键是 `~` 之前、去掉协议与 host 的那一段。
-fn object_key(url: &str) -> Option<String> {
-    let without_query = url.split('?').next().unwrap_or(url);
-    let path = without_query.split('~').next().unwrap_or(without_query);
-    let key = path
-        .strip_prefix("https://")
-        .or_else(|| path.strip_prefix("http://"))
-        .map(|rest| rest.split_once('/').map(|(_, path)| path).unwrap_or(""))
-        .unwrap_or(path);
-    (!key.is_empty()).then(|| key.to_string())
+struct Image {
+    key: String,
+    raw: Option<String>,
+    preview: Option<String>,
 }
 
 #[derive(Default)]
 pub struct Decoder {
     pub text: String,
     pub reasoning: String,
-    reasoning_blocks: BTreeSet<String>,
     blocks: BTreeMap<String, String>,
+    reasoning_blocks: BTreeSet<String>,
     images: Vec<Image>,
-    pub done: bool,
     received: usize,
-}
-
-#[derive(Clone)]
-pub enum Delta {
-    Text(String),
-    Reasoning(String),
+    chunk_channel: BTreeSet<String>,
+    compact_channel: BTreeSet<String>,
+    active_block: Option<(String, bool)>,
+    restriction: Option<Error>,
 }
 
 impl Decoder {
-    fn note_generated(&mut self, block: &Value) {
-        for image in block["content"]["gen_image_block"]["images"]
-            .as_array()
-            .into_iter()
-            .flatten()
-        {
-            let Some(url) = ["uri", "thumb_url"]
-                .iter()
-                .find_map(|key| image[*key].as_str().filter(|value| !value.trim().is_empty()))
-            else {
-                continue;
-            };
-            let key = object_key(url).unwrap_or_else(|| url.to_string());
-            if let Some(known) = self.images.iter_mut().find(|known| known.key == key) {
-                if known.preview.is_empty() {
-                    known.preview = url.to_string();
-                }
-                continue;
+    fn image(&mut self, key: String, raw: Option<String>, preview: Option<String>) -> Result<()> {
+        if let Some(image) = self.images.iter_mut().find(|image| image.key == key) {
+            if raw.is_some() {
+                image.raw = raw;
             }
-            self.images.push(Image { key, raw: None, preview: url.to_string() });
-        }
-    }
-
-    /// 记下 `10084`（画布渲染）里的图片：这一份带着**无水印原图** [`Image::raw`]。
-    /// 与 `10010` 按对象键合并：先到的是预览、后到的补上原图，两种先后顺序都成立。
-    fn note_media(&mut self, block: &Value) {
-        for image in block["content"]["rich_media_layout_block"]["media"]
-            .as_array()
-            .into_iter()
-            .flatten()
-        {
-            let image = &image["creation"]["image"];
-            let key = image["key"]
-                .as_str()
-                .filter(|value| !value.trim().is_empty())
-                .map(str::to_string)
-                .or_else(|| {
-                    ["image_ori", "image_preview", "image_thumb"]
-                        .iter()
-                        .find_map(|field| object_key(image[*field]["url"].as_str()?))
-                });
-            let Some(key) = key else { continue };
-            let raw = image["image_ori_raw"]["url"]
-                .as_str()
-                .filter(|url| !url.trim().is_empty())
-                .map(str::to_string);
-            let preview = ["image_ori", "image_preview", "image_thumb"]
-                .iter()
-                .find_map(|field| image[*field]["url"].as_str())
-                .filter(|url| !url.trim().is_empty())
-                .map(str::to_string);
-            if let Some(known) = self.images.iter_mut().find(|known| known.key == key) {
-                if known.raw.is_none() {
-                    known.raw = raw;
-                }
-                if known.preview.is_empty() {
-                    known.preview = preview.unwrap_or_default();
-                }
-                continue;
+            if preview.is_some() {
+                image.preview = preview;
             }
-            self.images.push(Image { key, raw, preview: preview.unwrap_or_default() });
+            return Ok(());
         }
+        if self.images.len() >= 16 {
+            return Err(errors::protocol("豆包工作返回图片过多"));
+        }
+        self.images.push(Image { key, raw, preview });
+        Ok(())
     }
 
-    pub fn has_images(&self) -> bool {
-        !self.images.is_empty()
-    }
-
-    /// 把攒下来的图片交出去（流末调用一次）。
-    ///
-    /// 渲成 markdown 而不是图片内容块：网关这条对话流一路上都是**文本增量**，
-    /// 塞一个 `image_url` 内容块会让多数客户端把整条 delta 一起丢掉。
-    /// 首选无水印原图，没有才退回带水印的预览（旧账号可能不下发 `10084`）。
-    pub fn drain_images(&mut self) -> Vec<Delta> {
-        let mut output = Vec::new();
-        for image in std::mem::take(&mut self.images) {
-            let url = match image
-                .raw
-                .clone()
-                .or_else(|| (!image.preview.is_empty()).then(|| image.preview.clone()))
+    fn note_images(&mut self, block: &Value) -> Result<()> {
+        if util::unsigned(&block["block_type"]) == Some(10010) {
+            for image in block["content"]["gen_image_block"]["images"]
+                .as_array()
+                .into_iter()
+                .flatten()
             {
-                Some(url) => url,
-                None => continue,
-            };
-            let delta = format!("\n\n![图片]({url})\n\n");
-            self.text.push_str(&delta);
-            output.push(Delta::Text(delta));
-        }
-        output
-    }
-
-    /// 把攒下来的图片 URL 交出去（生图通道用：要的是地址，不是 markdown）。
-    pub fn take_image_urls(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.images)
-            .into_iter()
-            .filter_map(|image| image.raw.or_else(|| (!image.preview.is_empty()).then_some(image.preview)))
-            .collect()
-    }
-
-    fn blocks(&mut self, value: &Value, append: bool) -> Result<Vec<Delta>> {
-        let mut output = Vec::new();
-        for block in value.as_array().into_iter().flatten() {
-            let kind = api::number(&block["block_type"]);
-            if kind == Some(10040) {
-                continue;
+                let preview = ["uri", "thumb_url"]
+                    .iter()
+                    .find_map(|key| image[*key].as_str())
+                    .and_then(safe_image);
+                if let Some(url) = preview {
+                    self.image(object_key(&url), None, Some(url))?;
+                }
             }
-            if kind == Some(IMAGE_BLOCK) {
-                self.note_generated(block);
-                continue;
-            }
-            if kind == Some(MEDIA_BLOCK) {
-                self.note_media(block);
-                continue;
-            }
-            if kind != Some(10000) {
-                continue;
-            }
-            let Some(text) = block["content"]["text_block"]["text"].as_str() else {
-                continue;
-            };
-            let id = api::identifier(&block["block_id"]);
-            let icons = ["icon_url", "icon_url_dark"];
-            let tagged = icons.iter().any(|key| {
-                block["content"]["text_block"][*key]
+        } else {
+            for row in block["content"]["rich_media_layout_block"]["media"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                let image = &row["creation"]["image"];
+                let raw = image["image_ori_raw"]["url"].as_str().and_then(safe_image);
+                let preview = ["image_ori", "image_preview", "image_thumb"]
+                    .iter()
+                    .find_map(|key| image[*key]["url"].as_str())
+                    .and_then(safe_image);
+                let key = image["key"]
                     .as_str()
-                    .is_some_and(|icon| icon.to_ascii_lowercase().contains("deep_think"))
-            });
-            if let Some(id) = id.as_ref() {
+                    .filter(|key| !key.is_empty() && key.len() <= 2048)
+                    .map(str::to_string)
+                    .or_else(|| raw.as_ref().or(preview.as_ref()).map(|url| object_key(url)));
+                if let Some(key) = key {
+                    self.image(key, raw, preview)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn text(
+        &mut self,
+        key: String,
+        text: &str,
+        append: bool,
+        reasoning: bool,
+    ) -> Result<Option<Delta>> {
+        let prior = self.blocks.entry(key).or_default();
+        let delta = if append {
+            prior.push_str(text);
+            text.to_string()
+        } else if let Some(suffix) = text.strip_prefix(prior.as_str()) {
+            let delta = suffix.to_string();
+            *prior = text.to_string();
+            delta
+        } else {
+            return Err(errors::protocol(
+                "豆包工作替换了已下发正文，无法安全继续输出",
+            ));
+        };
+        if delta.is_empty() {
+            return Ok(None);
+        }
+        if reasoning {
+            self.reasoning.push_str(&delta);
+        } else {
+            self.text.push_str(&delta);
+        }
+        if self.text.len() > MAX_OUTPUT || self.reasoning.len() > MAX_OUTPUT {
+            return Err(errors::protocol("豆包工作回答超过大小限制"));
+        }
+        Ok(Some(if reasoning {
+            Delta::Reasoning(delta)
+        } else {
+            Delta::Text(delta)
+        }))
+    }
+
+    fn blocks(&mut self, value: &Value, append: bool, source: &str) -> Result<Vec<Delta>> {
+        let mut deltas = Vec::new();
+        for block in value.as_array().into_iter().flatten() {
+            let kind = util::unsigned(&block["block_type"]);
+            if matches!(kind, Some(10010 | 10084)) {
+                self.note_images(block)?;
+                continue;
+            }
+            if !matches!(kind, Some(10000 | 10040)) {
+                continue;
+            }
+            let id = util::identifier(&block["block_id"]).unwrap_or_else(|| "default".into());
+            let reasoning = if kind == Some(10040) {
+                self.reasoning_blocks.insert(id.clone());
+                true
+            } else {
+                let content = &block["content"]["text_block"];
+                let tagged = ["icon_url", "icon_url_dark"].iter().any(|key| {
+                    content[*key]
+                        .as_str()
+                        .is_some_and(|icon| icon.to_ascii_lowercase().contains("deep_think"))
+                });
                 if tagged {
                     self.reasoning_blocks.insert(id.clone());
-                } else if icons
+                } else if ["icon_url", "icon_url_dark"]
                     .iter()
-                    .any(|key| block["content"]["text_block"].get(*key).is_some())
+                    .any(|key| content.get(*key).is_some())
                 {
-                    self.reasoning_blocks.remove(id);
+                    self.reasoning_blocks.remove(&id);
                 }
-            }
-            let reasoning = tagged
-                || id
-                    .as_ref()
-                    .is_some_and(|id| self.reasoning_blocks.contains(id));
-            let key = format!(
-                "{}:{}",
-                if reasoning { "reasoning" } else { "text" },
-                id.unwrap_or_else(|| "default".into())
-            );
-            let prior = self.blocks.entry(key).or_default();
-            let delta = if append {
-                prior.push_str(text);
-                text.to_string()
-            } else if let Some(suffix) = text.strip_prefix(prior.as_str()) {
-                let suffix = suffix.to_string();
-                *prior = text.into();
-                suffix
-            } else if prior.is_empty() {
-                *prior = text.into();
-                text.to_string()
-            } else {
-                return Err(Error::http(502, "豆包工作替换了已发送的回答，无法安全继续流式响应"));
+                self.reasoning_blocks.contains(&id)
             };
-            if delta.is_empty() {
+            if source != "snapshot" {
+                self.active_block = Some((id.clone(), reasoning));
+            }
+            let content = if kind == Some(10040) {
+                &block["content"]["thinking_block"]
+            } else {
+                &block["content"]["text_block"]
+            };
+            let text = content["text"]
+                .as_str()
+                .or_else(|| content["content"].as_str());
+            let Some(text) = text else {
+                continue;
+            };
+            let key = format!("{}:{id}", if reasoning { "reasoning" } else { "text" });
+            if append && source == "chunk" && self.compact_channel.contains(&key) {
                 continue;
             }
-            if reasoning {
-                self.reasoning.push_str(&delta);
-                output.push(Delta::Reasoning(delta));
-            } else {
-                self.text.push_str(&delta);
-                output.push(Delta::Text(delta));
+            if append
+                && source == "notify"
+                && (self.chunk_channel.contains(&key) || self.compact_channel.contains(&key))
+            {
+                continue;
             }
-            if self.text.len() > MAX_OUTPUT || self.reasoning.len() > MAX_OUTPUT {
-                return Err(Error::http(502, "豆包工作输出超过大小限制"));
+            if source == "chunk" && !text.is_empty() {
+                self.chunk_channel.insert(key.clone());
+            }
+            if let Some(delta) = self.text(key, text, append, reasoning)? {
+                deltas.push(delta);
             }
         }
-        Ok(output)
+        Ok(deltas)
     }
 
-    /// 解一帧上游事件；错误帧直接变成带状态的 [`Error`]。
-    pub fn frame(&mut self, event: &str, raw: &str) -> Result<Vec<Delta>> {
-        self.received = self.received.saturating_add(raw.len());
-        if self.received > MAX_OUTPUT * 4 {
-            return Err(Error::http(502, "豆包工作流式响应过大"));
-        }
-        let value: Value = serde_json::from_str(raw)
-            .map_err(|_| Error::http(502, "豆包工作流式事件格式无效"))?;
-        if event.contains("ERR")
-            || event == "gateway-error"
-            || event == "error"
-            || value
-                .get("error")
-                .is_some_and(|error| !error.is_null() && error != &Value::Bool(false))
-            || api::number(&value["code"]).is_some_and(|code| code != 0)
-            || api::number(&value["error_code"]).is_some_and(|code| code != 0)
-        {
-            return Err(api::error(200, &value));
-        }
-        if self.done {
+    fn compact(&mut self, value: &Value) -> Result<Vec<Delta>> {
+        let Some(text) = value["text"].as_str() else {
+            return Ok(Vec::new());
+        };
+        let explicit = util::identifier(&value["block_id"]);
+        let (id, reasoning) = match explicit {
+            Some(id) => {
+                let reasoning = self.reasoning_blocks.contains(&id);
+                (id, reasoning)
+            }
+            None => self
+                .active_block
+                .clone()
+                .ok_or_else(|| errors::protocol("豆包工作紧凑文本增量缺少已确认的所属内容块"))?,
+        };
+        let key = format!("{}:{id}", if reasoning { "reasoning" } else { "text" });
+        if self.chunk_channel.contains(&key) {
             return Ok(Vec::new());
         }
-        match event {
-            "SSE_REPLY_END" => {
-                self.done = true;
-                Ok(Vec::new())
+        self.compact_channel.insert(key.clone());
+        Ok(self.text(key, text, true, reasoning)?.into_iter().collect())
+    }
+
+    fn observe_restriction(&mut self, value: &Value) {
+        for ext in [
+            value.get("ext"),
+            value.pointer("/message/ext"),
+            value.pointer("/content/ext"),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(error) = restriction::error(ext) {
+                self.restriction.get_or_insert(error);
             }
-            "STREAM_MSG_NOTIFY" => self.blocks(&value["content"]["content_block"], true),
-            "CHUNK_DELTA" if value["text"].is_string() => self.blocks(
-                &json!([{
-                    "block_id": "delta",
-                    "block_type": 10000,
-                    "content": {"text_block": {"text": value["text"]}},
-                }]),
-                true,
-            ),
-            "FULL_MSG_NOTIFY" if api::number(&value["message"]["user_type"]) == Some(2) => {
-                self.blocks(&value["message"]["content_block"], false)
+        }
+        for patch in value["patch_op"].as_array().into_iter().flatten() {
+            if util::integer(&patch["patch_object"]) == Some(50) {
+                if let Some(error) = restriction::error(&patch["patch_value"]["ext"]) {
+                    self.restriction.get_or_insert(error);
+                }
             }
+        }
+    }
+
+    pub fn restriction(&self) -> Option<&Error> {
+        self.restriction.as_ref()
+    }
+
+    pub fn begin_stream(&mut self) {
+        // 后续异步任务有独立内容块编号空间，正文/图片历史仍保留。
+        self.blocks.clear();
+        self.reasoning_blocks.clear();
+        self.chunk_channel.clear();
+        self.compact_channel.clear();
+        self.active_block = None;
+    }
+
+    pub fn frame(&mut self, event: &str, raw: &str) -> Result<(Vec<Delta>, bool)> {
+        self.received = self.received.saturating_add(raw.len());
+        if self.received > 64 * 1024 * 1024 {
+            return Err(errors::protocol("豆包工作流式响应过大"));
+        }
+        let value: Value =
+            serde_json::from_str(raw).map_err(|_| errors::protocol("豆包工作事件 JSON 无效"))?;
+        if event.contains("ERR")
+            || matches!(event, "error" | "gateway-error")
+            || errors::business(&value).is_some_and(|code| code != 0)
+            || value
+                .get("error")
+                .is_some_and(|error| !error.is_null() && error != false)
+            || errors::verification(&value)
+        {
+            return Err(errors::upstream(200, &value, ReadEndpoint::Chat));
+        }
+        self.observe_restriction(&value);
+        let done = event == "SSE_REPLY_END" && util::integer(&value["end_type"]) == Some(3);
+        let deltas = match event {
+            "STREAM_MSG_NOTIFY" => {
+                self.blocks(&value["content"]["content_block"], true, "notify")?
+            }
+            "FULL_MSG_NOTIFY" if util::integer(&value["message"]["user_type"]) == Some(2) => {
+                self.blocks(&value["message"]["content_block"], false, "snapshot")?
+            }
+            "CHUNK_DELTA" => self.compact(&value)?,
             "STREAM_CHUNK" => {
                 let mut deltas = Vec::new();
                 for patch in value["patch_op"].as_array().into_iter().flatten() {
-                    if api::number(&patch["patch_object"]) != Some(1) {
+                    if util::integer(&patch["patch_object"]) != Some(1) {
                         continue;
                     }
-                    deltas.extend(
-                        self.blocks(
-                            &patch["patch_value"]["content_block"],
-                            api::number(&patch["patch_type"]) == Some(1),
-                        )?,
-                    );
+                    deltas.extend(self.blocks(
+                        &patch["patch_value"]["content_block"],
+                        util::integer(&patch["patch_type"]) == Some(1),
+                        "chunk",
+                    )?);
                 }
-                Ok(deltas)
+                deltas
             }
-            _ => Ok(Vec::new()),
-        }
+            "ASYNC_CHUNK_SNAPSHOT" => {
+                self.blocks(&value["message"]["content_block"], false, "snapshot")?
+            }
+            _ => Vec::new(),
+        };
+        Ok((deltas, done))
+    }
+
+    pub fn image_urls(&self) -> Vec<String> {
+        self.images
+            .iter()
+            .filter_map(|image| image.raw.clone().or_else(|| image.preview.clone()))
+            .collect()
+    }
+    pub fn image_markdown(&self) -> String {
+        self.image_urls()
+            .into_iter()
+            .map(|url| format!("\n\n![图片]({url})\n\n"))
+            .collect()
     }
 }
 
-/// 一帧一帧喂进去的驱动器（内部带着帧队列与「已读但未交出」的增量）。
-#[derive(Default)]
-pub struct FrameQueue {
-    pub frames: VecDeque<(String, String)>,
-    pub deltas: VecDeque<Delta>,
+fn object_key(url: &str) -> String {
+    url.split('?')
+        .next()
+        .unwrap_or(url)
+        .split('~')
+        .next()
+        .unwrap_or(url)
+        .splitn(4, '/')
+        .nth(3)
+        .unwrap_or(url)
+        .to_string()
 }
-
-impl FrameQueue {
-    pub fn push(&mut self, frames: Vec<(String, String)>) {
-        self.frames.extend(frames);
+fn safe_image(raw: &str) -> Option<String> {
+    if raw.len() > 8192 || raw.chars().any(char::is_control) {
+        return None;
     }
-
-    /// 拿下一个增量；返回 `None` 表示当前缓冲里没有（调用方继续读流）。
-    pub fn next(&mut self, decoder: &mut Decoder) -> Result<Option<Delta>> {
-        loop {
-            if let Some(delta) = self.deltas.pop_front() {
-                return Ok(Some(delta));
-            }
-            if let Some((event, data)) = self.frames.pop_front() {
-                self.deltas.extend(decoder.frame(&event, &data)?);
-                continue;
-            }
-            return Ok(None);
-        }
+    let url = url::Url::parse(raw).ok()?;
+    if url.scheme() != "https"
+        || url.port_or_known_default() != Some(443)
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
     }
+    if ![
+        ".byteimg.com",
+        ".ibyteimg.com",
+        ".ibytedtos.com",
+        ".douyinpic.com",
+        ".imagex.cn",
+        ".bytevcloudapi.com",
+    ]
+    .iter()
+    .any(|suffix| url.host_str().is_some_and(|host| host.ends_with(suffix)))
+    {
+        return None;
+    }
+    Some(raw.replace(')', "%29").replace('(', "%28"))
 }

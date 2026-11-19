@@ -1,280 +1,223 @@
-//! 设备授权登录（PKCE，轮询型）。verifier 只留在后端，不能进入前端状态或日志。
-//!
-//! ── 流程（2026-11-03 在 native 侧复核过，四个站点同一条）────────
-//!   1. 生成 PKCE verifier + challenge（S256）、一个**标准 UUID** 的 `nonce`、
-//!      一个设备标识 `machine_id`；
-//!   2. 把用户引到 `https://qoder.com.cn/device/selectAccounts?challenge=…`；
-//!   3. 网关按 `poll_interval_ms` 回调 `login.poll`，插件去
-//!      `GET {openapi}/api/v1/deviceToken/poll?nonce=…&verifier=…&challenge_method=S256`
-//!      问进度（202 / 404 = 还没授权）；
-//!   4. 拿到令牌后补一份用户资料，落成账号。
-//!
-//! ── `nonce` 必须是标准 UUID（带横线）────────────────────────
-//! 上游按 UUID 解析它，去横线会让整条 query 被判非法
-//! （`400 INVALID_DEVICE_FLOW`，`details.field=query`）。native 曾经踩过这个
-//! 坑并误判成「入口已停用」—— 这里保持带横线的 `uuid_v4`。
-//!
-//! ── 为什么 verifier 存宿主状态而不是插件全局 ─────────────────
-//! native 用进程内 `HashMap`（单进程、一次登录几分钟）。Wasm 里每次调用都是
-//! 新实例，进程内表活不过一次调用 —— 于是把 `{state, poll_url, machine_id}`
-//! 写进宿主的**登录作用域状态**（带版本号、比较再写），语义与 native 那张表
-//! 等价，且多了「宿主重启也不丢」的好处。
-//!
-//! ── 硬约束 ──────────────────────────────────────────────────
-//! 零 unwrap/expect/panic。
-
-use agent2api_wasm_sdk::{self as sdk, json, Error, Result, Value};
+//! 国内网页登录是设备授权 + S256 PKCE，无授权码/localhost 回调、无客户端文件或 UMID。
+//! nonce 保留 UUID 横线（去掉会使当前四站接口拒绝）；verifier 仅在宿主 flow 隔离状态。
+use super::{account, auth, client, credentials::Credentials, endpoints, login_methods, util};
+use agent2api_wasm_sdk::{
+    self as sdk, json,
+    state::{self, Scope},
+    Error, Result, Value,
+};
+use base64::Engine;
 use sha2::{Digest, Sha256};
 
-use super::crypto;
-use super::credentials::{self, Credentials};
-use super::machine;
-use super::site;
-
-/// 登录作用域里存设备流状态的键与 schema
-const LOGIN_KEY: &str = "device";
-const LOGIN_SCHEMA: u32 = 1;
-
-/// 一次设备授权会话
-struct DeviceLogin {
-    /// 插件侧生成的一次性标识（进 flow id，排障用）
-    state: String,
-    auth_url: String,
-    poll_url: String,
-    machine_id: String,
+const KEY: &str = "device-login";
+const TTL: i64 = 300_000;
+fn flow(params: &Value) -> Result<&str> {
+    params["flow"]
+        .as_str()
+        .filter(|flow| !flow.is_empty() && util::printable(flow, 256))
+        .ok_or_else(|| Error::http(400, "主程序未分配 Qoder 登录流程"))
 }
-
-/// 简单的 query 值转义（只保留 RFC 3986 的 unreserved 字符）。
-///
-/// PKCE 串、UUID 本身都在 unreserved 集合里，这里只是不把「拼接」交给运气。
-fn encode_query(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || b"-_.~".contains(&byte) {
-            out.push(byte as char);
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
+fn changed() -> Error {
+    Error::http(409, "Qoder 登录已取消、过期或被替换")
 }
-
-impl DeviceLogin {
-    fn new() -> Self {
-        let verifier = crypto::random_secret();
-        let challenge = crypto::b64_url_nopad(&Sha256::digest(verifier.as_bytes()));
-        // nonce 必须是标准 UUID（带横线）：上游按 UUID 解析它（见模块头）
-        let nonce = crypto::uuid_v4();
-        let machine_id = machine::login_machine_id();
-        let auth_url = format!(
-            "{}?challenge={}&challenge_method=S256&machine_id={}&nonce={}",
-            site::device_login_url(),
-            encode_query(&challenge),
-            encode_query(&machine_id),
-            encode_query(&nonce),
-        );
-        let poll_url = format!(
-            "{}?nonce={}&verifier={}&challenge_method=S256",
-            site::open_api_url(site::DEVICE_POLL_PATH),
-            encode_query(&nonce),
-            encode_query(&verifier),
-        );
-        Self {
-            state: crypto::random_secret(),
-            auth_url,
-            poll_url,
-            machine_id,
-        }
-    }
-
-    /// 问一次上游：`Ok(None)` = 还在等授权。
-    fn poll(&self) -> Result<Option<Credentials>> {
-        let response = super::auth::request(
-            "GET",
-            &self.poll_url,
-            None,
-            &super::auth::account_headers(None),
-        )?;
-        if response.status == 202 || response.status == 404 {
-            return Ok(None);
-        }
-        let data = super::auth::payload(response, "设备授权")?;
-        let token = credentials::secret(&data, &["token", "device_token"])?;
-        if token.is_empty() {
-            return Err(Error::http(502, "设备授权响应缺少 token"));
-        }
-        let refresh_token = credentials::secret(&data, &["refresh_token"])?;
-        if refresh_token.contains('|') {
-            return Err(Error::http(502, "设备授权响应的 refresh_token 格式无效"));
-        }
-        let user_id = credentials::text(&data, &["user_id", "uid"]);
-        let mut credentials = Credentials::from_payload(&json!({
-            "mode": "cn",
-            "accessToken": token,
-            "refreshToken": if refresh_token.is_empty() { String::new() }
-                else { format!("{}|{}|{}", refresh_token, user_id, self.machine_id) },
-            "userId": user_id,
-            "machineId": self.machine_id,
-            // 设备令牌的绝对到期时刻；缺省按 30 天算
-            "expiresAt": credentials::timestamp(data.get("expires_at"))
-                .unwrap_or_else(|| sdk::now() + 30 * 24 * 60 * 60 * 1000),
-        }))?;
-        match super::auth::fetch_profile(&credentials.access_token) {
-            Ok(profile) => super::auth::apply_profile(&mut credentials, &profile)?,
-            Err(error) if credentials.user_id.is_empty() => return Err(error),
-            Err(_) => {}
-        }
-        credentials.complete_identity()?;
-        Ok(Some(credentials))
-    }
+fn failed(message: &str) -> Value {
+    json!({ "state": "failed", "message": message, "interaction": null })
 }
-
-/// 读登录状态里那份设备流（拿不到给 None）
-fn load_flow() -> Option<Value> {
-    let snapshot = sdk::state::get(sdk::state::Scope::Login, LOGIN_KEY, LOGIN_SCHEMA).ok()?;
-    if !snapshot.compatible || !snapshot.value.is_object() {
-        return None;
-    }
-    Some(snapshot.value)
-}
-
-/// 写一份设备流状态（比较再写）
-fn store_flow(revision: u64, value: Value) -> Result<()> {
-    let updated = sdk::state::compare_exchange(
-        sdk::state::Scope::Login,
-        LOGIN_KEY,
-        LOGIN_SCHEMA,
-        revision,
-        value,
-        600_000,
-    )?;
-    if !updated {
-        return Err(Error::new("登录状态已变化，请重新发起"));
+fn put(before: &state::Snapshot, value: Value, ttl: i64) -> Result<()> {
+    if !state::compare_exchange(Scope::Login, KEY, 1, before.revision, value, ttl)? {
+        return Err(changed());
     }
     Ok(())
 }
-
-/// 清掉设备流状态（成功、失败、取消都清：它是一次性的）
-fn clear_flow() {
-    let Ok(snapshot) = sdk::state::get(sdk::state::Scope::Login, LOGIN_KEY, LOGIN_SCHEMA) else {
-        return;
-    };
-    let _ = sdk::state::compare_exchange(
-        sdk::state::Scope::Login,
-        LOGIN_KEY,
-        LOGIN_SCHEMA,
-        snapshot.revision,
-        Value::Null,
-        1000,
-    );
-}
-
-/// 添加账号弹窗里可用的登录方式（与 `metadata.json` 的 `login_methods` 同序）。
-pub fn methods() -> Value {
-    json!({ "methods": [
-        {
-            "methodIndex": 0, "type": "api", "label": "个人访问令牌（PAT）",
-            "prompts": [
-                { "key": "pat", "type": "text", "label": "Qoder 个人访问令牌（PAT）", "secret": true }
-            ],
-            "instructions": "在 Qoder 设置页创建一个个人访问令牌后粘贴到这里；插件会用它换取账号令牌。"
-        },
-        {
-            "methodIndex": 1, "type": "oauth", "label": "网页登录", "prompts": [],
-            "browserMode": "choice", "manualCallback": false,
-            "instructions": "在打开的页面里完成 Qoder 的授权，完成后会自动收下账号"
-        }
-    ] })
-}
-
-/// 发起登录：`methodIndex == 0`（PAT）应走账号表单，设备授权走这一条。
 pub fn start(params: &Value) -> Result<Value> {
-    let index = params["payload"]["methodIndex"]
-        .as_u64()
-        .or_else(|| params["methodIndex"].as_u64())
-        .unwrap_or(1);
-    if index == 0 {
+    if !matches!(
+        params["method"].as_str().unwrap_or(""),
+        "" | "browser" | "web"
+    ) || params["payload"]["methodIndex"].as_u64().unwrap_or(0) != 0
+    {
         return Err(Error::http(
             400,
-            "「填写凭证」请直接在账号页粘贴个人访问令牌（PAT）；网页登录请点「网页登录」",
+            "Qoder 手动凭据请使用账号表单，设备授权请使用网页登录",
         ));
     }
-    let flow = params["flow"].as_str().unwrap_or("").trim().to_string();
-    if flow.is_empty() {
-        return Err(Error::new("主程序未分配登录流程"));
+    let flow = flow(params)?;
+    let before = state::get(Scope::Login, KEY, 1)?;
+    if !before.value.is_null() {
+        return Err(changed());
     }
-    let device = DeviceLogin::new();
-    let snapshot = sdk::state::get(sdk::state::Scope::Login, LOGIN_KEY, LOGIN_SCHEMA)?;
-    store_flow(
-        snapshot.revision,
-        json!({
-            "state": device.state,
-            "poll_url": device.poll_url,
-            "machine_id": device.machine_id,
-        }),
+    let verifier = util::random_secret()?;
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(Sha256::digest(verifier.as_bytes()));
+    let nonce = util::uuid()?;
+    // 原生对普通 machineId 允许随机 UUID；保存在此 flow，成功后随账号落地。
+    let machine = util::uuid()?;
+    let now = util::now()?;
+    let mut url = url::Url::parse(&format!("{}{}", endpoints::WEB, endpoints::DEVICE_LOGIN))
+        .map_err(|_| Error::new("Qoder 授权地址配置无效"))?;
+    url.query_pairs_mut()
+        .append_pair("challenge", &challenge)
+        .append_pair("challenge_method", "S256")
+        .append_pair("machine_id", &machine)
+        .append_pair("nonce", &nonce);
+    // Qoder 中国版原生不发 client_id/redirect_uri；不套千问办公的那组字段。
+    put(
+        &before,
+        json!({ "flow": flow, "nonce": nonce, "verifier": verifier, "machineId": machine,
+        "phase": "waiting", "expiresAt": now + TTL, "nextAt": now, "generation": util::uuid()? }),
+        TTL,
     )?;
-    Ok(json!({
-        "flow": flow,
-        "url": device.auth_url,
-        // 轮询型：授权在上游域名终结，网关按这个间隔问 `login.poll`
-        "poll_interval_ms": 2000,
-        "instructions": "在打开的页面里完成 Qoder 的授权，完成后会自动收下账号",
-        "external_browser": true,
-        "allowed_hosts": site::allowed_login_hosts(),
-        "login_ui": {
-            "browserMode": "choice",
-            "manualCallback": false,
-            "callbackInput": "url",
-            "cookieCapture": null,
-            "captureCallback": false,
-        },
-    }))
+    Ok(
+        json!({ "flow": flow, "url": url.to_string(), "poll_interval_ms": 2000,
+        "instructions": login_methods::instructions(params["payload"]["locale"].as_str().unwrap_or("zh-CN")),
+        "external_browser": true, "allowed_hosts": ["qoder.com.cn", "qoder.com", "qoder.sh"],
+        "login_ui": { "browserMode": "external", "manualCallback": false, "callbackInput": "url",
+            "cookieCapture": null, "captureCallback": false } }),
+    )
 }
-
-/// 轮询登录进度（设备授权型）。
 pub fn poll(params: &Value) -> Result<Value> {
-    let _ = params;
-    let Some(value) = load_flow() else {
-        return Ok(json!({
-            "state": "failed",
-            "message": "这次登录流程已失效（插件重启过或已取消），请重新发起",
-        }));
-    };
-    let poll_url = value["poll_url"].as_str().unwrap_or("").to_string();
-    let state = value["state"].as_str().unwrap_or("").to_string();
-    let machine_id = value["machine_id"].as_str().unwrap_or("").to_string();
-    if poll_url.is_empty() || machine_id.is_empty() {
-        clear_flow();
-        return Ok(json!({ "state": "failed", "message": "登录状态损坏，请重新发起" }));
+    let flow = flow(params)?;
+    let before = state::get(Scope::Login, KEY, 1)?;
+    let now = util::now()?;
+    if !before.value.is_null() && before.value["flow"] != flow {
+        return Err(changed());
     }
-    let device = DeviceLogin { state, auth_url: String::new(), poll_url, machine_id };
-    match device.poll() {
-        Ok(None) => Ok(json!({ "state": "pending", "hint": "等待你在浏览器里完成授权…" })),
-        Ok(Some(credentials)) => {
-            clear_flow();
-            Ok(json!({
-                "state": "done",
-                "account": super::account::account_of(&credentials, "web", None),
-            }))
+    if !before.compatible
+        || before.value.is_null()
+        || before.value["expiresAt"].as_i64().unwrap_or(0) <= now
+    {
+        put(&before, Value::Null, 1000)?;
+        return Ok(failed("Qoder 设备授权已取消或过期，请重新发起"));
+    }
+    if before.value["phase"] == "polling" {
+        if before.value["busyUntil"].as_i64().unwrap_or(0) <= now {
+            put(&before, Value::Null, 1000)?;
+            return Ok(failed(
+                "Qoder 上轮授权结果未确认，请重新发起，未重复领取设备凭据",
+            ));
         }
-        // 暂时不可达：继续等（与网关同一条处置）
+        return Ok(sdk::login::pending(None));
+    }
+    if before.value["phase"] != "waiting" {
+        return Err(changed());
+    }
+    if before.value["nextAt"].as_i64().unwrap_or(0) > now {
+        return Ok(sdk::login::pending(None));
+    }
+    let mut working = before.value.clone();
+    let marker = util::uuid()?;
+    working["phase"] = json!("polling");
+    working["marker"] = json!(marker);
+    working["busyUntil"] = json!(now + 120_000);
+    let ttl = working["expiresAt"]
+        .as_i64()
+        .unwrap_or(now)
+        .saturating_sub(now)
+        .min(TTL);
+    put(&before, working.clone(), ttl)?;
+    let reserved = state::get(Scope::Login, KEY, 1)?;
+    if reserved.value["marker"] != marker || reserved.value["flow"] != flow {
+        return Err(changed());
+    }
+    let result = step(&working);
+    if working["expiresAt"].as_i64().unwrap_or(0) <= util::now()? {
+        put(&reserved, Value::Null, 1000)?;
+        return Ok(failed("Qoder 设备授权已过期，未添加迟到的账号"));
+    }
+    match result {
+        Ok(Some(credentials)) => {
+            let result = account::normalized(credentials, "web", "");
+            if working["expiresAt"].as_i64().unwrap_or(0) <= util::now()? {
+                put(&reserved, Value::Null, 1000)?;
+                return Ok(failed("Qoder 设备授权已过期，未添加迟到的账号"));
+            }
+            put(&reserved, Value::Null, 1000)?;
+            result.map(sdk::login::done)
+        }
+        Ok(None) => {
+            working["phase"] = json!("waiting");
+            working["nextAt"] = json!(util::now()? + 2000);
+            working["busyUntil"] = json!(0);
+            put(&reserved, working, ttl)?;
+            Ok(sdk::login::pending(None))
+        }
         Err(error) if error.code.as_deref() == Some("qoder_transport") => {
-            Ok(json!({ "state": "pending", "hint": "授权服务暂时不可达，正在重试…" }))
+            working["phase"] = json!("waiting");
+            working["nextAt"] = json!(util::now()? + 2000);
+            working["busyUntil"] = json!(0);
+            put(&reserved, working, ttl)?;
+            Ok(json!({ "state": "pending", "hint": "Qoder 设备授权服务暂时不可达，正在等待重试" }))
         }
         Err(error) => {
-            clear_flow();
-            Ok(json!({ "state": "failed", "message": error.message }))
+            put(&reserved, Value::Null, 1000)?;
+            if util::terminal(&error) {
+                return Err(error);
+            }
+            Ok(failed(&error.message))
         }
     }
 }
-
-/// 取消一次登录。
-pub fn cancel() -> Value {
-    clear_flow();
-    Value::Null
+fn step(value: &Value) -> Result<Option<Credentials>> {
+    let mut url = url::Url::parse(&format!(
+        "{}{}",
+        endpoints::OPEN_API,
+        endpoints::DEVICE_POLL
+    ))
+    .map_err(|_| Error::new("Qoder 轮询地址配置无效"))?;
+    let nonce = value["nonce"].as_str().ok_or_else(changed)?;
+    let verifier = value["verifier"].as_str().ok_or_else(changed)?;
+    let machine = value["machineId"].as_str().ok_or_else(changed)?;
+    url.query_pairs_mut()
+        .append_pair("nonce", nonce)
+        .append_pair("verifier", verifier)
+        .append_pair("challenge_method", "S256");
+    let path = format!("{}?{}", url.path(), url.query().unwrap_or(""));
+    let reply = client::request(
+        "GET",
+        endpoints::OPEN_API,
+        &path,
+        client::account_headers(None),
+        None,
+        "设备授权轮询",
+    )?;
+    if matches!(reply.status, 202 | 404) {
+        return Ok(None);
+    }
+    let data = client::accepted(reply, "设备授权")?;
+    let access = util::secret(&data, &["token", "device_token"])?;
+    let refresh = util::secret(&data, &["refresh_token"])?;
+    if access.is_empty() || access.contains('|') || refresh.contains('|') {
+        return Err(Error::http(502, "Qoder 设备授权未返回有效凭据"));
+    }
+    let user = util::text(&data, &["user_id", "uid"]);
+    let mut credentials = Credentials::parse(
+        &json!({ "mode": "cn", "accessToken": access, "refreshToken": refresh,
+        "userId": user, "machineId": machine, "expiresAt": util::timestamp(&data["expires_at"]).unwrap_or(util::now()? + endpoints::DEVICE_LIFETIME) }),
+    )?;
+    if let Err(error) = auth::profile(&mut credentials) {
+        if credentials.user.is_empty()
+            || util::terminal(&error)
+            || matches!(error.status, Some(401 | 403))
+        {
+            return Err(if error.code.as_deref() == Some("qoder_transport") {
+                Error::http(502, "Qoder 已返回设备凭据但未能确认用户身份，请重新授权")
+            } else {
+                error
+            });
+        }
+    }
+    credentials.complete()?;
+    Ok(Some(credentials))
 }
-
-/// 设备授权是轮询型：内嵌窗口拦下回调也没有东西可兑换，按错误回。
-pub fn callback() -> Result<Value> {
-    Err(Error::http(400, "Qoder 中国版的网页登录是设备授权型，不接受回调"))
+pub fn cancel(params: &Value) -> Result<Value> {
+    let flow = flow(params)?;
+    for _ in 0..3 {
+        let before = state::get(Scope::Login, KEY, 1)?;
+        if !before.value.is_null() && before.value["flow"] != flow {
+            return Err(changed());
+        }
+        if state::compare_exchange(Scope::Login, KEY, 1, before.revision, Value::Null, 1000)? {
+            return Ok(Value::Null);
+        }
+    }
+    Err(changed())
 }

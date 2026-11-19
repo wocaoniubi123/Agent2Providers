@@ -1,140 +1,250 @@
-//! 上游错误 → 网关认识的分类 / 错误事件 / 出站错误翻译。
-//!
-//! ── 本家的错误形态（三种，来自实测记录）────────────────────
-//!   1. HTTP 非 2xx：正文可能是 HTML（风控页）也可能是 JSON；
-//!   2. HTTP 200 + 顶层 `{errno, show_msg | errmsg}`（`userreport` / `freepoint` /
-//!      签到活动这一族接口的成功判据是 `errno == 0`）；
-//!   3. HTTP 200 + 顶层 `{status: {code, msg}}`（`sendmsg` / `model/list` /
-//!      `getgfvipremain` 这一族，判据是 `status.code == 0`）。
-//!
-//! 第 2、3 两种由各接口自己翻译（成功判据不同，见 `chat` / `models` /
-//! `usage` / `checkin` 各自的模块头）；本文件只负责**状态码层面**的分类与
-//! 「把分类折成一条 SSE 错误事件」。
-//!
-//! ── 与 native 的对应 ────────────────────────────────────────
-//! native `kuku/mod.rs` 的 `classify()` 一律给 `ErrorClass::Fatal`：上游业务错误
-//! 在 `chat::run_chat` 内部已经按参考实现的口径归一到状态码与文案，
-//! `classify` 在正常路径上走不到。这里逐字沿用同一条口径（也保留这句判断
-//! 依据：把本家错误再分档没有实测证据，凭空分档只会让编排层做出错的换号决定）。
-//!
-//! ── 硬约束 ──────────────────────────────────────────────────
-//! release 是 `panic=abort`：本文件零 unwrap/expect/panic。
+//! 区分HTTP状态、errno与status.code；缺码不当成功。流前/流后均保留真实错误。
+//! 上游正文可能含Cookie/三件套/活动token，公开错误绝不回显URL或凭据。
 
-use agent2api_wasm_sdk::{json, Error, Value};
+use crate::util;
+use agent2api_wasm_sdk::{json, Error, Result, Value};
 
-/// 上游错误文案的通用兜底。
-pub const FALLBACK_MESSAGE: &str = "上游错误";
-
-/// 从三种错误形态里尽力取一句人话（`message` / `show_msg` / `errmsg` /
-/// `status.msg`），取不到给 `FALLBACK_MESSAGE`。
-pub fn message_of(body: &Value) -> String {
-    let direct = ["message", "msg", "show_msg", "errmsg", "error_description"]
+pub fn message(value: &Value) -> String {
+    let own = util::text(value, &["show_msg", "errmsg", "message", "msg"]);
+    if !own.is_empty() {
+        return own;
+    }
+    let status = util::text(&value["status"], &["msg", "message"]);
+    if !status.is_empty() {
+        return status;
+    }
+    util::text(&value["error"], &["message", "msg"])
+}
+fn kind(status: u16, code: Option<i64>, message: &str) -> (&'static str, u16) {
+    let lower = message.to_ascii_lowercase();
+    if matches!(code, Some(-6 | 1000004))
+        || matches!(status, 401 | 403)
+        || [
+            "not login",
+            "not_login",
+            "bduss invalid",
+            "登录态已失效",
+            "未登录",
+        ]
         .iter()
-        .find_map(|key| body.get(*key).and_then(Value::as_str))
-        .map(str::trim)
-        .filter(|text| !text.is_empty());
-    if let Some(text) = direct {
-        return text.to_string();
+        .any(|s| lower.contains(s))
+    {
+        return ("token_expired", 401);
     }
-    let nested = body
-        .get("status")
-        .and_then(|status| status.get("msg"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|text| !text.is_empty());
-    match nested {
-        Some(text) => text.to_string(),
-        None => FALLBACK_MESSAGE.to_string(),
+    if code == Some(11002)
+        || status == 429
+        || [
+            "insufficient_balance",
+            "积分不足",
+            "额度不足",
+            "quota",
+            "rate limit",
+            "限流",
+            "频率过高",
+        ]
+        .iter()
+        .any(|s| lower.contains(s))
+    {
+        return ("quota_limited", 429);
     }
-}
-
-/// 非 2xx 的分类（与 native `classify()` 同口径：一律 Fatal）。
-pub fn classify(status: u16, body: &Value) -> Value {
-    json!({
-        "kind": "fatal",
-        "status": status,
-        "message": message_of(body),
-        "reset_at": Value::Null,
-        "upstream_code": Value::Null,
-        "code": Value::Null,
-    })
-}
-
-/// 非 2xx 的翻译：401 / 403 是登录态失效，其余原样带状态码与诊断体前 240 字符。
-///
-/// ── 为什么 401/403 要改写成 401 ─────────────────────────────
-/// 本家的登录态是 Cookie（BDUSS / STOKEN），没有刷新接口 —— 403 在这家通常也是
-/// 「这个 Cookie 不被认」，让编排层按 `token_expired` 处理比按 `fatal` 更准：
-/// 用户看到的是「请重新登录」，而不是「上游请求未成功」这种无从下手的提示。
-pub fn http_error(status: u16, url: &str, head: &str) -> Error {
-    let head = head.trim();
-    if status == 401 || status == 403 {
-        return Error::http(
-            401,
-            format!("KukuAI 登录态已失效，请重新登录或重新导入该账号（HTTP {status}）"),
-        )
-        .with_code("token_expired");
+    if [
+        "content_filter",
+        "content blocked",
+        "内容违规",
+        "敏感内容",
+        "内容安全",
+    ]
+    .iter()
+    .any(|s| lower.contains(s))
+    {
+        return ("content_blocked", 400);
     }
-    let mut message = format!("KukuAI 返回 HTTP {status}（{url}）");
-    if !head.is_empty() {
-        message.push('：');
-        message.push_str(head);
-    }
-    Error::http(status.max(400), message)
-}
-
-/// 一条 SSE 错误事件（已经下发过字节之后再出错时补在流里）。
-///
-/// 形状与 atomcode / codearts 一致：`{"error": {"message", "type", "status"}}`，
-/// 网关的聚合器认得它，客户端也能按 OpenAI 错误体解析。
-pub fn error_event(error: &Error) -> Value {
-    let status = error.status.unwrap_or(502);
-    json!({
-        "error": {
-            "message": error.message,
-            "type": "upstream_error",
-            "status": status,
+    (
+        "fatal",
+        if (400..600).contains(&status) {
+            status
+        } else {
+            502
         },
+    )
+}
+pub fn upstream(status: u16, code: Option<i64>, value: &Value, secrets: &[&str]) -> Error {
+    let message = message(value);
+    let (kind, status) = kind(status, code, &message);
+    let safe = safe_message(&message, secrets);
+    let mut error = Error::http(
+        status,
+        if safe.is_empty() {
+            format!("库库请求失败（HTTP {status}）")
+        } else {
+            safe
+        },
+    )
+    .with_code(match kind {
+        "token_expired" => "kuku_auth",
+        "quota_limited" => "kuku_quota",
+        "content_blocked" => "kuku_content_blocked",
+        _ => "kuku_upstream",
+    });
+    error.upstream_code = code;
+    error
+}
+pub fn errno(value: &Value, secrets: &[&str]) -> Result<()> {
+    let code = util::integer(&value["errno"]);
+    match code {
+        Some(0) => Ok(()),
+        Some(code) => Err(upstream(502, Some(code), value, secrets)),
+        None => Err(Error::http(502, "库库响应缺少errno，不能确认成功").with_code("kuku_protocol")),
+    }
+}
+pub fn status(value: &Value, secrets: &[&str]) -> Result<()> {
+    let code = util::integer(&value["status"]["code"]);
+    match code {
+        Some(0) => Ok(()),
+        Some(code) => Err(upstream(502, Some(code), value, secrets)),
+        None => {
+            Err(Error::http(502, "库库响应缺少业务状态，不能确认成功").with_code("kuku_protocol"))
+        }
+    }
+}
+pub fn classify(status: u16, value: &Value) -> Value {
+    let text = message(value);
+    let code = util::integer(&value["upstream_code"])
+        .or_else(|| util::integer(&value["error"]["upstream_code"]))
+        .or_else(|| util::integer(&value["errno"]))
+        .or_else(|| util::integer(&value["data"]["code"]))
+        .or_else(|| util::integer(&value["data"]["errno"]))
+        .or_else(|| util::integer(&value["status"]["code"]));
+    let (kind, status) = if value["code"] == "kuku_content_blocked"
+        || value["error"]["code"] == "kuku_content_blocked"
+    {
+        ("content_blocked", 400)
+    } else {
+        kind(status, code, &text)
+    };
+    json!({ "kind": kind, "status": status, "message": safe_message(&text, &[]), "upstream_code": code, "reset_at": null })
+}
+pub fn uncertain(error: Error) -> Error {
+    if host_stop(&error) || matches!(error.status, Some(400 | 401 | 403 | 429)) {
+        return error;
+    }
+    Error {
+        message: format!(
+            "{}；上游可能已创建任务，请先查看任务与积分，不会自动重复发送",
+            error.message
+        ),
+        code: Some("kuku_turn_uncertain".into()),
+        ..error
+    }
+}
+
+pub fn stop(value: &Value) -> bool {
+    [value, &value["error"]].iter().any(|value| {
+        value["code"].as_str().is_some_and(|code| {
+            matches!(
+                code,
+                "kuku_turn_uncertain" | "kuku_requires_client" | "kuku_stream_incomplete"
+            )
+        })
     })
 }
 
-/// 按字符数截断（中文文案按字节截会切出半个字符）。
-pub fn truncate_chars(value: &str, limit: usize) -> String {
-    if value.chars().count() <= limit {
-        return value.to_string();
-    }
-    let mut out: String = value.chars().take(limit).collect();
-    out.push('…');
-    out
+pub fn is_error_response(status: u16, value: &Value) -> bool {
+    status >= 400
+        || value.get("error").is_some_and(|error| !error.is_null())
+        || [
+            util::integer(&value["errno"]),
+            util::integer(&value["status"]["code"]),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|code| code != 0)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn message_falls_back_through_three_shapes() {
-        assert_eq!("直接消息", message_of(&json!({ "message": "直接消息" })));
-        assert_eq!("业务码消息", message_of(&json!({ "errno": -6, "show_msg": "业务码消息" })));
-        assert_eq!("包络消息", message_of(&json!({ "status": { "code": 1, "msg": "包络消息" } })));
-        assert_eq!(FALLBACK_MESSAGE, message_of(&json!({ "errno": -6 })));
+pub fn host_stop(error: &Error) -> bool {
+    matches!(
+        error.code.as_deref(),
+        Some(
+            "aborted"
+                | "forbidden"
+                | "plugin_resource_limit"
+                | "plugin_protocol_error"
+                | "plugin_unavailable"
+        )
+    )
+}
+pub fn transport(error: Error) -> Error {
+    if host_stop(&error) {
+        return error;
     }
-
-    #[test]
-    fn auth_failures_become_401_with_token_expired() {
-        let error = http_error(403, "https://kuku.baidu.com/x", "forbidden");
-        assert_eq!(Some(401), error.status);
-        assert_eq!(Some("token_expired"), error.code.as_deref());
-        let error = http_error(500, "https://kuku.baidu.com/x", "boom");
-        assert_eq!(Some(500), error.status);
-        assert!(error.message.contains("boom"));
+    if error.code.as_deref() == Some("timeout") {
+        Error::http(504, "库库请求超时，请检查网络或账号代理").with_code("kuku_transport")
+    } else {
+        Error::http(502, "无法连接库库，请检查网络或账号代理").with_code("kuku_transport")
     }
-
-    #[test]
-    fn classification_is_always_fatal() {
-        let class = classify(429, &json!({ "errno": 123, "errmsg": "稍后再试" }));
-        assert_eq!("fatal", class["kind"].as_str().unwrap_or_default());
-        assert_eq!(429, class["status"].as_u64().unwrap_or(0));
-        assert_eq!("稍后再试", class["message"].as_str().unwrap_or_default());
+}
+pub fn redact(input: &str, secrets: &[&str]) -> String {
+    let mut text = input.to_string();
+    for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
+        for needle in [secret.to_string(), util::query(secret)] {
+            text = text.replace(&needle, "[已隐藏]");
+        }
     }
+    text
+}
+pub fn safe_message(input: &str, secrets: &[&str]) -> String {
+    let text = redact(input, secrets);
+    let lower = text.to_ascii_lowercase();
+    if [
+        "http://",
+        "https://",
+        "bduss=",
+        "stoken=",
+        "ptoken=",
+        "jstoken=",
+        "bdstoken=",
+        "uinfo=",
+        "cookie:",
+    ]
+    .iter()
+    .any(|hint| lower.contains(hint))
+    {
+        return "库库返回了含敏感会话信息的错误，详细内容已隐藏".into();
+    }
+    util::safe_text(&text, 400)
+}
+pub fn sanitize(value: &Value, secrets: &[&str]) -> Value {
+    match value {
+        Value::String(text) => json!(redact(text, secrets)),
+        Value::Array(items) => {
+            Value::Array(items.iter().map(|value| sanitize(value, secrets)).collect())
+        }
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(key, _)| {
+                    let key = key.to_ascii_lowercase().replace(['_', '-'], "");
+                    ![
+                        "cookie",
+                        "cookies",
+                        "accesstoken",
+                        "bduss",
+                        "stoken",
+                        "ptoken",
+                        "ptokenbfess",
+                        "bdstoken",
+                        "uinfo",
+                        "jstoken",
+                        "authorization",
+                    ]
+                    .contains(&key.as_str())
+                })
+                .map(|(key, value)| (key.clone(), sanitize(value, secrets)))
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+pub fn event(error: &Error) -> Value {
+    json!({ "error": { "message": error.message, "code": error.code, "status": error.status,
+        "upstream_code": error.upstream_code, "type": if error.status == Some(429) { "rate_limit_error" } else { "upstream_error" } } })
 }

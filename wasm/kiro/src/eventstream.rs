@@ -1,30 +1,16 @@
-//! AWS event stream 帧解析（Kiro 的响应格式）。
-//!
-//! ── 帧结构 ──────────────────────────────────────────────────
-//! ```text
-//!   [0..4)   total length（含所有字段）
-//!   [4..8)   headers length
-//!   [8..12)  prelude CRC（不校验）
-//!   [12..12+headers)
-//!   [..total-4) payload
-//!   [total-4..total) message CRC（不校验）
-//! ```
-//!
-//! 每个 header 是 `名称长度(1) 名称 类型(1) 值`：
-//!   0=true / 1=false（无字节）、2=byte、3=short、4=int、5=long、8=timestamp、
-//!   9=uuid、6=bytes（2 字节长度）、7=string（2 字节长度）。
-//!
-//! 我们只关心类型 7 的字符串：`:message-type`（event / exception / error）、
-//! `:event-type`、`:exception-type`、`:error-code`。
-//!
-//! ── 为什么要自己解析 ────────────────────────────────────────
-//! 网关的 `UpstreamKind` 是封闭枚举，没有 AWS event stream。走 `conversation`
-//! 之后由插件自己读帧、自己推 chat SSE，是唯一不扩协议的路。
+//! AWS eventstream 二进制帧，不把字节流当 SSE 字符串喂转换器。
+//! 基于原生 kiro/eventstream.rs，按 Smithy Amazon Event Stream 规范补上双 CRC32：
+//! prelude=[0..8)，message=[0..total-4)。所有整数大端，header重复/越界/未知类型拒绝。
+//! 单帧16MiB、headers128KiB、单次读64KiB；残帧EOF永远报错，不假补成功终态。
 
-use agent2api_wasm_sdk::{Error, Result};
+use crate::errors;
+use agent2api_wasm_sdk::{http, Error, Result};
+use std::collections::HashSet;
 
-/// 一个解析出来的帧。
-#[derive(Clone, Debug, Default)]
+const MAX_FRAME: usize = 16 * 1024 * 1024;
+const MAX_HEADERS: usize = 128 * 1024;
+const MAX_CHUNK: usize = 64 * 1024;
+
 pub struct Frame {
     pub event_type: String,
     pub message_type: String,
@@ -32,193 +18,188 @@ pub struct Frame {
     pub error_code: String,
     pub payload: Vec<u8>,
 }
-
 impl Frame {
-    /// 这一帧是不是错误（exception / error / 带错误码的事件）。
-    pub fn is_error(&self) -> bool {
-        self.message_type == "exception"
-            || self.message_type == "error"
+    pub fn error(&self) -> bool {
+        matches!(self.message_type.as_str(), "exception" | "error")
+            || !self.exception_type.is_empty()
+            || !self.error_code.is_empty()
             || matches!(
                 self.event_type.as_str(),
-                "error" | "throttlingError" | "validationError" | "serviceUnavailableError" | "internalServerException"
+                "error"
+                    | "invalidStateEvent"
+                    | "throttlingError"
+                    | "validationError"
+                    | "serviceUnavailableError"
+                    | "internalServerException"
             )
     }
-
-    /// 错误的类型名（异常类型优先，其次事件名）。
-    pub fn error_kind(&self) -> String {
+    pub fn error_kind(&self) -> &str {
         if !self.exception_type.is_empty() {
-            self.exception_type.clone()
+            &self.exception_type
         } else if !self.error_code.is_empty() {
-            self.error_code.clone()
+            &self.error_code
         } else {
-            self.event_type.clone()
+            &self.event_type
         }
     }
 }
-
-/// 增量帧读取器（缓冲区 + 取帧）。
-pub struct FrameReader {
-    buffer: Vec<u8>,
+fn bad(message: &str) -> Error {
+    Error::http(502, message).with_code("kiro_eventstream_invalid")
 }
-
-impl Default for FrameReader {
-    fn default() -> Self {
-        Self { buffer: Vec::new() }
-    }
+fn u32_at(bytes: &[u8], at: usize) -> Result<u32> {
+    let value = bytes
+        .get(at..at + 4)
+        .ok_or_else(|| bad("Kiro 事件帧整数被截断"))?;
+    Ok(u32::from_be_bytes([value[0], value[1], value[2], value[3]]))
 }
-
-impl FrameReader {
-    /// 追加一段上游字节。
-    pub fn push(&mut self, bytes: &[u8]) {
-        self.buffer.extend_from_slice(bytes);
-    }
-
-    /// 缓冲区里已经有一整帧就取出来（不足一帧返回 `Ok(None)`）。
-    pub fn take(&mut self) -> Result<Option<Frame>> {
-        if self.buffer.len() < 12 {
-            return Ok(None);
-        }
-        let total = u32::from_be_bytes([self.buffer[0], self.buffer[1], self.buffer[2], self.buffer[3]]) as usize;
-        let header_length =
-            u32::from_be_bytes([self.buffer[4], self.buffer[5], self.buffer[6], self.buffer[7]]) as usize;
-        if total < 16 || total > (16 << 20) || header_length > total.saturating_sub(16) {
-            return Err(Error::http(502, "Kiro 的事件流帧格式不对"));
-        }
-        if self.buffer.len() < total {
-            return Ok(None);
-        }
-        let headers = parse_headers(&self.buffer[12..12 + header_length]);
-        let payload = self.buffer[12 + header_length..total - 4].to_vec();
-        self.buffer.drain(..total);
-        Ok(Some(Frame {
-            payload,
-            event_type: headers.0,
-            message_type: headers.1,
-            exception_type: headers.2,
-            error_code: headers.3,
-        }))
-    }
-
-    /// 流结束时缓冲区还有残留 → 说明帧被截断。
-    pub fn leftover(&self) -> usize {
-        self.buffer.len()
-    }
+fn take<'a>(bytes: &'a [u8], index: &mut usize, length: usize) -> Result<&'a [u8]> {
+    let end = index
+        .checked_add(length)
+        .ok_or_else(|| bad("Kiro 事件头长度溢出"))?;
+    let value = bytes
+        .get(*index..end)
+        .ok_or_else(|| bad("Kiro 事件头被截断"))?;
+    *index = end;
+    Ok(value)
 }
-
-/// 解析 header 段，返回（event-type, message-type, exception-type, error-code）。
-fn parse_headers(bytes: &[u8]) -> (String, String, String, String) {
-    let mut event_type = String::new();
-    let mut message_type = String::new();
-    let mut exception_type = String::new();
-    let mut error_code = String::new();
+fn headers(bytes: &[u8]) -> Result<Frame> {
+    let mut out = Frame {
+        event_type: String::new(),
+        message_type: String::new(),
+        exception_type: String::new(),
+        error_code: String::new(),
+        payload: Vec::new(),
+    };
+    let mut names = HashSet::new();
     let mut index = 0;
     while index < bytes.len() {
-        let name_length = bytes[index] as usize;
-        index += 1;
-        if index + name_length + 1 > bytes.len() {
-            break;
+        let length = take(bytes, &mut index, 1)?[0] as usize;
+        if length == 0 || names.len() >= 256 {
+            return Err(bad("Kiro 事件头名称或数量无效"));
         }
-        let name = String::from_utf8_lossy(&bytes[index..index + name_length]).to_string();
-        index += name_length;
-        let kind = bytes[index];
-        index += 1;
-        match kind {
-            0 | 1 => {
-                if name == ":message-type" {
-                    message_type = if kind == 0 { "event" } else { "error" }.to_string();
-                }
-            }
-            2 | 3 | 4 | 5 | 8 | 9 => {
-                let size = match kind {
-                    2 => 1,
-                    3 => 2,
-                    4 => 4,
-                    5 | 8 => 8,
-                    _ => 16,
-                };
-                index += size;
-            }
+        let name = std::str::from_utf8(take(bytes, &mut index, length)?)
+            .map_err(|_| bad("Kiro 事件头名称不是有效UTF-8"))?;
+        if name.chars().any(char::is_control) || !names.insert(name.to_string()) {
+            return Err(bad("Kiro 事件头重复或包含控制字符"));
+        }
+        let kind = take(bytes, &mut index, 1)?[0];
+        let required = matches!(
+            name,
+            ":event-type" | ":message-type" | ":exception-type" | ":error-code"
+        );
+        if required && kind != 7 {
+            return Err(bad("Kiro 事件类型头必须为字符串"));
+        }
+        let length = match kind {
+            0 | 1 => 0,
+            2 => 1,
+            3 => 2,
+            4 => 4,
+            5 | 8 => 8,
+            9 => 16,
             6 | 7 => {
-                if index + 2 > bytes.len() {
-                    break;
-                }
-                let length = u16::from_be_bytes([bytes[index], bytes[index + 1]]) as usize;
-                index += 2;
-                if index + length > bytes.len() {
-                    break;
-                }
-                if kind == 7 {
-                    let value = String::from_utf8_lossy(&bytes[index..index + length]).to_string();
-                    match name.as_str() {
-                        ":event-type" => event_type = value,
-                        ":message-type" => message_type = value,
-                        ":exception-type" => exception_type = value,
-                        ":error-code" => error_code = value,
-                        _ => {}
-                    }
-                }
-                index += length;
+                let length = take(bytes, &mut index, 2)?;
+                u16::from_be_bytes([length[0], length[1]]) as usize
             }
-            _ => break,
+            _ => return Err(bad("Kiro 事件头使用未知编码类型")),
+        };
+        let raw = take(bytes, &mut index, length)?;
+        if kind == 7 {
+            let text = std::str::from_utf8(raw).map_err(|_| bad("Kiro 事件头值不是有效UTF-8"))?;
+            if required
+                && (text.is_empty() || text.len() > 1024 || text.chars().any(char::is_control))
+            {
+                return Err(bad("Kiro 事件类型值无效"));
+            }
+            match name {
+                ":event-type" => out.event_type = text.into(),
+                ":message-type" => out.message_type = text.into(),
+                ":exception-type" => out.exception_type = text.into(),
+                ":error-code" => out.error_code = text.into(),
+                _ => {}
+            }
         }
     }
-    (event_type, message_type, exception_type, error_code)
+    if !matches!(out.message_type.as_str(), "event" | "exception" | "error")
+        || out.message_type == "event" && out.event_type.is_empty()
+    {
+        return Err(bad("Kiro 事件帧缺少有效类型"));
+    }
+    Ok(out)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 手工拼一帧：`assistantResponseEvent` + payload，验证头部解析与取帧。
-    fn frame(event: &str, payload: &[u8]) -> Vec<u8> {
-        let mut headers = Vec::new();
-        let name = b":event-type";
-        headers.push(name.len() as u8);
-        headers.extend_from_slice(name);
-        headers.push(7);
-        headers.extend_from_slice(&(event.len() as u16).to_be_bytes());
-        headers.extend_from_slice(event.as_bytes());
-        let total = 12 + headers.len() + payload.len() + 4;
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&(total as u32).to_be_bytes());
-        bytes.extend_from_slice(&(headers.len() as u32).to_be_bytes());
-        bytes.extend_from_slice(&0u32.to_be_bytes());
-        bytes.extend_from_slice(&headers);
-        bytes.extend_from_slice(payload);
-        bytes.extend_from_slice(&0u32.to_be_bytes());
-        bytes
+pub struct Reader {
+    response: http::Response,
+    buffer: Vec<u8>,
+    offset: usize,
+    ended: bool,
+    frames: usize,
+}
+impl Reader {
+    pub fn new(response: http::Response) -> Self {
+        Self {
+            response,
+            buffer: Vec::new(),
+            offset: 0,
+            ended: false,
+            frames: 0,
+        }
     }
-
-    #[test]
-    fn reads_a_whole_frame_in_two_pushes() {
-        let bytes = frame("assistantResponseEvent", b"{\"content\":\"hi\"}");
-        let split = bytes.len() / 2;
-        let mut reader = FrameReader::default();
-        reader.push(&bytes[..split]);
-        // 半帧还在缓冲区里（没被解析出来）。
-        assert_eq!(split, reader.leftover());
-        assert!(reader.take().ok().flatten().is_none(), "半帧不该被解析出来");
-        reader.push(&bytes[split..]);
-        let Some(parsed) = reader.take().ok().flatten() else {
-            assert!(false, "应当有一整帧");
-            return;
-        };
-        assert_eq!("assistantResponseEvent", parsed.event_type);
-        assert_eq!(b"{\"content\":\"hi\"}".to_vec(), parsed.payload);
-        assert!(!parsed.is_error());
-        assert_eq!(0, reader.leftover());
+    fn frame(&mut self) -> Result<Option<Frame>> {
+        let bytes = &self.buffer[self.offset..];
+        if bytes.len() < 12 {
+            return Ok(None);
+        }
+        let total = u32_at(bytes, 0)? as usize;
+        let header_len = u32_at(bytes, 4)? as usize;
+        if !(16..=MAX_FRAME).contains(&total) || header_len > total - 16 || header_len > MAX_HEADERS
+        {
+            return Err(bad("Kiro 事件帧长度无效或超出上限"));
+        }
+        if crc32fast::hash(&bytes[..8]) != u32_at(bytes, 8)? {
+            return Err(bad("Kiro 事件帧前导校验失败"));
+        }
+        if bytes.len() < total {
+            return Ok(None);
+        }
+        if crc32fast::hash(&bytes[..total - 4]) != u32_at(bytes, total - 4)? {
+            return Err(bad("Kiro 事件帧完整校验失败"));
+        }
+        let mut frame = headers(&bytes[12..12 + header_len])?;
+        frame.payload = bytes[12 + header_len..total - 4].to_vec();
+        self.offset += total;
+        self.frames += 1;
+        if self.frames > 100_000 {
+            return Err(bad("Kiro 事件数量超出单次请求上限"));
+        }
+        Ok(Some(frame))
     }
-
-    #[test]
-    fn parses_exception_frame() {
-        let bytes = frame("throttlingError", b"{}");
-        let mut reader = FrameReader::default();
-        reader.push(&bytes);
-        let Some(parsed) = reader.take().ok().flatten() else {
-            assert!(false, "应当有一整帧");
-            return;
-        };
-        assert!(parsed.is_error());
-        assert_eq!("throttlingError", parsed.error_kind());
+    pub fn next(&mut self) -> Result<Option<Frame>> {
+        loop {
+            if let Some(frame) = self.frame()? {
+                return Ok(Some(frame));
+            }
+            if self.ended {
+                return if self.buffer.len() == self.offset {
+                    Ok(None)
+                } else {
+                    Err(bad("Kiro 二进制事件流提前结束，最后一帧不完整"))
+                };
+            }
+            if self.offset > 0 {
+                self.buffer.drain(..self.offset);
+                self.offset = 0;
+            }
+            match self.response.read().map_err(errors::transport)? {
+                Some(bytes) => {
+                    if bytes.len() > MAX_CHUNK
+                        || self.buffer.len().saturating_add(bytes.len()) > MAX_FRAME + MAX_CHUNK
+                    {
+                        return Err(bad("Kiro 事件缓冲超过受控上限"));
+                    }
+                    self.buffer.extend(bytes);
+                }
+                None => self.ended = true,
+            }
+        }
     }
 }

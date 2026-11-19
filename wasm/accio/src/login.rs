@@ -1,386 +1,406 @@
-//! Accio 网页登录：授权页 → **回调 URL 回填** → 换凭据 → 收账号。
-//!
-//! ── 与 native 的结构差别（迁移时改的）───────────────────────
-//! native 侧每轮登录会**自己绑一个 loopback 端口**收回调（`callback_server.rs`），
-//! wasm 没有 socket，这条链因此改成：
-//!
-//! ```text
-//!   login.start    → 造授权地址 + 把 PKCE / 回调地址存进 Login 状态
-//!   login.poll     → 只读状态（网关按 poll_interval_ms 来问）
-//!   login.callback → 用户把地址栏那条 URL 粘回来 → 当场换证 → 状态翻成 done
-//!   login.cancel   → 清掉那一条
-//! ```
-//!
-//! ── 为什么报 `poll_interval_ms > 0`（本家明明是回调型）────────
-//! 「轮询型」在协议里的含义是「**网关主动问插件要结果**」，与授权在哪里终结
-//! 无关。回调落在用户浏览器的地址栏里，网关必须来问，所以这里报一个间隔；
-//! 报 `0` 会让网关一直等一个不会自动到来的回调，没有任何报错。
-//!
-//! ── 为什么换证不另起后台任务 ────────────────────────────────
-//! native 用后台任务是因为 `login.poll` 现场 await 换证超时会把回调消费掉、
-//! 结果丢掉。wasm 没有线程，而 `login.callback` 本身就是一次同步 RPC ——
-//! 换证放在它里面，成功/失败都直接落状态，没有「两个消费者抢一个 channel」的
-//! 问题。所以 `poll` 只读状态，不发起网络。
-//!
-//! ── `flow` 必须原样回传（规格第 17 节的硬约束）─────────────────
-//! 网关在 `login.start` 时把 `params.flow` 给插件，`login.callback` 时逐字
-//! 比对 URL 里的 `state` 与当前 flow。插件若把**上游自己的 state** 当 `flow`
-//! 返回，点「网页登录」会当场 502。上游 state 存在本模块的登录状态里，
-//! 不进 flow。
-//!
-//! ── 交付给面板的两处契约（漏了面板就不对）────────────────────
-//!   · `auth.methods` 必须由插件申报（网关对 wasm 恒走动态通道，不实现就 501）；
-//!   · `manualCallback: true` + `callbackInput: "url"`：插件没有 socket，收不到
-//!     浏览器重定向，必须由用户回填（与 `login.start` 的 `login_ui` 逐字同值）。
+//! 宿主一次性 flow + PKCE；只复用已登记的 /auth/callback-accio，不开本机监听器。
+//! code/verifier 不进公开返回、错误或账号；取消/超时用 flow 隔离状态清理。
 
-use agent2api_wasm_sdk::{self as sdk, json, state, Error, Result, Value};
+use crate::{account, credentials::Credentials, endpoints, errors, network, util};
+use agent2api_wasm_sdk::{
+    self as sdk, json,
+    state::{self, Scope, Snapshot},
+    Error, Result, Value,
+};
+use url::Url;
 
-use super::credential::{self, Credential};
-use super::oauth;
-use super::region;
+const KEY: &str = "accio.oauth";
+const TTL: i64 = 360_000;
 
-/// 登录状态在宿主 Login 作用域里的键（同一时刻只允许一轮登录）。
-const STATE_KEY: &str = "flow";
-const SCHEMA: u32 = 1;
-
-/// 登录状态有效期（15 分钟；超时由网关的登录超时驱动，这里只负责「过期后
-/// 状态自己消失」，免得一条旧上下文一直躺着被后来者误用）。
-const STATE_TTL_MS: i64 = 900_000;
-
-fn failed(message: impl Into<String>) -> Value {
-    json!({ "state": "failed", "message": message.into() })
+pub fn methods() -> Value {
+    json!({ "methods": [
+        { "methodIndex": 0, "type": "oauth", "label": "Accio 国际版网页登录", "browserMode": "choice",
+            "manualCallback": true, "callbackInput": "url", "validatesCallback": true,
+            "instructions": "在 www.accio.com 完成授权；同机自动接收，远程部署可粘贴最后的完整回调地址。",
+            "prompts": [{ "key": "name", "type": "text", "label": "备注名", "optional": true }] },
+        { "methodIndex": 1, "type": "api", "label": "手工填写凭据",
+            "instructions": "请填写国际版凭据，国内账号不能共用；不提供刷新凭据时无法自动续期。",
+            "prompts": [
+                { "key": "accessToken", "type": "text", "label": "访问令牌", "secret": true },
+                { "key": "refreshToken", "type": "text", "label": "刷新令牌", "optional": true, "secret": true },
+                { "key": "name", "type": "text", "label": "备注名", "optional": true }
+            ] },
+        { "methodIndex": 2, "type": "api", "label": "导入凭据 JSON",
+            "instructions": "接受国际版 accessToken、refreshToken、expiresAt、userId、deviceId 和 sgcookie；不会读取本机文件。",
+            "prompts": [
+                { "key": "credentialJson", "type": "text", "label": "凭据 JSON", "secret": true },
+                { "key": "name", "type": "text", "label": "备注名", "optional": true }
+            ] }
+    ] })
 }
 
-/// 写状态（CAS：并发发起时后到的那个会失败，而不是把前一轮的参数改掉）。
-fn put_state(value: Value, ttl_ms: i64) -> Result<()> {
-    let snapshot = state::get(state::Scope::Login, STATE_KEY, SCHEMA)?;
-    if !state::compare_exchange(state::Scope::Login, STATE_KEY, SCHEMA, snapshot.revision, value, ttl_ms)? {
-        return Err(Error::new("登录状态已被另一轮流程改写，请重新发起"));
+pub fn methods_for(locale: &str) -> Value {
+    let mut value = methods();
+    let rows = [
+        (["Accio 国际版网页登录", "Accio international web sign-in", "Accio 國際版網頁登入", "Accio 国際版のウェブログイン", "Accio 국제판 웹 로그인", "Login web do Accio internacional"],
+         ["在 www.accio.com 完成授权；同机自动接收，远程部署可粘贴本次完整回调地址。", "Authorize at www.accio.com. On the gateway computer the callback is received automatically; remote users can paste this flow's complete callback URL.", "在 www.accio.com 完成授權；同機自動接收，遠端部署可貼上本次完整回呼位址。", "www.accio.com で認証します。ゲートウェイのコンピューターでは自動受信し、リモートでは今回の完全なコールバック URL を貼り付けられます。", "www.accio.com에서 인증하세요. 게이트웨이 컴퓨터에서는 자동 수신하며, 원격 사용자는 이번 흐름의 전체 콜백 URL을 붙여넣을 수 있습니다.", "Autorize em www.accio.com. No computador do gateway o retorno é automático; remotamente, cole a URL completa de retorno deste login."]),
+        (["手工填写凭据", "Enter credentials", "手動填寫憑據", "認証情報を入力", "인증 정보 입력", "Inserir credenciais"],
+         ["请填写国际版访问令牌；国内账号不能共用。刷新令牌可选，未提供时无法自动续期。", "Enter an international access token; mainland accounts are separate. The refresh token is optional and is required for automatic renewal.", "請填寫國際版存取權杖；國內帳號不能共用。更新權杖可選，未提供時無法自動續期。", "国際版のアクセストークンを入力してください。中国国内版のアカウントとは別です。自動更新には任意の更新トークンが必要です。", "국제판 액세스 토큰을 입력하세요. 중국 국내판 계정과는 별개입니다. 자동 갱신에는 선택 사항인 갱신 토큰이 필요합니다.", "Insira o token de acesso internacional; as contas da China são separadas. O token de renovação é opcional e necessário para renovação automática."]),
+        (["导入凭据 JSON", "Import credential JSON", "匯入憑據 JSON", "認証情報 JSON を取り込む", "인증 JSON 가져오기", "Importar JSON de credenciais"],
+         ["接受国际版 accessToken、refreshToken、expiresAt、userId、deviceId、utdid 和 sgcookie，以及 secret/pluginSecret 包装；不会读取本机文件。", "Accepts international accessToken, refreshToken, expiresAt, userId, deviceId, utdid and sgcookie, including secret/pluginSecret wrappers. No local files are read.", "接受國際版 accessToken、refreshToken、expiresAt、userId、deviceId、utdid 和 sgcookie，以及 secret/pluginSecret 包裝；不讀取本機檔案。", "国際版の accessToken、refreshToken、expiresAt、userId、deviceId、utdid、sgcookie と secret/pluginSecret 形式を受け付けます。ローカルファイルは読みません。", "국제판 accessToken, refreshToken, expiresAt, userId, deviceId, utdid, sgcookie 및 secret/pluginSecret 형식을 지원합니다. 로컬 파일은 읽지 않습니다.", "Aceita accessToken, refreshToken, expiresAt, userId, deviceId, utdid e sgcookie internacionais, inclusive em secret/pluginSecret. Não lê arquivos locais."]),
+    ];
+    for (row, (labels, instructions)) in value["methods"]
+        .as_array_mut()
+        .into_iter()
+        .flatten()
+        .zip(rows)
+    {
+        row["label"] = json!(localized(locale, labels));
+        row["instructions"] = json!(localized(locale, instructions));
+        for prompt in row["prompts"].as_array_mut().into_iter().flatten() {
+            let labels = match prompt["key"].as_str().unwrap_or("") {
+                "name" => [
+                    "备注名",
+                    "Nickname",
+                    "備註名稱",
+                    "表示名",
+                    "별칭",
+                    "Apelido",
+                ],
+                "accessToken" => [
+                    "访问令牌",
+                    "Access token",
+                    "存取權杖",
+                    "アクセストークン",
+                    "액세스 토큰",
+                    "Token de acesso",
+                ],
+                "refreshToken" => [
+                    "刷新令牌",
+                    "Refresh token",
+                    "更新權杖",
+                    "更新トークン",
+                    "갱신 토큰",
+                    "Token de renovação",
+                ],
+                _ => [
+                    "凭据 JSON",
+                    "Credential JSON",
+                    "憑據 JSON",
+                    "認証情報 JSON",
+                    "인증 JSON",
+                    "JSON de credenciais",
+                ],
+            };
+            prompt["label"] = json!(localized(locale, labels));
+        }
+    }
+    value
+}
+
+fn localized(locale: &str, values: [&str; 6]) -> String {
+    values[match locale {
+        "en" => 1,
+        "zh-Hant" => 2,
+        "ja" => 3,
+        "ko" => 4,
+        "pt-BR" => 5,
+        _ => 0,
+    }]
+    .into()
+}
+
+fn callback_instructions(locale: &str) -> String {
+    if endpoints::ID == "accio-cn" {
+        return localized(locale, [
+            "在 Accio 国内站完成授权；远程部署请粘贴本次完整回调地址。",
+            "Authorize on Accio mainland; remotely, paste this login's complete callback URL.",
+            "在 Accio 國內站完成授權；遠端部署請貼上本次完整回呼位址。",
+            "Accio 中国国内版で認証し、リモートの場合は今回の完全なコールバック URL を貼り付けてください。",
+            "Accio 중국 국내판에서 인증하고, 원격에서는 이번 로그인의 전체 콜백 URL을 붙여넣으세요.",
+            "Autorize no Accio da China; remotamente, cole a URL completa de retorno deste login.",
+        ]);
+    }
+    if endpoints::ID != "accio" {
+        return "等待 Accio 国内版授权回调".into();
+    }
+    localized(locale, ["在 Accio 国际站完成授权；远程部署请粘贴本次完整回调地址。", "Authorize on Accio international; remotely, paste the complete callback URL for this login.", "在 Accio 國際站完成授權；遠端部署請貼上本次完整回呼位址。", "Accio 国際版で認証し、リモートの場合は今回の完全なコールバック URL を貼り付けてください。", "Accio 국제판에서 인증하고, 원격인 경우 이번 로그인의 전체 콜백 URL을 붙여넣으세요.", "Autorize no Accio internacional; remotamente, cole a URL completa de retorno deste login."])
+}
+
+fn flow(params: &Value) -> Result<&str> {
+    params["flow"]
+        .as_str()
+        .filter(|flow| {
+            !flow.is_empty()
+                && flow.len() <= 256
+                && flow
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+        })
+        .ok_or_else(|| Error::http(503, "主程序未提供有效的 Accio 登录流程"))
+}
+
+fn parsed(raw: &str) -> Result<Url> {
+    if raw.is_empty()
+        || raw.len() > 32 * 1024
+        || raw
+            .bytes()
+            .any(|byte| byte <= b' ' || byte == 127 || byte == b'\\')
+    {
+        return Err(Error::http(400, "Accio 回调地址格式无效"));
+    }
+    let url = Url::parse(raw).map_err(|_| Error::http(400, "Accio 回调地址格式无效"))?;
+    let authority = raw
+        .split_once("://")
+        .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or(""))
+        .unwrap_or("");
+    if authority.is_empty()
+        || authority.contains('@')
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(Error::http(400, "Accio 回调不能包含用户信息或片段"));
+    }
+    Ok(url)
+}
+
+fn redirect(params: &Value) -> Result<String> {
+    // 只从宿主可信根参数读，绝不接受表单里的 redirectUri/callback_url。
+    let mut url = parsed(params["callback_url"].as_str().unwrap_or(""))?;
+    if url.scheme() != "http"
+        || url.host_str() != Some("127.0.0.1")
+        || url.port().is_none_or(|port| port == 0)
+        || url.query().is_some()
+    {
+        return Err(Error::http(503, "主程序未提供可信本机回调地址"));
+    }
+    url.set_path(endpoints::CALLBACK);
+    Ok(url.to_string())
+}
+
+fn replace(snapshot: &Snapshot, value: Value, ttl: i64) -> Result<()> {
+    if !state::compare_exchange(Scope::Login, KEY, 1, snapshot.revision, value, ttl)? {
+        return Err(Error::http(409, "Accio 授权状态已变化，请勿重复提交"));
     }
     Ok(())
 }
 
-fn clear(revision: u64) {
-    let _ = state::compare_exchange(
-        state::Scope::Login,
-        STATE_KEY,
-        SCHEMA,
-        revision,
-        Value::Null,
-        1000,
-    );
+fn active(snapshot: &Snapshot, now: i64) -> bool {
+    let created = snapshot.value["created_at"].as_i64().unwrap_or(0);
+    snapshot.compatible
+        && created > 0
+        && (0..TTL).contains(&now.saturating_sub(created))
+        && matches!(
+            snapshot.value["phase"].as_str(),
+            Some("pending" | "exchanging")
+        )
 }
 
-/// `admin.action = auth.methods`：添加账号面板里的登录方式清单。
-///
-/// ── 与 `metadata.json` 的对应（顺序不许换）──────────────────
-/// 0 号 = `kind: "browser"`（网页登录），1 号 = `kind: "token"`（登录凭据）。
-/// 网关的托管登录只认 0 号（`core/login/managed/trae.rs` 的 `applies`：只判
-/// `method == 0`），网页登录挪到别处就会被判成「不是网页登录」。
-///
-/// ── 两处不能省的契约 ────────────────────────────────────────
-///   · `manualCallback: true` + `callbackInput: "url"`：插件没有 socket；
-///   · `browserMode: "choice"`：`login.start` 的 `login_ui.browserMode` 就是它。
-pub fn methods() -> Value {
-    json!({ "methods": [
-        {
-            "methodIndex": 0, "type": "oauth", "label": "网页登录", "prompts": [],
-            "browserMode": "choice", "manualCallback": true, "callbackInput": "url",
-            "instructions": format!(
-                "打开 Accio {} 授权页完成登录；页面最后会停在「无法访问 127.0.0.1」——这是正常的：请把地址栏里那条完整 URL 复制回填，授权码就在其中",
-                region::REGION.label()
-            )
-        },
-        {
-            "methodIndex": 1, "type": "api", "label": "登录凭据", "prompts": [{
-                "key": "token", "type": "text", "label": "登录凭据",
-                "placeholder": "粘贴 accessToken / refreshToken", "secret": true
-            }],
-            "instructions": "粘贴 Accio 的 accessToken（有 refreshToken 时一并粘贴，便于自动续期）"
-        }
-    ] })
-}
-
-/// 发起一次网页登录。
-///
-/// `method` 不是浏览器时如实回绝：粘贴凭据走 `account.normalize`，不是这条链
-/// （回一个「请直接粘贴」比让它落到一个空授权地址上清楚）。
 pub fn start(params: &Value) -> Result<Value> {
-    let method = params["method"]
-        .as_str()
-        .or_else(|| params["kind"].as_str())
-        .unwrap_or("browser");
-    if !matches!(method, "" | "browser" | "web" | "oauth") {
-        return Err(Error::http(
-            400,
-            "Accio 的「填写凭证」请直接在账号页粘贴凭据；网页登录请点「网页登录」",
-        ));
-    }
-    // 网关分配的流程标识必须原样回传（见模块头）
-    let flow = params["flow"]
-        .as_str()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("accio-web-{}", sdk::now()));
-    let (verifier, challenge) = oauth::new_pkce();
-    // 上游的 state 由我们自己生成（回调回来时逐字比对），**不是** flow
-    let upstream_state = super::protocol::new_request_id();
-    let url = oauth::build_authorize_url(
-        region::REGION,
-        &upstream_state,
-        &challenge,
-        oauth::CALLBACK_REDIRECT,
-    );
-    put_state(
-        json!({
-            "flow": flow,
-            "phase": "waiting",
-            "upstream_state": upstream_state,
-            "verifier": verifier,
-            "redirect_uri": oauth::CALLBACK_REDIRECT,
-        }),
-        STATE_TTL_MS,
-    )?;
-    Ok(json!({
-        "flow": flow,
-        "url": url,
-        "poll_interval_ms": 2000,
-        "instructions": format!(
-            "在打开的页面里完成 Accio {} 的授权。页面最后会停在「无法访问 127.0.0.1」——这是正常的：请把地址栏里那条完整 URL 复制回填，授权码就在其中",
-            region::REGION.label()
-        ),
-        // 内嵌窗口：授权页会按用户选的登录方式继续跳不可穷举的主机，
-        // 所以 allowed_hosts 留空（空 = 不限制，与 native 同口径）
-        "external_browser": false,
-        "allowed_hosts": [],
-        // 插件收不到浏览器重定向（没有 socket），必须由用户回填回调 URL
-        "login_ui": {
-            "browserMode": "choice", "manualCallback": true, "callbackInput": "url",
-            "cookieCapture": Value::Null, "captureCallback": false
+    if let Some(hint) = params["method"].as_str() {
+        if hint != "browser" {
+            return Err(Error::http(400, "Accio 网页登录方式无效"));
         }
-    }))
-}
-
-/// 轮询一次登录进度（网关按 `poll_interval_ms` 来问）。
-pub fn poll(params: &Value) -> Result<Value> {
-    let snapshot = state::get(state::Scope::Login, STATE_KEY, SCHEMA)?;
-    if !snapshot.compatible || snapshot.value.is_null() {
-        return Ok(failed("这次登录流程已失效（插件实例或宿主重启过？），请重新发起"));
     }
-    let flow = params["flow"].as_str().unwrap_or("");
-    if !flow.is_empty() && snapshot.value["flow"].as_str() != Some(flow) {
-        return Ok(json!({ "state": "pending", "hint": "另一轮登录正在进行，请等待它完成" }));
-    }
-    match snapshot.value["phase"].as_str() {
-        Some("done") => {
-            let account = snapshot.value["account"].clone();
-            clear(snapshot.revision);
-            Ok(json!({ "state": "done", "account": account }))
-        }
-        Some("failed") => {
-            let message = snapshot.value["message"].as_str().unwrap_or("这轮登录没有成功").to_string();
-            clear(snapshot.revision);
-            Ok(failed(message))
-        }
-        // 授权在浏览器里，插件这边能做的只有等回填
-        _ => Ok(json!({
-            "state": "pending",
-            "hint": "等待你在浏览器里完成授权，然后把地址栏那条 URL 回填"
-        })),
-    }
-}
-
-/// 用户把回调 URL 贴回来：当场换证并把账号放进状态。
-///
-/// 网关给的 `code` 在插件家是整条回调 URL（历史约定：`url` 与 `code` 同值），
-/// 也接受裸授权码（`parse_callback` 会把它当成 `code=` 那条）。
-pub fn callback(params: &Value) -> Result<Value> {
-    let snapshot = state::get(state::Scope::Login, STATE_KEY, SCHEMA)?;
-    if !snapshot.compatible || snapshot.value.is_null() {
-        return Ok(failed("这次登录流程已失效，请重新发起"));
-    }
-    let flow = params["flow"].as_str().unwrap_or("");
-    if !flow.is_empty() && snapshot.value["flow"].as_str() != Some(flow) {
-        return Ok(failed("这次登录流程已失效，请重新发起"));
-    }
-    let raw = if params["url"].as_str().is_some_and(|text| !text.trim().is_empty()) {
-        params["url"].as_str().unwrap_or("").trim().to_string()
-    } else {
-        params["code"].as_str().unwrap_or("").trim().to_string()
-    };
-    if raw.is_empty() {
-        return Ok(failed("回调地址为空"));
-    }
-    let (code, state_from_callback) = match oauth::parse_callback_url(&raw) {
-        Ok(parsed) => parsed,
-        // 裸授权码（网关的 login.callback 只抽出 code 参数时就是这样）
-        Err(_) if !raw.contains("code=") && !raw.contains('?') => (raw.clone(), String::new()),
-        Err(error) => {
-            mark_failed(snapshot.revision, &error.message);
-            return Ok(failed(error.message));
-        }
-    };
-    let expected_state = snapshot.value["upstream_state"].as_str().unwrap_or("");
-    if !state_from_callback.is_empty()
-        && !expected_state.is_empty()
-        && state_from_callback != expected_state
+    let flow = flow(params)?;
+    let payload = &params["payload"];
+    let locale = payload["locale"].as_str().unwrap_or("zh-CN");
+    if payload
+        .get("methodIndex")
+        .is_some_and(|index| index.as_u64() != Some(0))
     {
-        let message = "回调里的 state 与本次登录不一致，已拒绝";
-        mark_failed(snapshot.revision, message);
-        return Ok(failed(message));
+        return Err(Error::http(400, "凭据导入请通过账号表单提交"));
     }
-    let verifier = snapshot.value["verifier"].as_str().unwrap_or("").to_string();
-    let redirect_uri = snapshot.value["redirect_uri"]
+    let fields = payload.get("inputs").cloned().unwrap_or_else(|| json!({}));
+    let fields = fields
+        .as_object()
+        .ok_or_else(|| Error::http(400, "Accio 登录字段必须是对象"))?;
+    if fields
+        .iter()
+        .any(|(key, value)| key != "name" || !value.is_string())
+    {
+        return Err(Error::http(400, "Accio 登录包含未申报字段"));
+    }
+    let name: String = fields
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(100)
+        .collect();
+    let redirect = redirect(params)?;
+    let verifier = util::verifier()?;
+    let challenge = util::challenge(&verifier);
+    let snapshot = state::get(Scope::Login, KEY, 1)?;
+    if !snapshot.compatible || !snapshot.value.is_null() {
+        return Err(Error::http(409, "Accio 登录流程已存在，请重新发起"));
+    }
+    replace(
+        &snapshot,
+        json!({ "phase": "pending", "created_at": util::now()?, "state": flow,
+        "verifier": verifier, "redirect_uri": redirect, "edition": endpoints::EDITION, "name": name, "locale": locale }),
+        TTL,
+    )?;
+    let url = format!(
+        "{}/login?return_url={}&state={}&code_challenge={}&code_challenge_method=S256&client_id={}",
+        endpoints::LOGIN,
+        util::query(&redirect),
+        util::query(flow),
+        util::query(&challenge),
+        endpoints::CLIENT_ID
+    );
+    Ok(json!({ "flow": flow, "url": url, "poll_interval_ms": 0,
+        "instructions": callback_instructions(locale),
+        // 可选择临时内嵌窗口或系统浏览器；第三方页面导航不赋予插件网络来源权限。
+        "external_browser": false, "allowed_hosts": [],
+        "login_ui": { "browserMode": "choice", "manualCallback": true, "callbackInput": "url",
+            "captureCallback": true, "cookieCapture": null, "loopbackTargets": [redirect] } }))
+}
+
+struct Callback {
+    code: String,
+    denied: bool,
+}
+
+fn callback_code(params: &Value, state: &Value) -> Result<Callback> {
+    let raw = params["url"].as_str().unwrap_or("");
+    let url = parsed(raw)?;
+    let expected = parsed(state["redirect_uri"].as_str().unwrap_or(""))?;
+    if url.scheme() != expected.scheme()
+        || url.host_str() != expected.host_str()
+        || url.port_or_known_default() != expected.port_or_known_default()
+        || url.path() != expected.path()
+        || url.path() != endpoints::CALLBACK
+        || raw.split('?').next() != Some(expected.as_str())
+    {
+        return Err(Error::http(400, "Accio 回调不属于本次本机接收地址"));
+    }
+    let pairs: Vec<_> = url.query_pairs().collect();
+    let states: Vec<_> = pairs.iter().filter(|(key, _)| key == "state").collect();
+    if states.len() != 1
+        || states[0].1 != flow(params)?
+        || state["state"] != flow(params)?
+        || state["edition"] != endpoints::EDITION
+    {
+        return Err(Error::http(400, "Accio 回调与本次国际版授权不匹配"));
+    }
+    let errors: Vec<_> = pairs.iter().filter(|(key, _)| key == "error").collect();
+    let codes: Vec<_> = pairs.iter().filter(|(key, _)| key == "code").collect();
+    if !errors.is_empty() {
+        if errors.len() != 1
+            || errors[0].1.trim().is_empty()
+            || errors[0].1.len() > 512
+            || errors[0].1.chars().any(char::is_control)
+        {
+            return Err(Error::http(400, "Accio 回调错误参数无效"));
+        }
+        // 官方拒绝优先于同时回显的旧 code；只结束原流程，绝不兑换任何材料。
+        return Ok(Callback {
+            code: String::new(),
+            denied: true,
+        });
+    }
+    if codes.len() != 1
+        || codes[0].1.is_empty()
+        || codes[0].1.len() > 8192
+        || codes[0].1.chars().any(char::is_control)
+        || codes[0].1.trim() != codes[0].1.as_ref()
+        || pairs.iter().any(|(key, _)| key == "authorization_code")
+    {
+        return Err(Error::http(400, "Accio 回调必须包含唯一有效授权码"));
+    }
+    if params["code"]
         .as_str()
-        .unwrap_or(oauth::CALLBACK_REDIRECT)
-        .to_string();
-    if verifier.is_empty() {
-        return Ok(failed("这次登录的上下文已损坏，请重新发起"));
+        .is_some_and(|code| !code.is_empty() && code != codes[0].1.as_ref())
+    {
+        return Err(Error::http(400, "Accio 回调授权码与请求不一致"));
     }
-    let credential = match oauth::exchange_code(region::REGION, &code, &verifier, &redirect_uri) {
-        Ok(credential) => credential,
-        Err(error) => {
-            // 换证失败按 `LoginPoll::Failed` 回，而不是把整条 RPC 变成错误：
-            // 授权码已经花掉，这一轮就是「没成」，重做要用户重新点一次登录。
-            mark_failed(snapshot.revision, &error.message);
-            return Ok(failed(error.message));
-        }
-    };
-    let account = account_of(&credential, "web");
-    put_done(snapshot.revision, &flow, &account);
-    Ok(json!({ "state": "done", "account": account }))
-}
-
-/// 取消一轮登录（native 走的是「收监听器、释放端口」，插件侧没有端口可放，
-/// 清状态就是同一件事）。
-pub fn cancel(params: &Value) -> Result<Value> {
-    let snapshot = state::get(state::Scope::Login, STATE_KEY, SCHEMA)?;
-    if snapshot.compatible && !snapshot.value.is_null() {
-        let flow = params["flow"].as_str().unwrap_or("");
-        if flow.is_empty() || snapshot.value["flow"].as_str() == Some(flow) {
-            let _ = state::compare_exchange(
-                state::Scope::Login,
-                STATE_KEY,
-                SCHEMA,
-                snapshot.revision,
-                Value::Null,
-                0,
-            );
-        }
-    }
-    Ok(Value::Null)
-}
-
-/// 把这一轮标成失败（存的是**状态**的形态，`poll` 从 `phase` 读出来再翻成
-/// `LoginPoll`；两处都用 `{state, message}` 那个响应形状的话，poll 会一直报
-/// pending —— 因为存储里根本没有 `phase` 这个键）。
-fn mark_failed(revision: u64, message: &str) {
-    let _ = state::compare_exchange(
-        state::Scope::Login,
-        STATE_KEY,
-        SCHEMA,
-        revision,
-        json!({ "phase": "failed", "message": message }),
-        STATE_TTL_MS,
-    );
-}
-
-/// 换证完成后重写状态：保留 flow，带上账号（`poll` 从 `phase=done` 读出它）。
-fn put_done(revision: u64, flow: &str, account: &Value) {
-    let _ = state::compare_exchange(
-        state::Scope::Login,
-        STATE_KEY,
-        SCHEMA,
-        revision,
-        json!({ "phase": "done", "flow": flow, "account": account }),
-        60_000,
-    );
-}
-
-/// 凭证 → 可落库的账号（登录与手工粘贴两条路共用）。
-///
-/// 名字优先级：显式给的 > 上游昵称 > 邮箱 > userId > 「Accio <地区>账号」。
-pub fn account_of(credential: &Credential, source: &str) -> Value {
-    let mut secret = match credential.to_secret(region::REGION) {
-        Value::Object(map) => map,
-        _ => serde_json::Map::new(),
-    };
-    // 地区以 provider 身份为准（凭证里的 mode 只是兼容字段）
-    secret.insert(
-        "mode".to_string(),
-        Value::String(region::REGION.edition().to_string()),
-    );
-    secret.insert("source".to_string(), Value::String(source.to_string()));
-    let name = if !credential.name.is_empty() {
-        credential.name.clone()
-    } else if !credential.email.is_empty() {
-        credential.email.clone()
-    } else if !credential.user_id.is_empty() {
-        format!("Accio {}", credential.user_id)
-    } else {
-        format!("Accio {}账号", region::REGION.label())
-    };
-    secret.insert("name".to_string(), Value::String(name.chars().take(100).collect()));
-    let secret = Value::Object(secret);
-    json!({
-        "identity": credential::identity(&secret),
-        "public": credential::view(&secret),
-        "secret": secret,
-        // 本家没有「实时读本机客户端」这条来源，恒 false
-        "desktop": false,
+    Ok(Callback {
+        code: codes[0].1.to_string(),
+        denied: false,
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 形状必须与网关 `api/session.rs` 的 `LoginMethodsMetadata` 对得上：
-    /// 索引唯一且非负、`type` 在四个枚举内、`prompts` 恒为数组、oauth 带合法的
-    /// `browserMode`、api 的 prompt 必须带 `type`。错一条的后果是整份 502。
-    #[test]
-    fn methods_declare_the_gateway_contract() {
-        let value = methods();
-        let list = value["methods"].as_array().cloned().unwrap_or_default();
-        assert_eq!(2, list.len());
-        let mut seen: Vec<u64> = Vec::new();
-        for method in &list {
-            let index = method["methodIndex"].as_u64().unwrap_or(u64::MAX);
-            assert!(!seen.contains(&index), "methodIndex 重复或缺失");
-            seen.push(index);
-            assert!(!method["label"].as_str().unwrap_or("").trim().is_empty());
-            assert!(method["prompts"].is_array());
-            match method["type"].as_str().unwrap_or("") {
-                "oauth" => assert!(matches!(
-                    method["browserMode"].as_str().unwrap_or(""),
-                    "choice" | "external" | "plugin" | "none"
-                )),
-                "api" => {
-                    let prompts = method["prompts"].as_array().cloned().unwrap_or_default();
-                    assert_eq!(1, prompts.len());
-                    assert_eq!("token", prompts[0]["key"].as_str().unwrap_or(""));
-                    // 缺 `type` 字段 = 网关 502（规格第 17 节）
-                    assert_eq!("text", prompts[0]["type"].as_str().unwrap_or(""));
-                    assert_eq!(true, prompts[0]["secret"].as_bool().unwrap_or(false));
-                }
-                other => assert!(matches!(other, "sms" | "desktop")),
-            }
+pub fn callback(params: &Value) -> Result<Value> {
+    flow(params)?;
+    let snapshot = state::get(Scope::Login, KEY, 1)?;
+    if !active(&snapshot, util::now()?) {
+        replace(&snapshot, Value::Null, 1000)?;
+        return Ok(json!({ "state": "failed", "message": "Accio 登录已过期或取消" }));
+    }
+    if snapshot.value["phase"] != "pending" {
+        return Err(Error::http(409, "Accio 授权正在处理，请勿重复提交"));
+    }
+    let received = match callback_code(params, &snapshot.value) {
+        Ok(received) => received,
+        Err(error) => {
+            return Ok(json!({ "state": "pending", "retryable": true, "hint": error.message }))
         }
-        // 网页登录必须是 0 号：网关托管登录只认这个索引。
-        assert_eq!("oauth", list[0]["type"].as_str().unwrap_or(""));
-        assert_eq!(true, list[0]["manualCallback"].as_bool().unwrap_or(false));
-        assert_eq!("url", list[0]["callbackInput"].as_str().unwrap_or(""));
+    };
+    if received.denied {
+        replace(&snapshot, Value::Null, 1000)?;
+        return Ok(json!({ "state": "failed", "message": "Accio 授权已取消或被拒绝" }));
     }
+    let attempt = util::uuid()?;
+    // verifier 只留在这次调用栈内；提交前从 flow 状态移除，防止重复换码。
+    replace(
+        &snapshot,
+        json!({ "phase": "exchanging", "created_at": snapshot.value["created_at"], "attempt": attempt,
+            "locale": snapshot.value["locale"] }),
+        snapshot.value["created_at"]
+            .as_i64()
+            .unwrap_or(0)
+            .saturating_add(TTL)
+            .saturating_sub(util::now()?)
+            .max(1000),
+    )?;
+    let result = (|| -> Result<Value> {
+        let verifier = snapshot.value["verifier"]
+            .as_str()
+            .filter(|value| (43..=128).contains(&value.len()))
+            .ok_or_else(|| Error::http(400, "Accio 授权材料已失效，请重新发起"))?;
+        let body = json!({ "code": received.code, "codeVerifier": verifier, "clientId": endpoints::CLIENT_ID,
+            "redirectUri": snapshot.value["redirect_uri"] });
+        let data = network::data(network::post(
+            endpoints::TOKEN,
+            &body,
+            &[&received.code, verifier],
+        )?);
+        let mut credential = Credentials::parse(&data)?;
+        match network::profile(&credential) {
+            Ok(profile) => credential.profile(&profile),
+            Err(error) if errors::host_stop(&error) => return Err(error),
+            Err(_) => {}
+        }
+        credential.ensure_device(true)?;
+        account::normalized(&credential, "web", snapshot.value["name"].as_str())
+    })();
+    let current = state::get(Scope::Login, KEY, 1)?;
+    if !active(&current, util::now()?)
+        || current.value["phase"] != "exchanging"
+        || current.value["attempt"] != attempt
+    {
+        return Err(Error::http(409, "Accio 登录已取消或过期，未保存迟到的账号"));
+    }
+    replace(&current, Value::Null, 1000)?;
+    match result {
+        Ok(account) => Ok(sdk::login::done(account)),
+        Err(error) => Ok(json!({ "state": "failed", "message": error.message })),
+    }
+}
 
-    /// 粘贴的整条 URL / 裸查询串 / 裸 code 三种形态都要能取出授权码。
-    #[test]
-    fn callback_accepts_three_shapes() {
-        let url = "http://127.0.0.1:17892/auth/callback-accio?code=abc&state=xyz";
-        let (code, state) = oauth::parse_callback_url(url).unwrap_or_default();
-        assert_eq!("abc", code);
-        assert_eq!("xyz", state);
-        let (code, _) = oauth::parse_callback_url("?code=abc&state=xyz").unwrap_or_default();
-        assert_eq!("abc", code);
+pub fn poll(params: &Value) -> Result<Value> {
+    flow(params)?;
+    let snapshot = state::get(Scope::Login, KEY, 1)?;
+    if active(&snapshot, util::now()?) {
+        let locale = snapshot.value["locale"].as_str().unwrap_or("zh-CN");
+        return Ok(json!({ "state": "pending", "hint": callback_instructions(locale) }));
     }
+    replace(&snapshot, Value::Null, 1000)?;
+    Ok(json!({ "state": "failed", "message": "Accio 登录已过期或取消，请重新发起" }))
+}
+
+pub fn cancel(params: &Value) -> Result<Value> {
+    flow(params)?;
+    let snapshot = state::get(Scope::Login, KEY, 1)?;
+    replace(&snapshot, Value::Null, 1000)?;
+    Ok(Value::Null)
 }

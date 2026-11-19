@@ -1,383 +1,311 @@
-//! 账号面：取 API Key、公开视图、稳定身份、粘贴式账号规范化。
-//!
-//! 合并自 native 的 `credentials.rs` 取值链 + `mod.rs` 的 `normalize_account`。
-//!
-//! ── 没有续期（如实声明，别照抄别家）─────────────────────────────
-//! 本家是单个静态 API Key，上游**没有 refresh 接口**，所以：
-//!   - `ensure()` 只做「记录里有没有 key、形态对不对」的检查；
-//!   - `refresh()` 恒返回一条可读的 401 文案（网关据此提示「重贴」而不是
-//!     「刷新失败」）；
-//!   - `expiring()` 恒 false（`account_features.long_lived = true`）。
-//!
-//! ── 校验顺序（先本地、再线上）是刻意的 ──────────────────────
-//! 本地形态不对时**一次网络都不发**（用户粘错了东西，探活没有意义）；
-//! 线上探活失败**不阻断添加**（见 `credentials::probe_key` 的三档语义）。
-//!
-//! ── 为什么没有「默认登录态 / 环境变量」旁路 ──────────────────────
-//! native 也没有。wasm 沙箱更没有：网关明文拒绝 wasm 包申报隐式本机凭证
-//! （`capabilities.anonymous_default_session` / `env_credentials` 必须为 false）。
-//!
-//! ── 硬约束 ──────────────────────────────────────────────────
-//! 零 unwrap/expect/panic。
-
-use agent2api_wasm_sdk::{self as sdk, json, Error, Result, Value};
+use agent2api_wasm_sdk::{self as sdk, http, json, Error, Result, Value};
 use sha2::{Digest, Sha256};
 
-use super::{credentials, fingerprint};
+use super::{config::Config, errors, fingerprint};
 
-/// 输入长度上限（超过这个长度的输入一定是粘错了东西）
-const MAX_INPUT_CHARS: usize = 8192;
+pub const KEY_FIELDS: &[&str] = &["apiKey", "accessToken", "token", "key"];
 
-/// 当前账号的完整记录（`{id, secret, public, …}`）
-pub fn record() -> Result<Value> {
-    sdk::account()
+pub fn text(value: &Value, keys: &[&str]) -> String {
+    keys.iter()
+        .find_map(|key| {
+            value[*key]
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or("")
+        .to_string()
 }
 
-/// 取可用 API Key（**唯一入口**）。
-///
-/// 没有账号与凭证形态不对都折成 401：两者对客户端都是「先补凭证」，
-/// 而网关的 `TokenExpired` 处置正是「刷新一次（本家拿回同一个 key）再换账号」。
-pub fn api_key() -> Result<String> {
-    let record = match record() {
-        Ok(record) => record,
-        Err(error) => {
-            return Err(Error::http(
-                401,
-                format!("Command Code 当前没有可用账号：{}", error.message),
-            ))
-        }
-    };
-    let secret = record.get("secret").cloned().unwrap_or(Value::Null);
-    credentials::api_key_of(&secret).map_err(|reason| Error::http(401, reason))
+pub fn shape_ok(key: &str) -> bool {
+    key.len() <= 8192
+        && key.strip_prefix("user_").is_some_and(|rest| {
+            !rest.is_empty()
+                && rest
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+        })
 }
 
-/// 取可用 API Key，并在此之前确保**设备指纹已上报**（`token.ensure`）。
-pub fn ensure() -> Result<String> {
-    let api_key = api_key()?;
-    // best-effort：失败只字不提，绝不影响生成（见 `fingerprint.rs` 模块头）
-    fingerprint::ensure_initialized(&api_key);
-    Ok(api_key)
+pub fn api_key(secret: &Value) -> Result<String> {
+    let key = text(secret, KEY_FIELDS);
+    if key.is_empty() {
+        return Err(Error::http(
+            401,
+            "Command Code 账号缺少 API Key，请重新粘贴 user_ 开头的密钥",
+        ));
+    }
+    if !shape_ok(&key) {
+        return Err(Error::http(
+            401,
+            "Command Code API Key 格式无效，请在 commandcode.ai/studio 重新获取",
+        ));
+    }
+    Ok(key)
 }
 
-/// 没有续期手段：单个静态 key，上游无 refresh 接口。
-///
-/// 返回 401 而不是 unsupported —— 网关对 `token.refresh` 的失败处置是
-/// 「提示重贴凭证」，`unsupported` 会被当成「这家不支持刷新」而静默跳过。
-pub fn refresh() -> Result<Value> {
-    Err(Error::http(
-        401,
-        "Command Code 使用静态 API Key，上游没有续期接口：请在 commandcode.ai/studio 重新获取后重贴",
-    )
-    .with_code("token_not_refreshable"))
+fn tail(key: &str) -> String {
+    key.chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
 }
 
-/// 令牌是否临期：静态 key 没有到期时刻，恒 false。
-pub fn expiring() -> bool {
-    false
-}
-
-/// 稳定身份 = key 的摘要前缀（上游没有 userId 可解析）
 pub fn identity(secret: &Value) -> Result<String> {
-    let api_key = credentials::api_key_of(secret).map_err(|reason| Error::http(401, reason))?;
-    Ok(format!("commandcode-{}", short_hash(&api_key)))
+    let key = api_key(secret)?;
+    // 保留原生账号主键的16位摘要；换备注不应新建另一个账号。
+    Ok(format!(
+        "commandcode-{}",
+        &format!("{:x}", Sha256::digest(key.as_bytes()))[..16]
+    ))
 }
 
-/// 账号行的公开视图（`account.view`）
-///
-/// 与 native 的 `NormalizedAccount.public` 逐字段一致：只有 `name` 与
-/// `tokenTail`。标识列显示的是 `identity`（`account_features.identifier = ["id"]`），
-/// 由网关自己拼，不需要插件在这里再放一份。
 pub fn view(secret: &Value) -> Value {
-    let display = view_name(secret);
-    let api_key = credentials::api_key_of(secret).unwrap_or_default();
-    json!({
-        "name": display,
-        "tokenTail": if api_key.is_empty() { String::new() } else { credentials::tail_of(&api_key) },
-    })
-}
-
-/// 可见名字：记录里写过就用它，否则 `Command Code <尾4位>`
-fn view_name(secret: &Value) -> String {
-    let stored = crate::util::pick(secret, &["name"]);
-    if !stored.is_empty() {
-        return stored;
-    }
-    let api_key = credentials::api_key_of(secret).unwrap_or_default();
-    if api_key.is_empty() {
-        "Command Code 账号".to_string()
+    let key = text(secret, KEY_FIELDS);
+    let valid = shape_ok(&key);
+    let display = text(secret, &["name"]);
+    let display = if display.is_empty() || !key.is_empty() && display.contains(&key) {
+        format!("Command Code {}", tail(&key))
     } else {
-        format!("Command Code {}", credentials::tail_of(&api_key))
+        display
+    };
+    json!({ "name": display, "tokenTail": tail(&key), "hasApiKey": valid,
+        "hasSession": valid, "longLived": true, "canRefresh": false })
+}
+
+fn normalize_key(raw: &str) -> String {
+    let trimmed = raw.trim().trim_matches(['"', '\'', '`', ',', ';']).trim();
+    if let Some(start) = trimmed.find("user_") {
+        let rest: String = trimmed[start + 5..]
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
+            .collect();
+        if !rest.is_empty() {
+            return format!("user_{rest}");
+        }
+    }
+    trimmed.chars().filter(|ch| !ch.is_whitespace()).collect()
+}
+
+fn credentials(value: &Value, depth: usize) -> Result<(String, String)> {
+    if depth > 4 {
+        return Err(Error::http(400, "Command Code 凭据嵌套超过限制"));
+    }
+    if let Some(raw) = value.as_str() {
+        return from_text(raw, depth + 1);
+    }
+    if !value.is_object() {
+        return Err(Error::http(
+            400,
+            "Command Code 凭据必须是 API Key 或 JSON 对象",
+        ));
+    }
+    let name = text(value, &["name"]);
+    let key = text(value, KEY_FIELDS);
+    if !key.is_empty() {
+        return Ok((key, name));
+    }
+    if let Some(raw) = value["credentialJson"]
+        .as_str()
+        .filter(|raw| !raw.trim().is_empty())
+    {
+        let (key, inner_name) = from_text(raw, depth + 1)?;
+        return Ok((key, if name.is_empty() { inner_name } else { name }));
+    }
+    for container in ["inputs", "pluginSecret", "secret", "auth"] {
+        if value[container].is_object() {
+            let (key, inner_name) = credentials(&value[container], depth + 1)?;
+            return Ok((key, if name.is_empty() { inner_name } else { name }));
+        }
+    }
+    // 不扫描JSON元数据中的user_片段，避免将userId/keyName错当成API Key。
+    Err(Error::http(
+        400,
+        "Command Code 凭据 JSON 缺少 apiKey、accessToken、token 或 key 字段",
+    ))
+}
+
+fn from_text(content: &str, depth: usize) -> Result<(String, String)> {
+    let trimmed = content.trim().trim_start_matches('\u{feff}').trim();
+    if trimmed.len() > 256 * 1024 {
+        return Err(Error::http(400, "Command Code 凭据文本超过大小限制"));
+    }
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(value) => credentials(&value, depth),
+        Err(_) if trimmed.starts_with(['{', '[']) => {
+            Err(Error::http(400, "Command Code 凭据 JSON 格式无效"))
+        }
+        Err(_) => Ok((trimmed.to_string(), String::new())),
     }
 }
 
-/// 规范化一条账号（`account.normalize`）。
-///
-/// `source.kind` 是网关 `NormalizeSource` 的序列化形态（`tag = "kind"`、
-/// snake_case）：`manual` / `file_text` / `file_base64` / `desktop`。
 pub fn normalize(params: &Value) -> Result<Value> {
     let source = &params["source"];
-    let kind = source["kind"].as_str().unwrap_or("");
-    let (raw, payload_name) = match kind {
-        "manual" => {
-            // 表单字段可能平铺在 `payload` 下，也可能被包一层 `inputs`
-            let payload = if source["payload"]["inputs"].is_object() {
-                source["payload"]["inputs"].clone()
-            } else {
-                source["payload"].clone()
-            };
-            let raw = crate::util::pick(&payload, &["apiKey", "accessToken", "token", "key"]);
-            let name = crate::util::pick(&payload, &["name"]);
-            (raw, if name.is_empty() { None } else { Some(name) })
-        }
-        "file_text" => {
-            // 文件可能是裸 key，也可能是 `{"apiKey": "user_..."}`
-            let content = source["content"].as_str().unwrap_or("").trim();
-            match serde_json::from_str::<Value>(content) {
-                Ok(parsed) if parsed.is_object() => {
-                    let raw = crate::util::pick(&parsed, &["apiKey", "accessToken", "token", "key"]);
-                    if raw.is_empty() {
-                        (content.to_string(), None)
-                    } else {
-                        (raw, None)
-                    }
-                }
-                _ => (content.to_string(), None),
+    let (raw, name) = match source["kind"].as_str() {
+        Some("manual") => {
+            let outer = &source["payload"];
+            if outer
+                .get("methodIndex")
+                .is_some_and(|index| !matches!(index.as_u64(), Some(0 | 1)))
+            {
+                return Err(Error::http(400, "Command Code 凭据导入方式无效"));
             }
+            credentials(outer, 0)?
         }
-        "file_base64" => {
+        Some("file_text") => from_text(source["content"].as_str().unwrap_or(""), 0)?,
+        Some("desktop") => {
+            let snapshot =
+                sdk::native_call("desktop.credentials.commandcode.v1", "read", json!({}))?;
+            from_text(
+                snapshot["content"]
+                    .as_str()
+                    .ok_or_else(|| Error::new("Command Code 本机快照缺少凭据"))?,
+                0,
+            )?
+        }
+        Some("file_base64") => {
             return Err(Error::http(
                 400,
                 "Command Code 不支持二进制文件导入，请粘贴 API Key",
             ))
         }
-        "desktop" => {
-            return Err(Error::http(
-                400,
-                "Command Code 不支持导入桌面端登录态，请粘贴 API Key（user_ 开头）添加账号",
-            ))
-        }
         _ => {
             return Err(Error::http(
                 400,
-                "Command Code 请粘贴 API Key（user_ 开头）添加账号",
+                "请粘贴 Command Code 的 API Key（user_ 开头）",
             ))
         }
     };
-    if raw.trim().is_empty() {
+    if raw.len() > 8192 {
         return Err(Error::http(
             400,
-            format!(
-                "请粘贴 Command Code 的 API Key（{} 开头）",
-                credentials::KEY_PREFIX
-            ),
+            "粘贴的内容过长，请确认复制的是 API Key 本身",
         ));
     }
-    if raw.chars().count() > MAX_INPUT_CHARS {
-        return Err(Error::http(400, "粘贴的内容过长，请确认复制的是 API Key 本身"));
-    }
-    let api_key = credentials::normalize_key(&raw);
-    if api_key.is_empty() {
+    let key = normalize_key(&raw);
+    if !shape_ok(&key) {
         return Err(Error::http(
             400,
-            format!(
-                "请粘贴 Command Code 的 API Key（{} 开头）",
-                credentials::KEY_PREFIX
-            ),
+            "Command Code API Key 应以 user_ 开头且只含字母、数字、_ 和 -",
         ));
     }
-    if !credentials::shape_ok(&api_key) {
-        return Err(Error::http(
-            400,
-            format!(
-                "这不是 Command Code 的 API Key：应以 {} 开头、只含字母数字与 _ -；\
-                 请在 commandcode.ai/studio（或本机 ~/.commandcode/auth.json）重新复制",
-                credentials::KEY_PREFIX
-            ),
-        ));
-    }
-    // best-effort 探活：只有明确 401/403 才判无效
-    match credentials::probe_key(&api_key) {
-        credentials::KeyCheck::Valid => {}
-        credentials::KeyCheck::Invalid(reason) => {
-            return Err(Error::http(
-                400,
-                format!(
-                    "Command Code API Key 无效或已失效（{reason}）：\
-                     请在 commandcode.ai/studio 重新获取后粘贴"
-                ),
-            ))
+    let config = Config::load()?;
+    // 保留best-effort添加：只有明确鉴权拒绝才拒绝；套餐/额度和暂时网络失败不等于Key无效。
+    match http::open_timeout(
+        "GET",
+        &config.url("/alpha/billing/credits"),
+        config.headers(&key),
+        None,
+        5_000,
+    ) {
+        Ok(response) if matches!(response.status, 401 | 403) => {
+            let status = response.status;
+            let body = match response.bytes(256 * 1024) {
+                Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({})),
+                Err(error)
+                    if errors::host_failure(&error) && error.code.as_deref() != Some("timeout") =>
+                {
+                    return Err(error)
+                }
+                Err(_) => json!({}),
+            };
+            if status == 401 || errors::authentication_failure(&body) {
+                return Err(Error::http(
+                    401,
+                    "Command Code API Key 无效或已失效，请在 commandcode.ai/studio 重新获取",
+                ));
+            }
         }
-        // 判不出来就放行：一次上游抖动不该让用户加不进账号。
-        // wasm 侧没有日志通道，`note` 在这里读一下只是为了与 native 的三档语义
-        // 保持同一份结构（native 用它写告警日志）。
-        credentials::KeyCheck::Unknown(note) => {
-            let _ = note.trim();
+        Err(error) if errors::host_failure(&error) && error.code.as_deref() != Some("timeout") => {
+            return Err(error)
         }
+        _ => {}
     }
-    // 稳定身份 = key 的摘要前缀（上游没有 userId 可解析）
-    let identity = format!("commandcode-{}", short_hash(&api_key));
-    let requested = crate::util::pick(params, &["name"]);
-    let display = if !requested.is_empty() {
-        requested
-    } else if let Some(name) = payload_name.filter(|name| !name.trim().is_empty()) {
-        name.trim().to_string()
+    let explicit_name = text(params, &["name"]);
+    let name = if explicit_name.is_empty() {
+        name
     } else {
-        format!("Command Code {}", credentials::tail_of(&api_key))
+        explicit_name
     };
-    // secret 里额外留一份 `name`：网关存的是 `secret` + `public`，而
-    // `account.view` 只拿得到 `secret`（拿不到 public）—— 不留这一份，用户
-    // 起的名字在账号行上就会退回成 `Command Code <尾4位>`。
-    let secret = json!({ "apiKey": api_key.clone(), "name": display.clone() });
-    Ok(json!({
-        "secret": secret,
-        "public": json!({
-            "name": display,
-            "tokenTail": credentials::tail_of(&api_key),
-        }),
-        "identity": identity,
-        "desktop": false,
-    }))
+    let name = if name.is_empty() {
+        format!("Command Code {}", tail(&key))
+    } else {
+        name
+    };
+    if name.chars().count() > 256 || name.chars().any(char::is_control) || name.contains(&key) {
+        return Err(Error::http(400, "账号备注过长、包含控制字符或完整 API Key"));
+    }
+    let secret = json!({ "apiKey": key, "name": name });
+    // 本机导入为一次快照，后续使用已保存Key，不持续读盘或执行官方客户端。
+    Ok(
+        json!({ "identity": identity(&secret)?, "public": view(&secret), "secret": secret, "desktop": false }),
+    )
 }
 
-/// key 的短摘要（16 位 hex，用于账号 id；不可反推）
-fn short_hash(input: &str) -> String {
-    let digest = Sha256::digest(input.as_bytes());
-    let hex = format!("{digest:x}");
-    hex[..16.min(hex.len())].to_string()
+pub fn unchanged(before: &Value) -> Result<()> {
+    let after = sdk::account()?;
+    if ["id", "provider", "identity", "secret"]
+        .iter()
+        .any(|key| before[*key] != after[*key])
+    {
+        return Err(
+            Error::http(409, "Command Code 账号在操作期间已变化，请重新发起")
+                .with_code("account_changed"),
+        );
+    }
+    Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub fn ensure() -> Result<String> {
+    let record = sdk::account()?;
+    let key = api_key(&record["secret"])?;
+    let config = Config::load()?;
+    fingerprint::ensure_initialized(&key, &config)?;
+    unchanged(&record)?;
+    Ok(key)
+}
 
-    #[test]
-    fn identity_is_stable_and_prefixed() {
-        let secret = json!({ "apiKey": "user_abcdef" });
-        // `Error` 没有 PartialEq，比较前先折成文案
-        let first = identity(&secret).map_err(|error| error.message);
-        let second = identity(&secret).map_err(|error| error.message);
-        assert_eq!(first, second);
-        let Ok(value) = identity(&secret) else {
-            assert!(false, "合法 key 必须能算出身份");
-            return;
+pub fn methods(locale: &str) -> Value {
+    let labels = match locale {
+        "en" => ["Paste API Key", "Paste a user_ API Key from commandcode.ai/studio. Authorization header lines are accepted. The official key has no automatic renewal.",
+            "Import credentials text", "Credentials text", "Paste a raw API Key or credential JSON. Manual input does not read local files."],
+        "zh-Hant" => ["貼上 API Key", "從 commandcode.ai/studio 複製 user_ 開頭的 API Key；也接受完整 Authorization 標頭。官方密鑰不需要自動續期。",
+            "匯入憑證文字", "憑證文字", "貼上純 API Key 或憑證 JSON；手動輸入不會讀取本機檔案。"],
+        "ja" => ["API Key を貼り付け", "commandcode.ai/studio の user_ で始まる API Key を貼り付けてください。Authorization ヘッダーにも対応します。公式キーの自動更新はありません。",
+            "認証情報テキストを取り込む", "認証情報テキスト", "API Key または認証情報 JSON を貼り付けてください。手動入力でローカルファイルは読み取りません。"],
+        "ko" => ["API Key 붙여넣기", "commandcode.ai/studio의 user_ API Key를 붙여넣으세요. Authorization 헤더도 지원합니다. 공식 키는 자동 갱신하지 않습니다.",
+            "인증 정보 텍스트 가져오기", "인증 정보 텍스트", "API Key 또는 인증 정보 JSON을 붙여넣으세요. 수동 입력으로 로컬 파일을 읽지 않습니다."],
+        "pt-BR" => ["Colar API Key", "Cole a API Key user_ de commandcode.ai/studio. Cabeçalhos Authorization completos também são aceitos. A chave oficial não é renovada automaticamente.",
+            "Importar texto de credenciais", "Texto de credenciais", "Cole a API Key ou o JSON de credenciais. A entrada manual não lê arquivos locais."],
+        _ => ["粘贴 API Key", "从 commandcode.ai/studio 复制 user_ 开头的 API Key；也接受完整 Authorization 请求头。官方静态密钥没有自动续期流程。",
+            "导入凭证文本", "凭证文本", "粘贴纯 API Key 或凭证 JSON；手工输入不会读取本机文件。"],
+    };
+    let mut result = json!({ "methods": [
+        { "methodIndex": 0, "type": "api", "label": labels[0], "prompts": [
+            { "key": "apiKey", "type": "text", "label": "API Key", "secret": true }
+        ], "instructions": labels[1] },
+        { "methodIndex": 1, "type": "api", "label": labels[2], "prompts": [
+            { "key": "credentialJson", "type": "text", "label": labels[3], "secret": true }
+        ], "instructions": labels[4] }
+    ] });
+    if let Some(methods) = result["methods"].as_array_mut() {
+        let mut desktop = sdk::login::desktop_method(2, "Command Code", locale);
+        let note = match locale {
+            "en" => "Imports a one-time copy of the official CLI key. Later CLI sign-in changes do not update this account.",
+            "zh-Hant" => "匯入官方 CLI 密鑰的一次性快照；之後在 CLI 切換登入不會自動改動此帳號。",
+            "ja" => "公式 CLI キーを一度だけコピーします。その後 CLI のログインを変更しても、このアカウントは自動変更されません。",
+            "ko" => "공식 CLI 키를 한 번만 복사합니다. 이후 CLI 로그인이 바뀌어도 이 계정은 자동으로 변경되지 않습니다.",
+            "pt-BR" => "Importa uma cópia única da chave da CLI oficial. Mudanças posteriores no login da CLI não atualizam esta conta.",
+            _ => "导入官方 CLI 密钥的一次快照；之后在 CLI 切换登录不会自动改动这个账号。",
         };
-        assert!(value.starts_with("commandcode-"));
-        // 16 位 hex 摘要
-        assert_eq!(value.len(), "commandcode-".len() + 16);
-        assert!(!value.contains("user_abc"), "身份里不得出现明文 key");
-        // 形态不对时明确报错，而不是给一个空身份
-        assert!(identity(&json!({ "apiKey": "bad" })).is_err());
+        desktop["instructions"] = json!(format!(
+            "{}\n{note}",
+            desktop["instructions"].as_str().unwrap_or("")
+        ));
+        methods.push(desktop);
     }
-
-    #[test]
-    fn view_falls_back_to_a_readable_name() {
-        let plain = view(&json!({ "apiKey": "user_abcdefgh" }));
-        assert_eq!(plain["name"], json!("Command Code efgh"));
-        assert_eq!(plain["tokenTail"], json!("efgh"));
-        let named = view(&json!({ "apiKey": "user_abcdefgh", "name": "主力号" }));
-        assert_eq!(named["name"], json!("主力号"));
-        // 坏凭证不 panic，只给空尾巴
-        let broken = view(&json!({ "apiKey": "bad" }));
-        assert_eq!(broken["tokenTail"], json!(""));
-    }
-
-    #[test]
-    fn normalize_rejects_binary_and_desktop_sources() {
-        let binary = normalize(&json!({ "source": { "kind": "file_base64", "content": "AA==" } }));
-        assert_eq!(binary.err().and_then(|error| error.status), Some(400));
-        let desktop = normalize(&json!({ "source": { "kind": "desktop" } }));
-        assert_eq!(desktop.err().and_then(|error| error.status), Some(400));
-    }
-
-    #[test]
-    fn normalize_rejects_wrong_shapes_before_any_network_call() {
-        let empty = normalize(&json!({ "source": { "kind": "manual", "payload": {} } }));
-        assert_eq!(empty.err().and_then(|error| error.status), Some(400));
-        let wrong = normalize(&json!({
-            "source": { "kind": "manual", "payload": { "apiKey": "sk-nope" } }
-        }));
-        let error = wrong.err();
-        let status = error.as_ref().and_then(|error| error.status);
-        assert_eq!(status, Some(400));
-        assert!(error
-            .map(|error| error.message.contains("这不是 Command Code 的 API Key"))
-            .unwrap_or(false));
-        // 超长输入
-        let long = "user_".to_string() + &"a".repeat(MAX_INPUT_CHARS);
-        let too_long = normalize(&json!({
-            "source": { "kind": "manual", "payload": { "apiKey": long } }
-        }));
-        assert_eq!(too_long.err().and_then(|error| error.status), Some(400));
-    }
-
-    #[test]
-    fn normalize_extracts_from_manual_and_file_text() {
-        // manual：Bearer 整行
-        let manual = normalize(&json!({
-            "source": {
-                "kind": "manual",
-                "payload": { "apiKey": "Authorization: Bearer user_manual123" }
-            }
-        }));
-        let Ok(manual) = manual else {
-            assert!(false, "manual 归一化必须成功");
-            return;
-        };
-        assert_eq!(manual["secret"]["apiKey"], json!("user_manual123"));
-        assert_eq!(manual["identity"].as_str().unwrap_or("").len(), "commandcode-".len() + 16);
-        assert_eq!(manual["desktop"], json!(false));
-        // "user_manual123" 的尾 4 个字符是 "l123"（按 char 取，不按字节）
-        assert_eq!(manual["public"]["tokenTail"], json!("l123"));
-
-        // file_text：JSON 包装
-        let wrapped = normalize(&json!({
-            "source": { "kind": "file_text", "content": "{\"apiKey\":\"user_file456\"}" }
-        }));
-        let Ok(wrapped) = wrapped else {
-            assert!(false, "file_text 归一化必须成功");
-            return;
-        };
-        assert_eq!(wrapped["secret"]["apiKey"], json!("user_file456"));
-
-        // file_text：裸 key
-        let bare = normalize(&json!({
-            "source": { "kind": "file_text", "content": "user_bare789\n" }
-        }));
-        let Ok(bare) = bare else {
-            assert!(false, "裸 key 必须被接受");
-            return;
-        };
-        assert_eq!(bare["secret"]["apiKey"], json!("user_bare789"));
-
-        // 用户指定的备注名优先
-        let named = normalize(&json!({
-            "name": "自定义名",
-            "source": { "kind": "manual", "payload": { "apiKey": "user_named" } }
-        }));
-        let Ok(named) = named else {
-            assert!(false, "带备注名的归一化必须成功");
-            return;
-        };
-        assert_eq!(named["public"]["name"], json!("自定义名"));
-    }
-
-    #[test]
-    fn refresh_is_a_readable_401() {
-        let error = refresh().err();
-        let error = match error {
-            Some(error) => error,
-            None => {
-                assert!(false, "static key 不得声称刷新成功");
-                return;
-            }
-        };
-        assert_eq!(error.status, Some(401));
-        assert_eq!(error.code.as_deref(), Some("token_not_refreshable"));
-        assert!(error.message.contains("没有续期接口"));
-    }
-
-    #[test]
-    fn static_keys_never_expire() {
-        assert!(!expiring());
-    }
+    result
 }

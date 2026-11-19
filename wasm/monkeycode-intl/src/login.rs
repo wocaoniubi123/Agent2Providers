@@ -1,201 +1,155 @@
-//! MonkeyCode 粘贴式登录：**校验 + 归一化**（没有验证码 / 短信 / OAuth 窗口）。
-//!
-//! ── 链路（一步校验 + 一次 best-effort 发现）────────────────────
-//! ```text
-//! GET {站点}/api/v1/users/status   Cookie: monkeycode_ai_session=…
-//!   → {"code":0,"data":{"user":{"id":"uuid","subscription_level":"pro"}}}
-//! GET {站点}/api/v1/users/tasks?page=1&size=5
-//!   → data.tasks[].image.id           （best-effort 发现 image_id）
-//! ```
-//! 校验端点取 `GET /api/v1/users/status` —— 参考 `mvp/auth.py::check_status`
-//! 与 `docs/05-api/01-endpoint-catalog.md` 都把它列为「登录状态检查」的权威端点
-//! （200 + `code:0` 即已登录）。
-//!
-//! ── 为什么 image_id 在这里发现而不是要求用户填 ──────────────────
-//! 参考 `discoverImageId`（`proxy/src/admin-login.ts`）从**已有任务列表**的
-//! `task.image.id` 里取镜像 UUID。老用户一般至少有一个历史任务，能自动拿到；
-//! 新用户取不到 —— 此时**不阻断添加**，把 `imageId` 留空，由界面提示手动填写
-//! （转发入口 `conversation.rs` 会给出「缺少 image_id」的可读错误）。这比在添加
-//! 时就拒绝一个「登录态明明有效」的账号友好得多。
-//!
-//! ── 归一化做什么 ────────────────────────────────────────────
-//! 用户从 DevTools 复制的东西形态很杂：可能是裸值、可能是
-//! `monkeycode_ai_session=xxx`、也可能是整行 `Cookie: monkeycode_ai_session=xxx;`
-//! 或带引号。这里统一剥成裸值，避免把一整行当 cookie 值发给上游（那会稳定 401）。
-//!
-//! ── 硬约束 ──────────────────────────────────────────────────
-//! release 是 `panic=abort`：本文件零 unwrap/expect/panic。
+//! 国际官方网页登录与手工凭据入口；只读取本次官方桌面窗口，不借用国内登录态。
 
-use agent2api_wasm_sdk::{json, Error, Result, Value};
+use agent2api_wasm_sdk::{self as sdk, json, Error, Result, Value};
 
-use super::{client, endpoints, logging, region};
+use crate::{account, endpoints, gates};
 
-/// session 长度上限（超过这个长度的输入一定是粘错了东西）
-const MAX_SESSION_LENGTH: usize = 8192;
+fn text(locale: &str, items: [&'static str; 6]) -> &'static str {
+    items[match locale {
+        "en" => 1,
+        "zh-Hant" => 2,
+        "ja" => 3,
+        "ko" => 4,
+        "pt-BR" => 5,
+        _ => 0,
+    }]
+}
 
-/// 归一化粘贴的 session：剥掉 `Cookie:` / `monkeycode_ai_session=` / `;` / 引号
-/// 与所有空白，返回裸 cookie 值。
-pub fn normalize_session(raw: &str) -> String {
-    let mut text = raw.trim();
-    // 整行 Cookie 头形态：`Cookie: monkeycode_ai_session=xxx;`
-    if let Some(rest) = text
-        .strip_prefix("Cookie:")
-        .or_else(|| text.strip_prefix("cookie:"))
+fn instructions(locale: &str) -> &'static str {
+    text(locale, [
+        "添加前只在 monkeycode-ai.net 校验账号；国际账号、目录与固定任务和国内站隔离。发送对话仅授权本次固定远端任务，无需额外权限设置。镜像留空使用官方默认环境，不购买或兑换；真实业务未验收。",
+        "The account is verified only on monkeycode-ai.net before saving. International accounts, catalogs and fixed tasks stay separate from the Chinese site. Sending a chat authorizes only that fixed remote task, without extra permission setup. Leave the image ID empty for the official default environment. No purchases or exchanges are performed; live behavior is unverified.",
+        "儲存前只在 monkeycode-ai.net 驗證帳號；國際帳號、目錄與固定任務和國內站隔離。傳送對話僅授權本次固定遠端任務，無需額外權限設定。鏡像留空使用官方預設環境，不購買或兌換；實際業務未驗收。",
+        "保存前に monkeycode-ai.net のみでアカウントを確認します。国際版のアカウント、モデル一覧、固定タスクは中国サイトと分離されます。会話の送信はその固定リモートタスクだけを許可し、追加の権限設定は不要です。イメージ ID が空の場合は公式の既定環境を使います。購入や交換は行いません。実際の動作は未検証です。",
+        "저장 전에 monkeycode-ai.net에서만 계정을 확인합니다. 국제 계정, 모델 목록 및 고정 작업은 중국 사이트와 분리됩니다. 대화를 보내면 해당 고정 원격 작업만 허용되며 별도 권한 설정은 필요하지 않습니다. 이미지 ID를 비우면 공식 기본 환경을 사용합니다. 구매나 교환은 하지 않으며 실제 동작은 검증되지 않았습니다.",
+        "A conta é validada somente em monkeycode-ai.net antes de salvar. Contas, catálogos e tarefas fixas internacionais ficam separados do site chinês. Enviar uma conversa autoriza apenas essa tarefa remota fixa, sem configuração extra de permissões. Deixe o ID da imagem vazio para usar o ambiente oficial padrão. Nenhuma compra ou troca é realizada; o funcionamento real não foi validado.",
+    ])
+}
+
+fn web_hint(locale: &str) -> &'static str {
+    text(locale, [
+        "在桌面应用的独立窗口完成国际站官方登录，成功后自动接回并校验账号，无需粘贴回调。网页面板和手机可导入国际 Session／Cookie 或完整 JSON。",
+        "Complete official international sign-in in the app's separate desktop window. Credentials are captured and verified automatically, with no callback to paste. Web and mobile panels can import an international Session / Cookie or complete JSON.",
+        "請在桌面應用的獨立視窗完成國際站官方登入，成功後自動接回並驗證帳號，無需貼上回調。網頁面板和手機可匯入國際 Session／Cookie 或完整 JSON。",
+        "デスクトップアプリの独立した画面で国際サイトの公式ログインを完了してください。認証情報を自動取得してアカウントを確認するため、コールバックの貼り付けは不要です。Web・モバイルでは国際版 Session／Cookie または完全な JSON を取り込めます。",
+        "데스크톱 앱의 별도 창에서 국제 사이트의 공식 로그인을 완료하세요. 인증 정보를 자동으로 가져와 계정을 확인하므로 콜백을 붙여넣을 필요가 없습니다. 웹과 모바일에서는 국제 Session / Cookie 또는 전체 JSON을 가져올 수 있습니다.",
+        "Conclua o login oficial internacional na janela separada do aplicativo desktop. As credenciais são capturadas e verificadas automaticamente, sem colar um callback. Os painéis web e móvel podem importar Session / Cookie internacional ou JSON completo.",
+    ])
+}
+
+pub fn methods(locale: &str) -> Value {
+    let manual = text(
+        locale,
+        [
+            "粘贴国际 Session／Cookie",
+            "Paste international Session / Cookie",
+            "貼上國際 Session／Cookie",
+            "国際版 Session／Cookie を貼り付け",
+            "국제 Session / Cookie 붙여넣기",
+            "Colar Session / Cookie internacional",
+        ],
+    );
+    let web = text(
+        locale,
+        [
+            "MonkeyCode 国际版网页登录",
+            "Sign in to MonkeyCode International",
+            "MonkeyCode 國際版網頁登入",
+            "MonkeyCode 国際版にログイン",
+            "MonkeyCode 국제 로그인",
+            "Entrar no MonkeyCode Internacional",
+        ],
+    );
+    let name = text(locale, ["备注名", "Note", "備註", "メモ", "메모", "Nota"]);
+    let image = text(
+        locale,
+        [
+            "执行环境镜像编号（可选）",
+            "VM image ID (optional)",
+            "鏡像編號（選填）",
+            "イメージ ID（任意）",
+            "이미지 ID (선택)",
+            "ID da imagem (opcional)",
+        ],
+    );
+    let json_label = text(
+        locale,
+        [
+            "导入完整国际 JSON",
+            "Import complete international JSON",
+            "匯入完整國際 JSON",
+            "国際版の完全な JSON を取り込む",
+            "전체 국제 JSON 가져오기",
+            "Importar JSON internacional completo",
+        ],
+    );
+    json!({"instructions":instructions(locale),"readiness":gates::status(),"methods":[
+        {"methodIndex":0,"type":"api","label":manual,"instructions":instructions(locale),"prompts":[
+            {"key":"session","type":"text","label":"Session / Cookie / JSON","secret":true,"placeholder":"monkeycode_ai_session=…"},
+            {"key":"name","type":"text","label":name,"optional":true},
+            {"key":"imageId","type":"text","label":image,"optional":true}]},
+        {"methodIndex":1,"type":"oauth","label":web,"instructions":web_hint(locale),"prompts":[],
+            "browserMode":"choice","embeddedOnly":true,"desktopOnly":true,"manualCallback":false,"validatesCallback":true},
+        {"methodIndex":2,"type":"api","label":json_label,"instructions":instructions(locale),"prompts":[
+            {"key":"credentialJson","type":"text","label":json_label,"secret":true},
+            {"key":"name","type":"text","label":name,"optional":true}]}
+    ]})
+}
+
+pub fn start(params: &Value) -> Result<Value> {
+    let options = &params["payload"];
+    if options
+        .get("methodIndex")
+        .is_some_and(|index| index.as_u64() != Some(1))
+        || options.get("mode").is_some_and(|mode| mode != "embedded")
+        || options.get("inputs").is_some_and(|inputs| {
+            !inputs.is_object() || inputs.as_object().is_some_and(|fields| !fields.is_empty())
+        })
     {
-        text = rest.trim();
+        return Err(gates::web_login());
     }
-    for part in text.split(';') {
-        let Some((name, value)) = part.trim().split_once('=') else {
-            continue;
-        };
-        if name.trim() == endpoints::SESSION_COOKIE_NAME {
-            return value.trim().trim_matches(|ch| ch == '"' || ch == '\'').to_string();
-        }
-    }
-    // 非 Cookie 串的输入按裸 session 处理。
-    if text.contains(';') || text.contains('=') {
-        return String::new();
-    }
-    // 去掉成对的引号
-    let text = text.trim_matches(|ch| ch == '"' || ch == '\'').trim();
-    // 去掉任何残留的空白（cookie 值不含空白）
-    text.chars().filter(|ch| !ch.is_whitespace()).collect()
-}
-
-/// 从用户对象里取展示名的候选字段（缺失时返回空串）
-fn display_name_of(user: &Value) -> String {
-    for key in ["name", "nickname", "display_name", "email"] {
-        let value = user
-            .get(key)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .unwrap_or("");
-        if !value.is_empty() {
-            return value.to_string();
-        }
-    }
-    String::new()
-}
-
-/// best-effort 从已有任务列表发现 image_id（`discoverImageId` 的同款逻辑）。
-///
-/// 失败（无任务 / 网络错误 / 格式不认识）一律返回 None —— 这是**增强**而不是
-/// 前置条件，不能因为它失败就判整个登录失败。
-pub fn discover_image_id(session: &str) -> Option<String> {
-    let path = format!("{}{}", endpoints::TASKS_PATH, endpoints::TASKS_DISCOVER_QUERY);
-    let payload = client::get_json(&path, session, "任务列表查询").ok()?;
-    let data = payload.get("data").unwrap_or(&payload);
-    let tasks = data.get("tasks").and_then(Value::as_array)?;
-    for task in tasks {
-        let id = task
-            .pointer("/image/id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .unwrap_or("");
-        if !id.is_empty() {
-            return Some(id.to_string());
-        }
-    }
-    None
-}
-
-/// 用粘贴的 session 校验登录态，返回可直接交给落账号入口的凭证对象：
-/// `{session, imageId, userId, name}`。
-///
-/// `provided_image_id`：用户在表单里填的 image_id（可空）。非空时优先用它，
-/// 否则做一次 best-effort 自动发现。
-pub fn verify_session(raw_session: &str, provided_image_id: Option<&str>) -> Result<Value> {
-    let session = normalize_session(raw_session);
-    if session.is_empty() {
-        return Err(Error::http(400, "请粘贴 MonkeyCode 的 session cookie"));
-    }
-    if session.chars().count() > MAX_SESSION_LENGTH {
-        return Err(Error::http(400, "session 过长，请确认粘贴的是 cookie 值"));
-    }
-    let payload = client::request(
-        "GET",
-        endpoints::USER_STATUS_PATH,
-        &session,
-        None,
-        "登录状态校验",
+    let locale = options["locale"].as_str().unwrap_or("zh-CN");
+    let mut started = sdk::cookie_login::start(
+        endpoints::ID,
+        endpoints::ORIGIN,
+        &["monkeycode-ai.net", "github.com", "accounts.google.com"],
     )?;
-    if client::business_code(&payload) != Some(client::SUCCESS_CODE) {
-        let upstream = client::upstream_message(&payload);
-        let message = if upstream.is_empty() {
-            // 本包只连国际站：站点选错（拿国内 .com 的 session）也会在这里 401，
-            // 文案直接点出本包认的站点，免得用户反复重贴一个本身有效的 session
-            format!(
-                "MonkeyCode 登录态校验失败：请确认 session 有效且站点选对（本包只连国际站 {}）",
-                region::SITE_ORIGIN
-            )
-        } else {
-            format!("MonkeyCode 登录态校验失败：{upstream}")
-        };
-        logging::warn(&format!("[MonkeyCode] ❌ {message}"));
-        return Err(Error::http(401, message));
-    }
-    let data = payload.get("data").cloned().unwrap_or(Value::Null);
-    // user 可能落在 `data.user`（`docs/05-api` 的形态），也可能是 `data` 本身
-    // （`mvp/auth.py` 的 `data.get("data", data)` 兜底）—— 两种都认。
-    let user = data.get("user").cloned().unwrap_or_else(|| data.clone());
-    let user_id = user
-        .get("id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or("")
+    let flow = started["flow"]
+        .as_str()
+        .ok_or_else(Error::unsupported)?
         .to_string();
-    if user_id.is_empty() {
-        return Err(Error::http(
-            401,
-            "MonkeyCode 未返回已登录用户，请在对应站点完成普通用户登录后重试",
-        ));
-    }
-    let name = display_name_of(&user);
-    let provided = provided_image_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let image_id = match provided {
-        Some(value) => value.to_string(),
-        None => discover_image_id(&session).unwrap_or_default(),
-    };
-    logging::verbose(&format!(
-        "[MonkeyCode] ✅ 登录态校验通过（user {}，image_id {}）",
-        logging::short_id(&user_id),
-        if image_id.is_empty() { "未发现（需手动填）" } else { "已就绪" }
-    ));
-    Ok(json!({
-        "session": session,
-        "imageId": image_id,
-        "userId": user_id,
-        "name": name,
-    }))
+    sdk::session_put(
+        &flow,
+        json!({"provider":endpoints::ID,"state":"waiting","locale":locale}),
+        300_000,
+    )?;
+    started["instructions"] = json!(web_hint(locale));
+    Ok(started)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub fn callback(params: &Value) -> Result<Value> {
+    sdk::cookie_login::callback(endpoints::ID, params, account::normalize).and_then(|mut result| {
+        if result["account"]["secret"].is_object() {
+            result["account"]["secret"]["source"] = json!("web");
+            result["account"]["public"] = account::view(&result["account"]["secret"])?;
+        }
+        Ok(result)
+    })
+}
 
-    /// 用户从 DevTools 复制的东西形态很杂：剥不干净就会把整行当 cookie 值发出去。
-    #[test]
-    fn normalize_session_strips_every_pasted_shape() {
-        assert_eq!("abc123", normalize_session("abc123"));
-        assert_eq!("abc123", normalize_session("  \"abc123\"  "));
-        assert_eq!("abc123", normalize_session("monkeycode_ai_session=abc123"));
-        assert_eq!(
-            "abc123",
-            normalize_session("Cookie: monkeycode_ai_session=abc123; other=1")
-        );
-        assert_eq!(
-            "abc123",
-            normalize_session("cookie: foo=1; monkeycode_ai_session=abc123")
-        );
-        // 含分号 / 等号却认不出本家 cookie 名 → 空串（宁可报「请粘贴」也不发垃圾）
-        assert_eq!("", normalize_session("foo=1; bar=2"));
-        assert_eq!("", normalize_session(""));
+pub fn poll(params: &Value) -> Result<Value> {
+    let flow = params["flow"]
+        .as_str()
+        .filter(|flow| flow.starts_with("cookie_login_") && flow.len() <= 128)
+        .ok_or_else(|| Error::http(400, "MonkeyCode 国际登录流程无效"))?;
+    let pending = sdk::session_get(flow)?;
+    let locale = pending["locale"].as_str().unwrap_or("zh-CN");
+    if pending["provider"] != endpoints::ID || pending["state"] != "waiting" {
+        return Ok(json!({"state":"failed","message":text(locale,[
+            "国际登录已取消或过期，请重新发起", "International sign-in was canceled or expired; start again",
+            "國際登入已取消或過期，請重新發起", "国際版のログインがキャンセルされたか期限切れです。再開してください",
+            "국제 로그인이 취소되었거나 만료되었습니다. 다시 시작하세요", "O login internacional foi cancelado ou expirou; inicie novamente"
+        ])}));
     }
-
-    #[test]
-    fn normalize_session_removes_inner_whitespace() {
-        assert_eq!("abc123", normalize_session("ab c1 23"));
-    }
+    Ok(json!({"state":"pending","message":web_hint(locale)}))
 }

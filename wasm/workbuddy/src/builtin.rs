@@ -1,27 +1,27 @@
 //! WorkBuddy 的内置模型清单与准入过滤（从网关 `core::models` 搬来）。
 //!
 //! ── 内置清单什么时候被用到 ──────────────────────────────────
-//! 只有「还没成功刷过 `/v3/config`」时才用：插件刚装上、或上游一直取不到。
-//! 网关那份目录以它作为初始态，插件侧同样 —— 否则第一次远程刷新之前
-//! `/v1/models` 是空的，客户端会以为这家没有模型。
+//! 只有「还没成功刷过 `/v3/config`」时才用：进程刚起来、或上游一直取不到。
+//! 网关那份目录以它作为初始态（`initial_state`），插件侧同样 —— 否则重启后
+//! 到第一次远程刷新之间 `/v1/models` 是空的，客户端会以为这家没有模型。
 //!
 //! ── 准入过滤（`is_chat_model`）为什么在插件里 ────────────────
 //! `/v3/config` 会下发补全 / 改写 / 内部工具 / 图像 / 视频 / 旧代条目，
-//! **本文件只挑对话模型**。这套判据（九个排除前缀 + `supportsExtra` 真值 +
-//! `maxOutputTokens >= 16000`）是**这一家上游的形态知识**，因此跟着 provider 走。
-//!
-//! ── 图像条目不在这里（本包的已知差异）───────────────────────
-//! native 的 `builtin_filtered()` 尾部还会挂上图像模型的内置兜底，并让
-//! `/v3/config` 里带 `text-to-image` / `image-to-image` 标签的条目走图片通道。
-//! 本包**没有实现** `images.generate` / `images.edit`（wasm 侧那对方法的请求与
-//! 回包契约在本仓库里没有可核对的实现，见 `lib.rs` 的 `images.capabilities`），
-//! 所以图像条目既不进目录、也不申报能力 —— 宁可让界面看不见，也不给一个点了
-//! 必然失败的入口。
+//! **本文件只挑对话模型**；图像条目由 [`super::image_models`] 按标签单独
+//! 摘出来（两条通道各要各的形态）。这套判据（九个排除前缀 + `supportsExtra`
+//! 真值 + `maxOutputTokens >= 16000`）是**这一家上游的形态知识**，因此跟着
+//! provider 走。网关侧不再保留同一份实现（内置家已随插件走）。
 //!
 //! ── 硬约束 ──────────────────────────────────────────────────
-//! 零 unwrap/expect/panic。
+//! release 是 `panic=abort`：本文件零 unwrap/expect/panic。
 
-use agent2api_wasm_sdk::{json, Value};
+use serde_json::{json, Value};
+
+/// 下游可见模型白名单：空数组 = 不限制，全量放行。
+///
+/// 与网关 `MODEL_ALLOWLIST` 同值（空）。需要收窄时填模型 id —— 但注意插件侧
+/// 改这一行要发版，而网关侧改常量也是发版，所以保持同一条口径即可。
+pub const MODEL_ALLOWLIST: &[&str] = &[];
 
 /// 非对话模型的排除前缀（网关 `CHAT_MODEL_EXCLUDE_PREFIXES` 的逐字副本）。
 ///
@@ -39,12 +39,28 @@ const CHAT_MODEL_EXCLUDE_PREFIXES: &[&str] = &[
     "default-1.",
 ];
 
-/// 下游可见模型白名单：空数组 = 不限制，全量放行。
-pub const MODEL_ALLOWLIST: &[&str] = &[];
+/// JS 真值判定（`supportsExtra` 那一格用）。
+fn js_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(flag) => *flag,
+        Value::Number(number) => number
+            .as_f64()
+            .is_some_and(|value| value != 0.0 && !value.is_nan()),
+        Value::String(text) => !text.is_empty(),
+        Value::Array(_) | Value::Object(_) => true,
+    }
+}
 
-/// JS `String(x)`（`id` 这类字段的容错文本化）。
+/// JS `String(x)`（`id` 这类字段的容错文本化，与网关 `shape::value_text` 同义）。
 pub fn value_text(value: &Value) -> String {
-    crate::util::string_value(value)
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Null => String::new(),
+        Value::Number(number) => number.to_string(),
+        Value::Bool(flag) => flag.to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// 对话模型判定：网关只服务对话模型，非对话项不进目录。
@@ -56,7 +72,7 @@ pub fn is_chat_model(model: &Value) -> bool {
     {
         return false;
     }
-    if model.get("supportsExtra").map(crate::util::js_truthy).unwrap_or(false) {
+    if model.get("supportsExtra").map(js_truthy).unwrap_or(false) {
         return false;
     }
     let Some(max_output) = model.get("maxOutputTokens").and_then(Value::as_f64) else {
@@ -117,7 +133,7 @@ pub fn builtin_models() -> Vec<Value> {
         { "id": "hunyuan-2.0-thinking", "name": "Hunyuan-2.0-Thinking", "vendor": "e", "credits": "", "maxOutputTokens": 24000, "maxInputTokens": 128000, "supportsToolCall": true, "supportsImages": true, "supportsReasoning": true, "onlyReasoning": true },
 
         { "id": "default-1.1", "name": "Claude-3.7-Sonnet", "vendor": "e", "credits": "", "maxOutputTokens": 8192, "maxInputTokens": 200000, "supportsToolCall": true, "supportsImages": true, "supportsReasoning": true, "onlyReasoning": true },
-        { "id": "default-1.2", "name": "Claude-4.0-Sonnet", "vendor": "e", "credits": "", "maxOutputTokens": 24000, "maxInputTokens": 200000, "supportsToolCall": true, "supportsImages": true, "supportsReasoning": true, "onlyReasoning": true }
+        { "id": "default-1.2", "name": "Claude-4.0-Sonnet", "vendor": "e", "credits": "", "maxOutputTokens": 24000, "maxInputTokens": 200000, "supportsToolCall": true, "supportsImages": true, "supportsReasoning": true, "onlyReasoning": true },
     ])
     .as_array()
     .cloned()
@@ -125,34 +141,12 @@ pub fn builtin_models() -> Vec<Value> {
 }
 
 /// 内置清单经准入过滤（网关 `initial_state` 的兜底分支）。
+///
+/// 尾部再挂上图像模型的内置兜底（`image_generation::builtin`）：这一份清单回答
+/// 的是「还没有远程目录时 `/v1/models` 长什么样」，图像通道同样需要在那段窗口
+/// 里有可选项，否则「装了插件但还没刷目录」的用户会看不到任何生图模型。
 pub fn builtin_filtered() -> Vec<Value> {
-    apply_filters(builtin_models())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn filters_drop_non_chat_entries() {
-        let models = builtin_filtered();
-        let ids: Vec<&str> = models.iter().filter_map(|m| m["id"].as_str()).collect();
-        // 默认两个都在
-        assert!(ids.contains(&"auto"));
-        assert!(ids.contains(&"deepseek-v4-pro"));
-        // Claude 内部 id 被 `default-1.` 前缀排除
-        assert!(!ids.contains(&"default-1.1"));
-        // 输出上限不足 16000 的被排除
-        assert!(!ids.contains(&"kimi-k2-instruct-taiji"));
-    }
-
-    #[test]
-    fn supports_extra_is_truthy_by_js_rules() {
-        // JS 真值：0 / false / "" 为假（仍算对话模型），非空串为真（排除）
-        assert!(is_chat_model(&json!({ "id": "x", "maxOutputTokens": 20000, "supportsExtra": 0 })));
-        assert!(!is_chat_model(&json!({ "id": "x", "maxOutputTokens": 20000, "supportsExtra": "no" })));
-        assert!(is_chat_model(&json!({ "id": "x", "maxOutputTokens": 20000, "supportsExtra": false })));
-        // 缺字段 → 不排除
-        assert!(is_chat_model(&json!({ "id": "x", "maxOutputTokens": 20000 })));
-    }
+    let mut models = apply_filters(builtin_models());
+    models.extend(super::image_models::builtin());
+    models
 }

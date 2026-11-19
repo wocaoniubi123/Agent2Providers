@@ -1,80 +1,120 @@
-//! Loomy 的「每日签到」= **每日首次登录刷新赠送积分**（已确认）。
-//!
-//! ── 上游是什么（安装包全包检索 + `points-service.js` 对照）────
-//! Loomy **没有独立的签到 / 领取接口**（客户端全包检索「签到 / checkin /
-//! 每日任务」零命中）。它每天把「每日赠送积分」刷回 5000 的机制是：
-//!
-//! ```text
-//! POST {集成网关}/api/v1/points/first-login      header: token: <session>
-//! body: {}（可带 inviteCode / deviceId / channel，签到场景都不需要）
-//!   → {code:"000000", desc, data:{…}}
-//! ```
-//!
-//! 服务端以「当天是否第一次」决定是否把赠送额度刷回 5000 —— 也就是说
-//! 「签到」的触发点是登录，而这里把同一个调用接进自动签到框架，让长期不登录
-//! 的账号也能每天把赠送积分续上。
-//!
-//! ── 判成功的口径（与别家对齐）───────────────────────────────
-//! HTTP 通了且业务码 `000000` 才算成功。重复调用是**按天幂等**的（服务端当天
-//! 已刷过就原样返回成功），所以「今天已刷过」不算失败 —— 与 AutoClaw
-//! 「今天已签到 → success:false」不同，这里没有可区分的返回字段，如实报成功
-//! 并说明「每日赠送积分已刷新」。
+//! 每日首次登录刷新是明确动作；不在查询时提交、不把重复结果算作新增积分。
+use super::{account, balance, client, errors};
+use agent2api_wasm_sdk::{
+    self as sdk, json,
+    state::{self, Scope},
+    AccountLock, Error, Result, Value,
+};
 
-use agent2api_wasm_sdk::{json, Result, Value};
+const KEY: &str = "daily-first-login";
 
-use super::{client, credentials};
+fn persist(revision: u64, value: Value) -> Result<()> {
+    if !state::compare_exchange(Scope::Account, KEY, 1, revision, value, 0)? {
+        return Err(Error::http(409, "Loomy 每日积分记录已变化，未覆盖其它操作"));
+    }
+    Ok(())
+}
 
-/// 每日登录刷新路径（相对集成网关）
-const FIRST_LOGIN_PATH: &str = "/api/v1/points/first-login";
-
-/// Loomy 账号的每日积分刷新（自动签到框架的 claim）。
 pub fn claim() -> Result<Value> {
-    let credentials = credentials::snapshot()?;
-    let payload = client::token_request(
+    let before_lock = account::current()?;
+    let _lock = AccountLock::acquire()?;
+    account::ensure_current(&before_lock)?;
+    let record = account::current()?;
+    let session = account::token(&record["secret"])?;
+    let now = sdk::now();
+    let day = (now + 8 * 3_600_000).div_euclid(86_400_000);
+    let saved = state::get(Scope::Account, KEY, 1)?;
+    if !saved.compatible {
+        return Err(Error::http(409, "Loomy 每日积分记录格式已变化"));
+    }
+    if saved.value["day"] == day && saved.value["phase"] == "done" {
+        return Ok(
+            json!({ "outcome": "done", "credit": null, "streak": null, "message": "今日首次登录积分已确认刷新" }),
+        );
+    }
+    let before = balance::daily(&balance::read(&record)?);
+    if saved.value["day"] == day
+        && matches!(saved.value["phase"].as_str(), Some("pending" | "uncertain"))
+    {
+        let old = saved.value["before"].as_f64();
+        if before
+            .zip(old)
+            .is_some_and(|(after, before)| after > before)
+        {
+            persist(saved.revision, json!({ "day": day, "phase": "done" }))?;
+            return Ok(
+                json!({ "outcome": "done", "credit": null, "message": "已只读确认每日积分变化，未重复提交" }),
+            );
+        }
+        return Ok(json!({ "outcome": "failed", "credit": null,
+            "message": "此前每日积分刷新结果尚未确认，已查询余额但未重复提交，请稍后核对" }));
+    }
+    account::ensure_current(&record)?;
+    persist(
+        saved.revision,
+        json!({ "day": day, "phase": "pending", "before": before }),
+    )?;
+    let reserved = state::get(Scope::Account, KEY, 1)?;
+    let reply = client::token_request(
         "POST",
-        FIRST_LOGIN_PATH,
-        &credentials.session,
+        "/api/v1/points/first-login",
+        &session,
         Some(&json!({})),
         "每日积分刷新",
-    )?;
-
-    let code = client::business_code(&payload);
-    if client::is_auth_error_code(&code) {
-        return Err(agent2api_wasm_sdk::Error::http(
-            401,
-            "Loomy 登录态已失效，无法刷新每日积分（请重新登录）",
-        ));
-    }
-    if code != client::SUCCESS_CODE {
-        let message = client::upstream_message(&payload);
-        let message = if message.trim().is_empty() {
-            format!("每日积分刷新失败（上游 code={code}）")
-        } else {
-            format!("每日积分刷新失败：{message}")
-        };
-        // 业务失败不是「登录失效」：如实报 Failed 让界面显示原因，
-        // 不抛成账号级错误（那会把一次上游抖动升级成 needsRelogin）。
-        return Ok(json!({
-            "outcome": "failed",
-            "credit": Value::Null,
-            "streak": Value::Null,
-            "message": message,
-        }));
-    }
-
-    // 响应里可能带今日的赠送额度（字段名未在客户端硬编码，取到就播报）
-    let daily_hint = payload
-        .pointer("/data/dailyBalance")
-        .and_then(Value::as_i64)
-        .or_else(|| payload.pointer("/data/data/dailyBalance").and_then(Value::as_i64));
-    let message = match daily_hint {
-        Some(balance) => format!("每日赠送积分已刷新（当前 {balance}）"),
-        None => "每日赠送积分已刷新".to_string(),
+    );
+    account::ensure_current(&record)?;
+    let payload = match reply {
+        Ok(payload) => payload,
+        Err(error) => {
+            let phase = if matches!(error.status, Some(400 | 401 | 403 | 429)) {
+                "failed"
+            } else {
+                "uncertain"
+            };
+            persist(
+                reserved.revision,
+                json!({ "day": day, "phase": phase, "before": before }),
+            )?;
+            return Err(error);
+        }
     };
-    Ok(json!({
-        "outcome": "claimed",
-        "credit": daily_hint.map(|value| value.to_string()),
-        "streak": Value::Null,
-        "message": message,
-    }))
+    if let Err(error) = errors::ensure_success(&payload, "每日积分刷新", &session) {
+        let phase = if errors::business_code(&payload).is_empty() {
+            "uncertain"
+        } else {
+            "failed"
+        };
+        persist(
+            reserved.revision,
+            json!({ "day": day, "phase": phase, "before": before }),
+        )?;
+        return Err(error);
+    }
+    let data = balance::data(&payload);
+    let after = balance::daily(&payload).or_else(|| {
+        balance::read(&record)
+            .ok()
+            .and_then(|value| balance::daily(&value))
+    });
+    let already = data["alreadyProcessed"] == true;
+    let newly = !already
+        && (data["alreadyProcessed"] == false
+            || before
+                .zip(after)
+                .is_some_and(|(before, after)| after > before));
+    let credit = (!already)
+        .then(|| {
+            before
+                .zip(after)
+                .map(|(before, after)| (after - before).max(0.0))
+        })
+        .flatten()
+        .filter(|credit| *credit > 0.0);
+    account::ensure_current(&record)?;
+    persist(reserved.revision, json!({ "day": day, "phase": "done" }))?;
+    Ok(
+        json!({ "outcome": if newly { "claimed" } else { "done" }, "credit": credit.map(|value| value.to_string()),
+        "streak": null, "message": after.map(|value| format!("每日赠送积分已刷新（当前 {value}）"))
+            .unwrap_or_else(|| "每日首次登录积分刷新已完成".into()) }),
+    )
 }

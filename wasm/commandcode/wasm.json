@@ -2,18 +2,13 @@
   "abi": 1,
   "verified": false,
   "requires": [
-    "accounts.cas.v1",
-    "catalog.v1",
-    "chat.stream.v1",
-    "clock.v1",
-    "http.v1",
-    "random.v1",
-    "settings.v1",
-    "state.v1"
+    "http.v1", "http.timeout.v1", "accounts.cas.v1", "settings.v1", "settings.schema.v1",
+    "clock.v1", "random.v1", "locks.v1", "catalog.v1", "chat.stream.v1",
+    "login.forms.v1", "errors.v1", "accounts.identity.v1", "state.v1",
+    "native.helpers.v1", "desktop.credentials.v1"
   ],
-  "origins": [
-    "https://api.commandcode.ai"
-  ],
+  "helpers": ["desktop.credentials.commandcode.v1"],
+  "origins": ["https://api.commandcode.ai"],
   "memory_mib": 64,
   "concurrency": 8
 }

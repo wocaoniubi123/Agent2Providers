@@ -1,596 +1,131 @@
-//! 小浣熊模型目录：仅采用 chat 分类，保留隐藏模型供显式映射使用。
-//!
-//! 远程 model_catalog 的 name 是模型 ID，displayName 是展示名；聚合层
-//! 分别映射为 id/name。上下文和输出上限缺失时保持 null，不虚构限制。
-//! 目录需要登录与组织身份；刷新失败保留旧目录，冷启动使用 `fallback.rs`。
-//!
-//! ── 目录缓存归宿主（与 native 的结构差异）──────────────────
-//! native 侧插件自己拿一把 `RwLock<CatalogState>` 存远程清单。wasm 实例不保证
-//! 跨调用存活，插件里存不住任何东西；而网关本来就会把 `models.list` 的应答
-//! 落库（它有 catalog 能力）。所以这里的「当前清单」= 宿主的 `catalog.get`，
-//! 插件只负责**拉取 + 归一**，刷新结果经 `catalog.refreshed(..)` 交回宿主。
-//! 好处是不再出现「两份真相」（用户改了网关缓存策略而插件还按自己的 TTL 走）。
+//! 目录按账号及组织state缓存10分钟；宿主展示目录可聚合，不把展示可见性当模型权限。
+//! 不声明catalog.accounts.v1，避免它把隐式自定义映射变成目录强权限闸门。
 
-use agent2api_wasm_sdk::{self as sdk, json, Result, Value};
+use super::{endpoints, fallback, images, model_shape, network, session, util};
+use agent2api_wasm_sdk::{
+    self as sdk, json,
+    state::{self, Scope, Snapshot},
+    Error, Result, Value,
+};
 
-use crate::{credentials, headers, upstream};
+const KEY: &str = "model-catalog";
+const TTL: i64 = 600_000;
 
-/// 远程目录缓存有效期（源实现 `CATALOG_CACHE_TTL_MS`：10 分钟）
-const CATALOG_CACHE_TTL_MS: i64 = 10 * 60_000;
-
-/// 静态兜底使用基准倍率，不把临时折扣写成永久价格。
-pub fn fallback_models() -> Vec<Value> {
-    super::fallback::models()
+pub fn fallback() -> Value {
+    json!({ "models": fallback::models(), "meta": { "remote": false, "refreshed_at": 0 } })
 }
-
-/// 当前清单（远程成功过就是宿主的远程清单，否则静态兜底），**已翻成聚合层的键名**。
-///
-/// ── `models.list` 的返回形态 ────────────────────────────────
-/// `{models, meta}` —— 与 native 的 `proto::ModelList` 同一形状：
-/// `meta.remote` 表示这份清单是不是真拉过上游，`meta.refreshed_at` 是上次
-/// 成功刷新的毫秒时刻（从未成功过为 0）。
-pub fn list() -> Result<Value> {
-    let catalog = sdk::catalog::cached().unwrap_or(Value::Null);
-    let remote: Vec<Value> = catalog
-        .get("models")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    if remote.is_empty() {
-        // 宿主还没有目录（冷启动）→ 静态兜底，并如实标注 remote: false
-        let models: Vec<Value> = fallback_models().iter().map(listing_entry).collect();
-        return Ok(json!({
-            "models": models,
-            "meta": { "remote": false, "refreshed_at": 0 },
-        }));
+fn load() -> Result<Snapshot> {
+    let snapshot = state::get(Scope::Account, KEY, 1)?;
+    if !snapshot.compatible {
+        return Err(Error::http(409, "小浣熊目录状态格式已变化"));
     }
-    let meta = if catalog.get("meta").is_some_and(Value::is_object) {
-        catalog["meta"].clone()
-    } else {
-        json!({ "remote": true, "refreshed_at": 0 })
-    };
-    Ok(json!({ "models": remote, "meta": meta }))
+    Ok(snapshot)
 }
-
-/// 源形态 → 聚合层的条目形态（键名映射；见模块头）。
-///
-/// 只做**改名与搬运**，不做任何值改写：上游给的 `null` 保持 `null`
-/// （聚合层对 null 的处理是「不输出该键」，与源实现的 `undefined` 一致）。
-fn listing_entry(model: &Value) -> Value {
-    let Some(object) = model.as_object() else {
-        return model.clone();
-    };
-    let mut out = object.clone();
-    let model_id = object
-        .get("name")
-        .map(crate::jwt::js_text)
-        .unwrap_or_default();
-    out.insert("id".to_string(), Value::String(model_id.clone()));
-    if let Some(display) = object.get("displayName") {
-        out.insert("name".to_string(), display.clone());
-    }
-    for (source, target) in [
-        ("contextWindow", "maxInputTokens"),
-        ("maxTokens", "maxOutputTokens"),
-    ] {
-        if let Some(value) = object.get(source) {
-            out.insert(target.to_string(), value.clone());
-        }
-    }
-    for (source, target) in [
-        ("supportImage", "supportsImages"),
-        ("supportThinking", "supportsReasoning"),
-    ] {
-        if let Some(value) = object.get(source) {
-            out.insert(target.to_string(), value.clone());
-        }
-    }
-    // 可见性：远程清单已经由 `normalize_catalog_entry` 算出 `visibility`，
-    // 这里原样搬运；**静态兜底表**没有上游字段可读，按 [`fallback_visibility`]
-    // 判 —— 兜底表里那三条 `raccoon-` 开头的内部 Work 模型，远程目录实测就是
-    // `visible: false`。
-    let visibility = match object.get("visibility").and_then(Value::as_str) {
-        Some(value) => value.to_string(),
-        None => fallback_visibility(&model_id).to_string(),
-    };
-    out.insert("visibility".to_string(), Value::String(visibility));
-    Value::Object(out)
+fn source(session: &session::Session) -> String {
+    util::hash(
+        &json!({ "user": session.credential.user, "org": session.credential.org,
+        "desktop": session.source.as_ref().map(|source| source.source_id.as_str()) })
+        .to_string(),
+    )
 }
-
-/// 静态兜底表的可见性判据（远程清单不读它 —— 那边有上游 `visible` 字段）。
-///
-/// 判据是**名字形态**：`raccoon-` + ≤8 位十六进制是内部 Work 模型。
-/// `raccoon-chat-ml-5-5`（桌面端本地配置的默认模型）与 `sn-*` 系一律按可见处理：
-/// 前者不在远程目录里、没有任何官方口径，后者实测 `visible: true`。
-fn fallback_visibility(id: &str) -> &'static str {
-    let lowered = id.trim().to_ascii_lowercase();
-    let Some(suffix) = lowered.strip_prefix("raccoon-") else {
-        return "shown";
-    };
-    let opaque =
-        !suffix.is_empty() && suffix.len() <= 8 && suffix.chars().all(|ch| ch.is_ascii_hexdigit());
-    if opaque {
-        "hidden"
-    } else {
-        "shown"
-    }
-}
-
-/// 刷新远程目录（`GET {llmBase}/model_catalog`）。
-///
-/// ── 返回值的三档（供手动路径如实汇报）──────────────────────────
-///   - `refreshed(n)`：真拉到并交回宿主了 n 条；
-///   - `unchanged()`：TTL 未到（只有 `force = false` 时会走到）；
-///   - `failed(原因)`：**这次真的去拉了但没成功**（HTTP 非 2xx / 网络错误 /
-///     目录为空）。清单仍按既有行为保留（不清空），失败原因如实带给调用方。
-///
-/// ── `force`：手动刷新必须能绕过 TTL ─────────────────────────
-/// TTL 早退是为**自动路径**设的（客户端每次拉 `/v1/models` 都真打一次上游既
-/// 没必要且会加重上游负担）。但用户手动点「刷新模型清单」时预期是「现在真的
-/// 去拉一次」：若在 TTL 窗口内照样早退，界面只能显示「已刷新」而清单一个字
-/// 没变 —— 与功能坏掉无法区分。
-///
-/// ── 身份获取失败为什么不算 Err ──────────────────────────────
-/// native 的 `refresh_models` 在拿不到凭证时返回 `RefreshOutcome::failed(error)`
-/// 而不是抛错：刷新是后台维护动作，调用方按返回值汇报，不该把整个请求打成
-/// 500。这里逐条照搬。
-pub fn refresh(account: &str, force: bool) -> Result<Value> {
-    let current = list()?;
-    let count = current["models"].as_array().map(Vec::len).unwrap_or(0);
-    if !force {
-        let age = sdk::now() - current["meta"]["refreshed_at"].as_i64().unwrap_or(0);
-        if current["meta"]["remote"] == true && (0..CATALOG_CACHE_TTL_MS).contains(&age) {
-            return Ok(sdk::catalog::unchanged(count));
-        }
-    }
-    let (token, org_code) = match credentials::request_identity(account) {
-        Ok(identity) => identity,
-        Err(error) => return Ok(sdk::catalog::failed(&error.message)),
-    };
-    let url = format!("{}/model_catalog", upstream::llm_base());
-    let mut request_headers: Vec<(String, String)> =
-        vec![("Accept".to_string(), "application/json".to_string())];
-    if !token.is_empty() {
-        request_headers.push(("Authorization".to_string(), format!("Bearer {token}")));
-    }
-    // 「沿用哪一份」的措辞在三条失败路径上都要用：它决定了用户看到的是
-    // 「刷新失败（保留旧目录）」还是「刷新失败（仍在用静态兜底清单）」。
-    let kept = || {
-        if current["meta"]["remote"] == true {
-            "旧缓存"
-        } else {
-            "静态兜底"
-        }
-    };
-    if let Err(error) = headers::append_org(&mut request_headers, &org_code) {
-        return Ok(sdk::catalog::failed(&error.message));
-    }
-    let response = match upstream::send("GET", &url, &request_headers, None) {
-        Ok(response) => response,
-        Err(error) => {
-            return Ok(sdk::catalog::failed(&format!(
-                "目录拉取失败（沿用{}）: {}",
-                kept(),
-                error.message
-            )))
-        }
-    };
-    if !response.ok {
-        return Ok(sdk::catalog::failed(&format!(
-            "上游返回 HTTP {}（沿用{}）",
-            response.status,
-            kept()
-        )));
-    }
-    let payload = response.payload;
-    if crate::errors::business_code(&payload).is_some_and(|code| code != 0) {
-        return Ok(sdk::catalog::failed(&crate::errors::message(&payload)));
-    }
-    let models = parse_catalog(&payload);
-    if models.is_empty() {
-        // 非 2xx 之外的另一种「拉了但没用」：上游给的目录解析不出任何模型。
-        // 报失败而不是「没刷」—— 用户点了按钮，这是需要他知道的异常
-        return Ok(sdk::catalog::failed(&format!(
-            "上游返回的模型目录为空（沿用{}）",
-            kept()
-        )));
-    }
-    let entries: Vec<Value> = models.iter().map(listing_entry).collect();
-    Ok(sdk::catalog::refreshed(entries))
-}
-
-/// 解析 `/model_catalog` 响应：`{ code, data: { categories: [{ type,
-/// default_model, models: [...] }] } }`（实测结构）。
-///
-/// 字段口径照抄源实现：根上没有 `data` 时把根当 `data`；平铺所有分类；
-/// 同名模型**首次出现者胜**；空 name 的条目丢弃。
-pub fn parse_catalog(payload: &Value) -> Vec<Value> {
-    let data = match payload.get("data") {
-        Some(Value::Object(_)) => payload.get("data").unwrap_or(payload),
-        _ => payload,
-    };
-    let mut models: Vec<Value> = Vec::new();
-    let mut seen: Vec<String> = Vec::new();
-    let Some(categories) = data.get("categories").and_then(Value::as_array) else {
-        return models;
-    };
-    for category in categories {
-        if category
-            .get("type")
-            .and_then(Value::as_str)
-            .is_some_and(|kind| kind != "chat")
-        {
-            continue;
-        }
-        let Some(entries) = category.get("models").and_then(Value::as_array) else {
-            continue;
-        };
-        for entry in entries {
-            let Some(model) = normalize_catalog_entry(entry) else {
-                continue;
-            };
-            let name = model
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            if seen.iter().any(|known| known == &name) {
-                continue;
-            }
-            seen.push(name);
-            models.push(model);
-        }
-    }
-    models
-}
-
-/// 单条目录记录归一（源实现 `normalizeCatalogEntry`）。
-///
-/// ── 三处易错点（照抄源实现，不做「顺手修正」）────────────────
-///   ① `description` 在目录里是**内部代号**（`Raccoon-Work` 这类），营销文案在
-///      `display_description`；`displayName` 优先取代号（≤64 字符时才用，
-///      更长的多半是句子，用它当展示名会把列表撑爆）。
-///   ② `params` 是嵌套对象，`context_window` / `max_tokens` 可能出现在
-///      `params` 里、也可能在顶层（两种都实测过）—— 两级都要看。
-///   ③ `supportThinking` 优先读显式能力，否则按官方运行时已确认的模型家族判断；
-///      `supportImage` 由目录的显式字段或 vision / image / image-understanding
-///      标签决定。
-fn normalize_catalog_entry(entry: &Value) -> Option<Value> {
-    let object = entry.as_object()?;
-    let name = object
-        .get("name")
-        .map(text_value)
-        .map(|text| text.trim().to_string())
-        .filter(|text| !text.is_empty())
-        .or_else(|| {
-            object
-                .get("model_name")
-                .map(text_value)
-                .map(|text| text.trim().to_string())
-                .filter(|text| !text.is_empty())
-        })?;
-    let tags: Vec<Value> = object
-        .get("tags")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str())
-                .map(|text| text.trim().to_string())
-                .filter(|text| !text.is_empty())
-                .map(Value::String)
-                .collect()
-        })
-        .unwrap_or_default();
-    let tag_names: Vec<String> = tags
-        .iter()
-        .filter_map(Value::as_str)
-        .map(str::to_ascii_lowercase)
-        .collect();
-    let params = object.get("params").and_then(Value::as_object);
-    let pick_int = |keys: &[&str]| -> Value {
-        for key in keys {
-            if let Some(number) = object.get(*key).and_then(int_of) {
-                return Value::from(number);
-            }
-            if let Some(number) = params.and_then(|params| params.get(*key)).and_then(int_of) {
-                return Value::from(number);
-            }
-        }
-        Value::Null
-    };
-    let codename = object
-        .get("description")
-        .map(text_value)
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let display_name = object
-        .get("display_name")
-        .map(text_value)
-        .map(|text| text.trim().to_string())
-        .filter(|text| !text.is_empty())
-        .unwrap_or_else(|| {
-            if !codename.is_empty() && codename.chars().count() <= 64 {
-                codename.clone()
+pub fn list(params: &Value) -> Result<Value> {
+    if params["account"].as_str().unwrap_or("").is_empty() {
+        let catalog = sdk::catalog::cached()?;
+        return Ok(
+            if catalog["models"].is_array() && catalog["meta"]["remote"] == true {
+                catalog
             } else {
-                name.clone()
-            }
-        });
-    let description = object
-        .get("display_description")
-        .map(text_value)
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let support_image = object
-        .get("supports_images")
-        .or_else(|| object.get("supportImage"))
-        .and_then(Value::as_bool)
-        .unwrap_or_else(|| {
-            ["vision", "image", "image-understanding"]
-                .iter()
-                .any(|wanted| tag_names.iter().any(|tag| tag == wanted))
-        });
-    let support_thinking = object
-        .get("supports_reasoning")
-        .or_else(|| object.get("supportThinking"))
-        .and_then(Value::as_bool)
-        .unwrap_or_else(|| super::reasoning::supported(&name));
-    let mut normalized = serde_json::Map::new();
-    normalized.insert("name".to_string(), Value::String(name));
-    normalized.insert("displayName".to_string(), Value::String(display_name));
-    normalized.insert("description".to_string(), Value::String(description));
-    normalized.insert("tags".to_string(), Value::Array(tags));
-    // 上下文窗口/输出上限用 `Value::Null` 表示「目录没给」——
-    // 聚合出口对 null 的处理是**不输出该键**（与源实现的 `undefined` 一致），
-    // 所以这里必须用 null 而不是 0
-    normalized.insert(
-        "contextWindow".to_string(),
-        pick_int(&["context_window", "contextWindow"]),
-    );
-    normalized.insert(
-        "maxTokens".to_string(),
-        pick_int(&["max_tokens", "maxTokens"]),
-    );
-    normalized.insert("supportImage".to_string(), Value::Bool(support_image));
-    normalized.insert("supportThinking".to_string(), Value::Bool(support_thinking));
-    for (source, target) in [
-        ("ability_level", "abilityLevel"),
-        ("billing_category", "billingCategory"),
-        ("billing_multiplier", "billingMultiplier"),
-        ("billing_effective_multiplier", "billingEffectiveMultiplier"),
-        ("billing_status_note", "billingStatusNote"),
-        ("billing_discounts", "billingDiscounts"),
-    ] {
-        if let Some(value) = object.get(source) {
-            normalized.insert(target.to_string(), value.clone());
+                fallback()
+            },
+        );
+    }
+    let session = session::snapshot()?;
+    let snapshot = load()?;
+    if snapshot.value["source"] == source(&session)
+        && snapshot.value["catalog"]["models"].is_array()
+    {
+        Ok(snapshot.value["catalog"].clone())
+    } else {
+        Ok(fallback())
+    }
+}
+pub fn refresh(params: &Value) -> Result<Value> {
+    let session = match session::ensure(false) {
+        Ok(session) => session,
+        Err(error) => {
+            return Ok(json!({ "refreshed": false, "message": error.message, "count": 0 }))
         }
-    }
-    // 倍率：上游目录里的 `billing_multiplier`（基准/原价倍率）与
-    // `billing_effective_multiplier`（计入活动与限免后的**实付**倍率）。
-    //
-    // ── 为什么不是 `points_multiplier` ──────────────────────────
-    // 那个字段**已被上游废弃**：桌面端代码里保留着读取，但当前 `/model_catalog`
-    // 的响应里一个都没有 —— 实测 8 个 chat 条目中 `points_multiplier` 出现 0 次、
-    // `billing_multiplier` 出现 8 次。早先从更早的实测快照移植的实现因此
-    // 透传出去的 `pointsMultiplier` 恒为 null。
-    //
-    // 三个字段的取向与桌面端界面一致：界面文案用「原 N 倍 / 现 N 倍」并列展示，
-    // 我们这一列只有一格，取**实付**（`billing_effective_multiplier`）——
-    // 用户真正会扣掉的那个数。实付缺失时回落基准值（老响应没有该字段）。
-    //
-    // 这两个数**不是积分功能**：网关不读、不判定、也不参与任何预算/账单计算，
-    // 只是把上游目录里的展示信息带给前端。
-    let billing_base = number_of(object.get("billing_multiplier"));
-    let billing_effective = number_of(object.get("billing_effective_multiplier"));
-    let multiplier = billing_effective.or(billing_base);
-    normalized.insert(
-        "pointsMultiplier".to_string(),
-        billing_base.map(json_number).unwrap_or(Value::Null),
-    );
-    // `credits` 是**聚合层与前端共用的那一列**。空串 = 上游没给，界面显示 `—`。
-    // 形态与 WorkBuddy 的 `"x0.16 credits"` 对齐，两家的倍率列因此走同一条渲染分支。
-    normalized.insert(
-        "credits".to_string(),
-        Value::String(
-            multiplier
-                .map(|value| format!("x{} credits", format_multiplier(value)))
-                .unwrap_or_default(),
-        ),
-    );
-    normalized.insert(
-        "billingStatus".to_string(),
-        object
-            .get("billing_status")
-            .and_then(Value::as_str)
-            .map(|text| Value::String(text.to_string()))
-            .unwrap_or(Value::Null),
-    );
-    // 可见性：上游 `/model_catalog` 每条自带 `visible`，`false` 表示官方客户端
-    // 不列它（实测 9 条里 3 条是 `false`，全是 `raccoon-` 开头的内部 Work 模型）。
-    // 缺字段 / `null` = 上游没说 = 按可见处理（上游删字段时不能把整张表判成
-    // 不可见）。这**不是**名字启发式的替代品：那条判的是「名字长得像内部哈希」，
-    // 这条判的是「上游自己说不展示」—— 后者才是依据。
-    let visible = !matches!(object.get("visible"), Some(Value::Bool(false)));
-    normalized.insert("visible".to_string(), Value::Bool(visible));
-    normalized.insert(
-        "visibility".to_string(),
-        Value::String(if visible { "shown" } else { "hidden" }.to_string()),
-    );
-    Some(Value::Object(normalized))
-}
-
-/// JS `Math.floor(Number(x))`；非有限值返回 None（源实现 `toInt`）
-fn int_of(value: &Value) -> Option<i64> {
-    let number = match value {
-        Value::Number(number) => number.as_f64()?,
-        Value::String(text) => text.trim().parse::<f64>().ok()?,
-        _ => return None,
     };
-    if number.is_finite() {
-        Some(number.floor() as i64)
+    let old = load()?;
+    let previous = if old.value["source"] == source(&session) {
+        old.value["catalog"].clone()
     } else {
-        None
-    }
-}
-
-/// 倍率字段读法：上游给的是 JSON 数字，但**字符串形态也接受**
-/// （目录里 `context_window` 这类字段就混着字符串形态，而倍率一旦被上游改成
-/// `"0.2"` 就会静默变成「没给」）。
-///
-/// `0` 是合法值（限免的 `billing_effective_multiplier = 0`），
-/// 因此**不能**用「假值即缺失」的写法。
-fn number_of(value: Option<&Value>) -> Option<f64> {
-    let number = match value? {
-        Value::Number(number) => number.as_f64()?,
-        Value::String(text) => text.trim().parse::<f64>().ok()?,
-        _ => return None,
+        fallback()
     };
-    if number.is_finite() && number >= 0.0 {
-        Some(number)
-    } else {
-        None
+    let age = sdk::now().saturating_sub(previous["meta"]["refreshed_at"].as_i64().unwrap_or(0));
+    if params["force"] != true && previous["meta"]["remote"] == true && (0..TTL).contains(&age) {
+        return Ok(
+            json!({ "refreshed": false, "count": previous["models"].as_array().map(Vec::len).unwrap_or(0) }),
+        );
     }
-}
-
-/// `f64` → JSON 数字（整数形态走 `i64`，避免 `1.0` 这种「看起来像浮点」
-/// 的值进入清单；非有限值给 `null`）。
-fn json_number(value: f64) -> Value {
-    if !value.is_finite() {
-        return Value::Null;
-    }
-    if value.fract() == 0.0 && value.abs() < 9_007_199_254_740_992.0 {
-        return Value::from(value as i64);
-    }
-    serde_json::Number::from_f64(value)
-        .map(Value::Number)
-        .unwrap_or(Value::Null)
-}
-
-/// 倍率数字 → 紧凑文本：整数不带小数点，其余最多两位小数并裁掉尾零
-/// （`0.2` → `0.2`、`0.75` → `0.75`、`1` → `1`、`0` → `0`）。
-///
-/// 保留两位是因为目录里 `0.25` / `0.75` 这类值真实存在，一位小数会把
-/// `0.25` 显示成 `0.3`。
-fn format_multiplier(value: f64) -> String {
-    let rounded = (value * 100.0).round() / 100.0;
-    if (rounded - rounded.trunc()).abs() < 1e-9 {
-        return format!("{}", rounded.trunc() as i64);
-    }
-    let text = format!("{rounded:.2}");
-    text.trim_end_matches('0').trim_end_matches('.').to_string()
-}
-
-/// JS `String(x)`（name/description 这类字段的文本形态；null 给空串）
-fn text_value(value: &Value) -> String {
-    crate::jwt::js_text(value)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn catalog_payload() -> Value {
-        json!({
-            "code": 0,
-            "data": {
-                "categories": [
-                    { "type": "chat", "models": [
-                        {
-                            "name": "sn-glm-5-3",
-                            "description": "GLM-5-3",
-                            "display_description": "智谱 GLM 5.3",
-                            "params": { "context_window": "1000000", "max_tokens": 100000 },
-                            "billing_multiplier": 0.75,
-                            "billing_effective_multiplier": "0.5",
-                            "visible": true,
-                            "tags": ["Vision"]
-                        },
-                        { "name": "raccoon-8c4485", "description": "Raccoon-Work", "visible": false },
-                        // 同名重复：首次出现者胜
-                        { "name": "sn-glm-5-3", "display_name": "重复条目" },
-                        // 空 name：丢弃
-                        { "display_name": "没有名字" }
-                    ] },
-                    // 非 chat 分类：整类跳过
-                    { "type": "image", "models": [ { "name": "img-1" } ] }
-                ]
+    let result = network::open_timeout(
+        "GET",
+        &format!("{}/model_catalog", endpoints::LLM),
+        &session.credential.token,
+        &session.credential.org,
+        json!({ "Accept": "application/json" }),
+        None,
+        10_000,
+    )
+    .and_then(|response| network::read(response, 4 * 1024 * 1024))
+    .and_then(|reply| network::data(reply, &[&session.credential.token], false))
+    .and_then(|data| {
+        let mut models = model_shape::parse(&data)?;
+        if !models.iter().any(|model| model["id"] == images::MODEL) {
+            models.push(images::model());
+        }
+        Ok(sdk::catalog::refreshed(models))
+    });
+    match result {
+        Ok(catalog) => {
+            let latest = session::snapshot()?;
+            if latest.record["secret"] != session.record["secret"]
+                || source(&latest) != source(&session)
+            {
+                return Err(Error::http(
+                    409,
+                    "小浣熊账号或来源在目录刷新期间已变化，未保存旧结果",
+                ));
             }
-        })
-    }
-
-    #[test]
-    fn catalog_parsing_keeps_only_chat_and_dedupes() {
-        let models = parse_catalog(&catalog_payload());
-        let ids: Vec<&str> = models
-            .iter()
-            .filter_map(|model| model["name"].as_str())
-            .collect();
-        assert_eq!(ids, vec!["sn-glm-5-3", "raccoon-8c4485"]);
-    }
-
-    #[test]
-    fn catalog_entry_maps_fields_and_multiplier() {
-        let models = parse_catalog(&catalog_payload());
-        let glm = &models[0];
-        // params 里的字符串形态也要认出来
-        assert_eq!(glm["contextWindow"], 1_000_000);
-        assert_eq!(glm["maxTokens"], 100_000);
-        assert_eq!(glm["displayName"], "GLM-5-3");
-        assert_eq!(glm["description"], "智谱 GLM 5.3");
-        // 标签判定图片能力（大小写不敏感）
-        assert_eq!(glm["supportImage"], true);
-        // 家族判定思考能力
-        assert_eq!(glm["supportThinking"], true);
-        // 实付倍率优先，且格式化成 `x0.5 credits`
-        assert_eq!(glm["credits"], "x0.5 credits");
-        assert_eq!(glm["pointsMultiplier"], 0.75);
-        assert_eq!(glm["visibility"], "shown");
-        // 上游说不可见 → hidden
-        assert_eq!(models[1]["visibility"], "hidden");
-        assert_eq!(models[1]["visible"], false);
-    }
-
-    #[test]
-    fn listing_entries_use_the_aggregate_key_names() {
-        let models = parse_catalog(&catalog_payload());
-        let entry = listing_entry(&models[0]);
-        assert_eq!(entry["id"], "sn-glm-5-3");
-        assert_eq!(entry["name"], "GLM-5-3");
-        assert_eq!(entry["maxInputTokens"], 1_000_000);
-        assert_eq!(entry["maxOutputTokens"], 100_000);
-        assert_eq!(entry["supportsImages"], true);
-        assert_eq!(entry["supportsReasoning"], true);
-        assert_eq!(entry["visibility"], "shown");
-    }
-
-    #[test]
-    fn fallback_visibility_follows_the_name_shape() {
-        // `raccoon-` + ≤8 位十六进制 = 内部 Work 模型
-        assert_eq!(fallback_visibility("raccoon-8c4485"), "hidden");
-        assert_eq!(fallback_visibility("raccoon-405a1c"), "hidden");
-        // 不是那副形态的一律可见
-        assert_eq!(fallback_visibility("raccoon-chat-ml-5-5"), "shown");
-        assert_eq!(fallback_visibility("sn-kimi-k3"), "shown");
-    }
-
-    #[test]
-    fn fallback_catalog_is_complete_and_marked() {
-        let models = fallback_models();
-        assert_eq!(models.len(), 9);
-        // 默认模型已在表里时不再追加
-        assert!(models
-            .iter()
-            .any(|model| model["name"] == "raccoon-405a1c"));
-    }
-
-    #[test]
-    fn multipliers_are_compact() {
-        assert_eq!(format_multiplier(1.0), "1");
-        assert_eq!(format_multiplier(0.2), "0.2");
-        assert_eq!(format_multiplier(0.75), "0.75");
-        assert_eq!(format_multiplier(0.0), "0");
-        assert_eq!(format_multiplier(0.256), "0.26");
+            if !state::compare_exchange(
+                Scope::Account,
+                KEY,
+                1,
+                old.revision,
+                json!({ "source": source(&session), "catalog": catalog }),
+                0,
+            )? {
+                let latest = load()?;
+                if latest.value["source"] == source(&session)
+                    && latest.value["catalog"]["models"].is_array()
+                    && latest.value["catalog"]["meta"]["remote"] == true
+                {
+                    let mut catalog = latest.value["catalog"].clone();
+                    catalog["refreshed"] = json!(false);
+                    catalog["count"] =
+                        json!(catalog["models"].as_array().map(Vec::len).unwrap_or(0));
+                    return Ok(catalog);
+                }
+                return Err(Error::http(409, "小浣熊模型目录已被其他刷新更新"));
+            }
+            Ok(catalog)
+        }
+        Err(error) => {
+            let mut previous = previous;
+            previous["refreshed"] = json!(false);
+            previous["count"] = json!(previous["models"].as_array().map(Vec::len).unwrap_or(0));
+            previous["message"] = json!(error.message);
+            Ok(previous)
+        }
     }
 }

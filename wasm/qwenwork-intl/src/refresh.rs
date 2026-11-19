@@ -1,185 +1,202 @@
-//! 凭证续期：同一凭证只刷新一次，保存时确认账号未被重新导入或删除。
-//!
-//! 只有**一条**续期路径，挂在 `gateway.qwenwork.ai` 上、不需要 COSY 签名：
-//!   设备流凭据（`dt-` / `drt-`）→ `POST /api/v1/deviceToken/refresh`
-//!   请求体带 `{"refresh_token": …, "target": "c"}`。
-//!
-//! ── 为什么只有一条（与 Qoder 的差别）───────────────────────────
-//! 千问办公**没有作业令牌交换**（`/api/v1/jobToken/exchange` 不存在），设备授权
-//! 拿到的那对令牌就是对话用的那一对，续期也按设备令牌续（native
-//! `Site::device_only` 为真）。`target: "c"` 是客户端形态标记，**不带会拿到
-//! 另一族的令牌**（见 `site::REFRESH_TARGET`）。
-//!
-//! **不要**改回 `{center}/algo/api/v3/user/refresh_token`：那条要求 appcode 签名，
-//! 设备流凭据打过去只会被 WAF 以 `403 Request discarded` 丢掉（详见 `site.rs`
-//! 里 `DEVICE_REFRESH_PATH` 的说明）。
-//!
-//! ── 单飞怎么做（与 native 的差别）───────────────────────────
-//! native 用进程内的 `flight::Table` 合并同一凭证的并发续期。Wasm 里每次调用
-//! 都是同一个实例上的同步执行，但宿主可能对同一账号并发发起多个调用 ——
-//! 于是这里用宿主的**账号锁**（`lock.acquire`）做串行化：拿到锁后重读账号，
-//! 若 secret 已经被别人换掉，直接用新的那份（不再刷第二次）。
+//! 国际设备令牌按原生千问基线提前一小时维护，携带本家client/redirect；兼容性未实测。
+//! 续期结果未知按原secret持久保留，不复用一次性材料；仍有效访问可用，不虚构刷新成功。
+//! 锁内比较原始 secret 后回写，保持同一账号和机器编号；没有作业令牌或 PAT 分支。
+use super::{
+    account::{self, Snapshot},
+    client,
+    credentials::Credentials,
+    endpoints, util,
+};
+use agent2api_wasm_sdk::{json, AccountLock, Error, Result, Value};
 
-use agent2api_wasm_sdk::{self as sdk, json, AccountLock, Error, Result, Value};
-
-use super::auth;
-use super::credentials::{self, Credentials};
-use super::site;
-
-/// 取当前账号的 secret + 解析后的凭证。
-pub fn snapshot() -> Result<(Value, Credentials)> {
-    let account = sdk::account()?;
-    if account.is_null() || account["secret"].is_null() {
-        return Err(Error::http(404, "账号不存在，请先添加账号"));
-    }
-    let mut credentials = Credentials::from_payload(&account["secret"])?;
-    credentials.set_seed(account["id"].as_str().unwrap_or(""));
-    credentials.complete_identity()?;
-    Ok((account, credentials))
+const CONTROL: &str = "refresh-control";
+pub fn due() -> Result<bool> {
+    let current = account::read()?;
+    Ok(current.credentials.is_biz != Some(true) && current.credentials.expiring()?
+        && agent2api_wasm_sdk::refresh_guard::available("credential-refresh", current.credentials.oauth_refresh())?)
 }
-
-/// 取一份现在能用的凭证（`force = false` 时只在临期窗口内真续期）。
-pub fn ensure_fresh(force: bool) -> Result<Credentials> {
-    let (account, credentials) = snapshot()?;
-    if !force && !credentials.expiring() {
-        return Ok(credentials);
-    }
-    if !credentials.can_refresh() {
-        return Err(Error::http(400, "账号没有刷新凭证，请重新登录"));
+pub fn ensure(force: bool) -> Result<Snapshot> {
+    let initial = account::ready()?;
+    if !force && !initial.credentials.expiring()? {
+        let now = util::now()?;
+        if initial.credentials.expires.is_some_and(|at| at <= now) {
+            return Err(Error::http(
+                401,
+                "千问办公访问令牌已过期且无可用续期材料，请重新授权",
+            ));
+        }
+        account::unchanged(&initial)?;
+        return Ok(initial);
     }
     let _lock = AccountLock::acquire()?;
-    // 拿到锁后重读：并发的另一个刷新可能刚刚落盘
-    let current = sdk::account()?;
-    if current["secret"] != account["secret"] {
-        let mut refreshed = Credentials::from_payload(&current["secret"])?;
-        refreshed.set_seed(current["id"].as_str().unwrap_or(""));
-        refreshed.complete_identity()?;
-        return Ok(refreshed);
+    let current = account::read()?;
+    if !account::same(&initial, &current) {
+        return compatible(&initial, current);
     }
-    refresh_and_save(&current, &credentials)
-}
-
-fn refresh_and_save(account: &Value, credentials: &Credentials) -> Result<Credentials> {
-    // 这家没有 PAT 交换（`/api/v1/jobToken/exchange` 不存在）：续期只有
-    // 「刷新令牌 → 新令牌」这一条，与 native `Site::supports_pat` 为假的结论一致。
-    let mut fresh = refresh_via_open_api(credentials)?;
-    fresh.complete_identity()?;
-    if fresh.user_id != credentials.user_id {
-        return Err(Error::http(400, "续期返回了不同账号，旧凭证未被覆盖"));
-    }
-    // ── 写回（比较再写）─────────────────────────────────────────
-    // `account.update` 的 `expect` 是读到时的那份 secret：宿主持有 CAS，
-    // 只有它没变时才写。与 native `store::save` 同一语义。
-    //
-    // 空值不覆盖既有内容：刷新结果里缺某一项（上游没回过期时间）时不该把
-    // 记录里仍然有效的值洗成空。
-    let expect = account["secret"].clone();
-    let next = merge_secret(&expect, &fresh.to_value());
-    let public = super::account::view(&next);
-    let result = sdk::host(
-        "account.update",
-        json!({ "expect": expect, "secret": next, "public": public }),
-    )?;
-    if result["updated"] != true {
-        // 期望值已变（另一个刷新先落盘 / 账号被重新导入）：重读一次再决定
-        let (_, current) = snapshot()?;
+    if !force && !current.credentials.expiring()? {
+        account::unchanged(&current)?;
+        let now = util::now()?;
+        if current.credentials.expires.is_some_and(|at| at <= now) {
+            return Err(Error::http(401, "千问办公访问凭据已过期，请重新授权"));
+        }
         return Ok(current);
     }
-    Ok(fresh)
-}
-
-/// 把刷新结果并进既有 secret（空值不覆盖）。
-fn merge_secret(expect: &Value, fresh: &Value) -> Value {
-    let mut next = expect.clone();
-    let (Some(target), Some(source)) = (next.as_object_mut(), fresh.as_object()) else {
-        return fresh.clone();
-    };
-    for (key, value) in source {
-        if value.is_null() || matches!(value, Value::String(text) if text.is_empty()) {
-            continue;
+    if !current.credentials.can_refresh() {
+        return Err(Error::http(401, "千问办公没有刷新凭据，请重新授权"));
+    }
+    if current.credentials.is_biz == Some(true) {
+        return Err(Error::http(409, "千问办公企业身份不能按个人设备凭据续期，请更新完整企业登录记录；未消费刷新令牌")
+            .with_code("identity_changed"));
+    }
+    let now = util::now()?;
+    let stamp = util::hash(
+        &json!([
+            current.credentials.binding(),
+            current.credentials.oauth_refresh()
+        ])
+        .to_string(),
+    );
+    let before = util::transient(CONTROL)?;
+    if !before.compatible || before.value["stamp"] == stamp && !before.value.is_null() {
+        return usable_or_error(
+            force,
+            &current,
+            Error::http(
+                409,
+                "千问办公上轮续期结果尚未确认，请重新授权；未重复使用旧刷新凭据",
+            ),
+        );
+    }
+    let marker = util::uuid()?;
+    if !util::put(
+        CONTROL,
+        &before,
+        json!({ "stamp": stamp, "marker": marker, "busyUntil": now + 120_000 }),
+        300_000,
+    )? {
+        return Err(Error::http(409, "千问办公续期状态已变化"));
+    }
+    let reserved = util::transient(CONTROL)?;
+    if reserved.value["marker"] != marker {
+        return Err(Error::http(409, "千问办公续期预约已变化，未消耗刷新凭据"));
+    }
+    account::unchanged(&current)?;
+    let reservation = agent2api_wasm_sdk::refresh_guard::Reservation::acquire(
+        "credential-refresh", current.credentials.oauth_refresh())?;
+    let next = match upstream(&current.credentials) {
+        Ok(next) => next,
+        Err(error) => {
+            // 一次发送的失败不能证明旧材料未被消耗；状态按原secret持久保留，直到换入新资料。
+            return usable_or_error(force, &current, error);
         }
-        target.insert(key.clone(), value.clone());
+    };
+    let observed = util::transient(CONTROL)?;
+    if observed.revision != reserved.revision || observed.value["marker"] != marker {
+        return Err(Error::http(409, "千问办公续期来源状态已变化，未交付该结果"));
     }
-    next
+    if next.binding() != current.credentials.binding() {
+        return Err(account::changed());
+    }
+    let completed_at = util::now()?;
+    if next.expires.is_some_and(|at| at <= completed_at) {
+        return Err(Error::http(502, "千问办公续期返回了已过期凭据"));
+    }
+    if next.access == current.credentials.access && next.refresh == current.credentials.refresh {
+        return Err(Error::http(409, "千问办公续期仍返回旧凭据，未记为刷新成功"));
+    }
+    let latest = account::read()?;
+    if !account::same(&current, &latest) {
+        return compatible(&current, latest);
+    }
+    if !account::save(&current, &next)? {
+        return compatible(&current, account::read()?);
+    }
+    let finished = account::read()?;
+    if finished.credentials.binding() != next.binding()
+        || finished.credentials.access != next.access || finished.credentials.refresh != next.refresh {
+        return Err(Error::http(409, "千问办公续期保存结果未确认，未清除旧凭据预约"));
+    }
+    reservation.complete()?;
+    if !util::put(CONTROL, &reserved, Value::Null, 1000)? {
+        return Err(Error::http(409, "千问办公续期保存后的状态未确认，请刷新核对；不会重复换证"));
+    }
+    compatible(&current, finished)
 }
-
-/// 用刷新令牌换一组新凭据（**openapi 主机，无需签名**）。
-///
-/// 路径按刷新令牌前缀分派：`jrt-`（PAT 换来的作业刷新令牌）走
-/// `/api/v1/jobToken/refresh`，**其余一律走设备端点** `/api/v1/deviceToken/refresh`。
-/// 默认落在设备端点是刻意的 —— 我们的账号全部来自网页设备授权（`drt-`），
-/// 未知格式大概率同族；而作业端点对 `drt-` 是硬拒（实测 400 `Bad request`）。
-///
-/// 上游**每次刷新都轮换**：返回新的访问令牌 + 新的刷新令牌，旧的立刻失效。
-/// 因此新令牌必须整体回写（`refresh_token` 缺失时才退回旧值）。
-fn refresh_via_open_api(credentials: &Credentials) -> Result<Credentials> {
-    let refresh = credentials.oauth_refresh();
-    if refresh.is_empty() {
-        return Err(Error::http(400, "账号没有刷新凭证，请重新登录"));
+fn usable_or_error(force: bool, current: &Snapshot, error: Error) -> Result<Snapshot> {
+    account::unchanged(current)?;
+    let now = util::now()?;
+    if !force && !util::terminal(&error) && current.credentials.expires.is_some_and(|at| at > now) {
+        // 提前维护失败与访问凭据过期不同；仍有效时可继续只读使用，不宣称续期成功。
+        return Ok(current.clone());
     }
-    // 千问办公**没有作业令牌**（设备令牌本身就是对话令牌，见 `Site::device_only`），
-    // 所以路径恒为设备端点；`jrt-` 那一族只属于 Qoder。
-    let path = site::DEVICE_REFRESH_PATH;
-    // 请求体：字段名是 snake_case 的 `refresh_token`（与取令牌时的 camelCase
-    // `refreshToken` 不是同一套 —— 发错名字上游按缺参处理）。这家还要多带一个
-    // `target`（`c` = 客户端形态），**不带会拿到另一族的令牌**。
-    let mut body = serde_json::Map::new();
-    body.insert("refresh_token".to_string(), Value::String(refresh.to_string()));
-    if let Some(target) = site::REFRESH_TARGET {
-        body.insert("target".to_string(), Value::String(target.to_string()));
-    }
-    let response = auth::request(
-        "POST",
-        &site::open_api_url(path),
-        Some(&Value::Object(body)),
-        &site::refresh_headers(),
-    )?;
-    // 401/403 在续期语义下只有一个含义：这把刷新令牌已经不能用了（过期、
-    // 被轮换掉，或与所选站点不符 —— 各站令牌不通用）。给一句能照做的提示，
-    // 而不是把上游的 `Request discarded` 原样透出去。
-    if matches!(response.status, 401 | 403) {
-        return Err(Error::http(401, "刷新令牌已失效或与所选站点不符，请重新登录该账号"));
-    }
-    let data = auth::payload(response, "凭证续期")?;
-    // 响应带用户标识时先核对身份：把 A 账号的令牌写进 B 账号的记录，
-    // 会让两个账号同时不可用，且从余额/模型列表上都看不出来。
-    // **只认 `user_id` 这几个键**：设备响应的 `id` 是设备会话号而非账号。
-    let returned_user = credentials::text(&data, &["user_id", "uid", "userId"]);
-    if !returned_user.is_empty()
-        && !credentials.user_id.is_empty()
-        && returned_user != credentials.user_id
+    Err(error)
+}
+fn compatible(previous: &Snapshot, current: Snapshot) -> Result<Snapshot> {
+    if previous.record["id"] != current.record["id"]
+        || previous.record["provider"] != current.record["provider"]
+        || previous.record["identity"] != current.record["identity"]
+        || previous.record["desktop"] != current.record["desktop"]
+        || previous.credentials.binding() != current.credentials.binding()
     {
-        return Err(Error::http(502, "续期返回了不同账号，旧凭证未被覆盖"));
+        return Err(account::changed());
     }
-    // 访问令牌的键名不固定：设备端点回 `device_token`，作业端点回 `token`。
-    let token = credentials::secret(&data, &["device_token", "deviceToken", "token", "access_token"])?;
-    if token.is_empty() {
-        return Err(Error::http(502, "续期响应缺少令牌，旧凭证未被覆盖"));
+    if account::same(previous, &current) {
+        return Err(Error::http(409, "千问办公续期结果未保存，请重试"));
     }
-    let refresh_token = credentials::secret(&data, &["refresh_token", "refreshToken"])?;
-    if refresh_token.contains('|') {
-        return Err(Error::http(502, "续期响应的 refresh_token 格式无效"));
+    let now = util::now()?;
+    if current.credentials.expires.is_some_and(|at| at <= now) {
+        return Err(Error::http(401, "千问办公续期后凭据仍已过期，请重新授权"));
     }
-    let mut fresh = credentials.clone();
-    fresh.access_token = token;
-    // 续期响应没带新刷新令牌时保留旧值：上游按「轮换」语义工作，此处只做兜底，
-    // 免得把仍然有效的那一半洗成空（空刷新令牌会让账号再也刷不动）。
-    fresh.refresh_token = format!(
-        "{}|{}|{}",
-        if refresh_token.is_empty() { refresh } else { &refresh_token },
-        credentials.user_id,
-        credentials.machine_id
-    );
-    // 只认绝对时间字段。**不要**回落到 `expires_in`：同一份协议里它的单位
-    // 在两家参考实现中被分别当成秒和毫秒（实测设备端点回 2591999994，
-    // 按毫秒算正好 30 天），猜错会写出一个几十年后的过期时间，让自动续期
-    // 再也不触发。缺字段时按设备令牌的 30 天寿命兜底，宁可早刷一次。
-    fresh.expires_at = Some(
-        credentials::timestamp(data.get("expires_at"))
-            .or_else(|| credentials::timestamp(data.get("expiresAt")))
-            .or_else(|| credentials::timestamp(data.get("expire_time")))
-            .or_else(|| credentials::timestamp(data.get("expireTime")))
-            .unwrap_or_else(|| sdk::now() + 30 * 24 * 60 * 60 * 1000),
-    );
-    Ok(fresh)
+    Ok(current)
+}
+fn upstream(previous: &Credentials) -> Result<Credentials> {
+    let refresh = previous.oauth_refresh();
+    if refresh.is_empty() {
+        return Err(Error::http(401, "千问办公缺少刷新令牌"));
+    }
+    let reply = client::request(
+        "POST",
+        endpoints::DEVICE_REFRESH,
+        client::refresh_headers()?,
+        Some(
+            &json!({ "refresh_token": refresh, "target": endpoints::REFRESH_TARGET,
+            "client_id": endpoints::CLIENT_ID, "redirect_uri": endpoints::REDIRECT_URI }),
+        ),
+        "令牌续期",
+    )?;
+    if matches!(reply.status, 401 | 403) {
+        return Err(Error::http(
+            401,
+            "千问办公刷新凭据已失效，请重新授权；设备令牌过期太久可能无法续期",
+        ));
+    }
+    let payload = client::accepted(reply, "令牌续期")?;
+    let data = client::unwrap_data(&payload);
+    super::credentials::owner(data)?;
+    // 设备响应 id 是会话号，不拿来替代 user_id。
+    let user = util::text(&data, &["user_id", "uid", "userId"]);
+    if !user.is_empty() && user != previous.user {
+        return Err(account::changed());
+    }
+    let access = util::secret(
+        &data,
+        &["device_token", "deviceToken", "token", "access_token"],
+    )?;
+    let new_refresh = util::secret(&data, &["refresh_token", "refreshToken"])?;
+    if access.is_empty()
+        || new_refresh.is_empty()
+        || access.contains('|')
+        || new_refresh.contains('|')
+        || access.starts_with("jt-")
+        || new_refresh.starts_with("jrt-")
+    {
+        return Err(Error::http(502, "千问办公续期未返回有效设备凭据"));
+    }
+    let mut next = previous.clone();
+    next.access = access;
+    next.refresh = format!("{new_refresh}|{}|{}", previous.user, previous.machine);
+    next.expires = util::token_expiry(data, &next.access)?;
+    // 没有到期证据时保持未知，不以30天兜底覆盖服务端真实有效时长。
+    next.complete()?;
+    Ok(next)
 }

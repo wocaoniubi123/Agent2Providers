@@ -1,212 +1,120 @@
-//! 千问办公 国内版 的 Wasm 插件实现。
-//!
-//! 迁移来源：`crates/providers/src/providers/qoder/`（native，21 个文件；该目录
-//! 按 `Site` 参数化，同时导出 `qoder` / `qoder-intl` / `qwenwork` /
-//! `qwenwork-intl` 四家）。本包只申报 `qwenwork` 一个 provider id（网关硬性要求
-//! wasm 包的 `providers.len() == 1`）。
-//!
-//! ── 为什么从 `wasm/qoder` 复制而不是另写一份 ───────────────────
-//! 两家是**同一套协议栈**：同一个聊天路径、同一套 `Bearer COSY.<payload>.<sig>`
-//! 信封、同一把服务端 RSA 公钥。差异集中在「客户端身份常量 + 账号接口路径」，
-//! 所以这里保留 `wasm/qoder` 的模块划分与全部协议/签名实现，只按 native 的
-//! 站点分支改值（每处改动都写了对应的 native 分支）。
-//!
-//! ── 本包相对 `wasm/qoder` 改了哪些（对应 native 的哪个分支）────
-//!   site.rs        主机（`gateway.qwenwork.cn`）、`cosyVersion 1.1.52`、
-//!                  `ClientType 6`、`Data-Policy agree`、`session_type qoder_work`、
-//!                  `Cosy-Scene/Business-*` 三个头、`client_id` / `redirect_uri`、
-//!                  账号上下文与钱包路径、`max_input_tokens 1.02M`
-//!   cosy.rs        `Cosy-Clientip` 用机器标识；三个 `Cosy-Business-*` / `Scene` 头
-//!   protocol.rs    `model_config` 换成客户端那一份更宽的字段集
-//!   models.rs      `qwork` 场景、`enable` 全量保留、可见性一律 shown、
-//!                  上下文窗口读 `max_input_tokens` / 1.02M
-//!   auth.rs        资料走 `account-context`（拆 `data.user`）、无 PAT 交换
-//!   refresh.rs     续期请求体多带 `target: "c"`、只走设备端点
-//!   credentials.rs 临期窗口 1 小时
-//!   usage.rs       账号上下文 + 三档积分池（`wallets`）
-//!   account.rs     身份前缀 `qwenwork-`、默认名按邮箱
-//!   login.rs       只有网页登录；授权 URL 带 `client_id` / `redirect_uri`
-//!   machine.rs     设备标识种子前缀 `qwenwork-machine`（与 Qoder 分开）
-//!   checkin.rs / claims.rs  **不编译**：这家没有 campaign 接口，也没有作业令牌
-//!                  （`metadata.json` 的 `capabilities.checkin` / `claims` 是
-//!                  false）。两个文件留在目录里只为与 native 对照，不进 `mod`。
-//!
-//! ── 与 native 的对应关系 ────────────────────────────────────
-//! `meta()` → `metadata()`；`build_chat()` → `chat` / `conversation`；
-//! `ensure_token()` → `token.ensure`；`refresh()` → `token.refresh`；
-//! `expiring()` → `token.expiring`；`classify()` → `classify`；
-//! `models()` → `models.list`；`refresh_models()` → `models.refresh`；
-//! `usage()` → `usage.query`；`normalize_account()` → `account.normalize`；
-//! `account_view()` → `account.view`；`account_identity()` → `account.identity`；
-//! `login.*` → `login.*`；`admin.action` → `admin.action`。
-//!
-//! ── 硬约束 ──────────────────────────────────────────────────
-//! 依赖只有 `agent2api-wasm-sdk` / `serde_json` / `sha2` / `chrono`；
-//! 零 unwrap/expect/panic（宿主按 abort 处理）。
-
+//! 千问办公国内版独立 Wasm：仅 qwenwork；不依赖原生提供商、不读盘或运行程序。
+//! 基线 Site::QwenworkCn 没有签到/领取证据（原生能力位关闭且活动路径只属 Qoder）；
+//! 不迁移 Qoder 活动，也不将未取证宣传成上游永远不支持。机器 UUID 默认尚未实测。
 mod account;
 mod auth;
+mod catalog;
 mod chat;
+mod client;
+mod config;
 mod context;
 mod cosy;
 mod credentials;
-mod crypto;
+mod endpoints;
 mod errors;
 mod login;
+mod login_methods;
 mod machine;
+mod messages;
 mod models;
+mod output;
 mod protocol;
+mod reasoning;
 mod refresh;
-mod site;
-mod stream;
+mod thinking;
 mod usage;
+mod util;
 
 use agent2api_wasm_sdk::{self as sdk, json, Error, Result, Value};
-
 sdk::export_provider!(handle);
 
-/// 与 native 侧 `meta()` 逐字段一致（`metadata.json` 已按 native 的 `meta()`
-/// 产出：capabilities / login_methods / checkin / account_features / default_models）。
-const METADATA: &str = include_str!("metadata.json");
-
-/// 解析随包的元数据。解析失败给 `Null`（宿主会把它当成「没有元数据」，
-/// 比 abort 好，也不做 unwrap）。
-///
-/// 解析结果只做一次（`OnceLock`）：`models::fallback()` 会在每次 `models.list`
-/// 与模型解析时读 `default_models`，重复解析一份 JSON 是白花的开销。
-pub(crate) fn metadata() -> Value {
-    static PARSED: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
-    PARSED
-        .get_or_init(|| serde_json::from_str(METADATA).unwrap_or(Value::Null))
-        .clone()
+fn metadata() -> Value {
+    json!({ "id": endpoints::PROVIDER, "label": endpoints::LABEL, "order": 24,
+        "capabilities": { "chat": true, "stateful": true, "refresh": true, "model_refresh": true,
+            "usage": true, "checkin": false, "claims": false, "web_login": true,
+            "sse_model_rewrite": false, "sse_strip_newline_chunks": false, "anonymous_default_session": false,
+            "system_proxy_when_unset": false, "refresh_uses_account": true, "supports_default_model": false, "env_credentials": false },
+        "login_methods": [{ "kind": "browser", "button": "网页登录", "hint": "千问办公国内设备 PKCE，无本机回调" },
+            { "kind": "token", "label": "设备访问凭据", "placeholder": "千问办公国内设备令牌", "extra_fields": [
+                { "key": "refreshToken", "label": "刷新令牌", "optional": true, "secret": true },
+                { "key": "userId", "label": "用户编号", "optional": true },
+                { "key": "machineId", "label": "原设备编号", "optional": true }
+            ] }],
+        "account_features": { "usage": true, "credit_detail": true, "edition": true,
+            "identifier": ["uid", "userId"], "expiry": ["expiresAt"], "email_as_name": true },
+        "default_models": catalog::public(&catalog::fallback()),
+        "settings_schema": config::schema(), "settings_group": { "label": endpoints::LABEL } })
 }
-
-/// 通用思考档位表（与网关 `EFFORT_LEVELS` 逐字相同）。
-///
-/// 只用于 `reasoning_patch` 判「这个值值不值得注入」—— 本家对未知档位不报错
-/// （回退到模型默认档），所以注入表外值不会弄坏请求，但也不会生效，日志里却
-/// 会出现一行「已注入」。那正是「绑了没生效还查不出」的典型来源。
-const EFFORT_LEVELS: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max"];
-
-/// 映射上绑的思考等级注入到请求体的哪个键。
-const REASONING_FIELD: &str = "reasoning_effort";
-
-/// 思考等级绑定 → `reasoning_effort`（值**原样**交给本家的归一逻辑）。
-///
-/// ── 为什么本家不做档位映射 ────────────────────────────────────
-/// 「这一家收哪些档位」是**模型级**知识：上游目录每个模型条目自己声明
-/// `thinking_config.enabled.efforts`，`protocol::resolve_thinking` 已经按它
-/// 归一与回退。在这里再折一层等于把同一件事做两遍，而且**必然做错**：
-/// 适配器这一层只看得到模型名字，拿不到那个模型声明的档位表。
-fn reasoning_patch(params: &Value) -> Value {
-    let level = params["level"]
-        .as_str()
-        .or_else(|| params["reasoning"].as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    let body = &params["body"];
-    if protocol::client_specified_reasoning(body) {
-        return json!({
-            "action": "skip",
-            "reason": "客户端请求体里已指定思考档位，绑定不覆盖",
-        });
-    }
-    if level.is_empty() || !EFFORT_LEVELS.iter().any(|known| known.eq_ignore_ascii_case(&level)) {
-        return json!({
-            "action": "skip",
-            "reason": "该等级不在通用候选表内，本家无法判断上游收不收（档位由各模型自己声明）",
-        });
-    }
-    json!({
-        "action": "set",
-        "field": REASONING_FIELD,
-        "value": level,
-    })
-}
-
-/// `admin.action`：厂商专属、网关不该认识的动作。
-///
-/// ── 本包支持哪些 ────────────────────────────────────────────
-///   - `auth.methods`：添加账号弹窗里的登录方式（**只有网页登录**，这家没有 PAT）；
-///   - `quota.sources`：额度来源申报（本家不上报，回空数组）。
-///
-/// `risk.*`（UMID 设备风控组件）**只有 Qoder 国际版有**：网关侧那条宿主通道
-/// （`desktop.qoder-umid.v1`）的 `candidate` 里写着 `provider != "qoder-intl"`
-/// 就返回 None，本包申报它连授权都过不去。所以这里如实回一句，而不是假装支持。
-fn admin(params: &Value) -> Result<Value> {
-    match params["action"].as_str().unwrap_or("") {
-        "auth.methods" => Ok(login::methods()),
-        "quota.sources" => Ok(json!([])),
-        "risk.status" | "risk.install" => Err(Error::coded(
-            "千问办公 没有设备风控组件（UMID 只用于 Qoder 国际版的签到链路）",
-            "unsupported",
-        )),
-        other => Err(Error::coded(
-            format!(
-                "千问办公 不认识管理动作「{other}」（可用：auth.methods / quota.sources）"
-            ),
-            "unsupported",
-        )),
-    }
-}
-
 fn handle(method: &str, params: Value) -> Result<Value> {
+    if params
+        .get("provider")
+        .is_some_and(|value| !value.is_null() && value != "" && value != endpoints::PROVIDER)
+    {
+        return Err(Error::coded("当前插件只处理千问办公国内版", "forbidden"));
+    }
     match method {
         "init" => Ok(json!([metadata()])),
         "ping" => Ok(json!(true)),
         "provider.info" => Ok(metadata()),
-        "admin.action" => admin(&params),
         "account.normalize" => account::normalize(&params),
-        "account.view" => Ok(account::view(&params["secret"])),
-        "account.identity" => Ok(json!(account::identity(&params["secret"]))),
-        "token.ensure" => Ok(json!(account::ensure()?)),
-        "token.refresh" => Ok(json!(account::refresh()?)),
-        "token.expiring" => Ok(json!(account::expiring(&params["secret"]))),
-        "models.list" => models::list_response(),
-        "models.refresh" => models::refresh(params["force"].as_bool().unwrap_or(false)),
+        "account.view" => account::view(&params["secret"]),
+        "account.identity" => account::identity(&params["secret"]).map(|id| json!(id)),
+        "token.ensure" => refresh::ensure(false).map(|snapshot| json!(snapshot.credentials.access)),
+        "token.refresh" => refresh::ensure(true).map(|snapshot| json!(snapshot.credentials.access)),
+        "token.expiring" => refresh::due().map(|value| json!(value)),
+        "models.list" => models::list(&params),
+        "models.refresh" => models::refresh(&params),
         "usage.query" => usage::query(),
-        // 这家没有 campaign 接口：能力位已是 false，界面不会挂入口。真被调到
-        // 就给一条中性结果（native `checkin::claim_daily_checkin` 的同一个兜底），
-        // 不报错也不打上游。
-        "checkin.claim" => Ok(json!({
-            "outcome": "inactive",
-            "message": "千问办公 没有每日签到活动",
-        })),
-        // 手动福利（活动领取）只有 Qoder 两个站点有：`claim` 能力位是 false，
-        // 这里如实报「没有这个能力」。
-        "claim.status" | "claim" => Err(Error::coded(
-            "千问办公 没有可领取的活动（campaign）接口",
-            "unsupported",
-        )),
-        "login.start" => login::start(&params),
-        "login.poll" => login::poll(&params),
-        "login.cancel" => Ok(login::cancel()),
-        "login.callback" => login::callback(),
-        // 有状态家：`conversation` 是正路；`chat` 走同一段实现（两者的参数形状
-        // 只差 `wire_model` / `reasoning` 两个键，本家都不需要）
-        "chat" | "conversation" => {
+        "conversation" => {
             chat::forward(&params)?;
             Ok(Value::Null)
         }
-        "classify" => Ok(errors::classify(
-            params["status"].as_u64().unwrap_or(502) as u16,
-            &params["body"],
+        "login.start" => login::start(&params),
+        "login.poll" => login::poll(&params),
+        "login.cancel" => login::cancel(&params),
+        "login.callback" => Err(Error::http(
+            400,
+            "千问办公国内版使用设备轮询，不接受授权码或本机回调",
         )),
-        // ── 为什么恒为 false ──────────────────────────────────
-        // 这个方法问的是「HTTP 200 但正文其实是失败话术」。本家的业务错误全在
-        // SSE 信封里（`statusCodeValue`），而这里只看得到状态码与响应头、拿不到
-        // 正文 —— 按状态码猜必然误伤（上游成功响应的状态码永远是 200）。
-        "is_error_response" => Ok(json!(false)),
-        // native 没有覆盖 `error_policy` 的默认实现（默认 `Null` = 不附加策略）
-        "error.policy" => Ok(Value::Null),
-        // native 没有实现 `retry_advice`（排队的退避在 `chat.rs` 内部完成）
-        "retry_advice" => Ok(Value::Null),
+        "classify" => Ok(errors::classify(status(&params), &params["body"])),
+        "is_error_response" => Ok(json!(
+            status(&params) >= 400 || errors::has_error(&params["body"])
+        )),
+        "error.policy" => Ok(json!({ "stop": false })),
         "retry.decision" => Ok(json!({ "action": "default" })),
-        // native 的 `CooldownModels::default()`：不连带冷却别的模型名
+        "retry_advice" => Ok(Value::Null),
+        "refusal_markers" => Ok(json!({ "finishes": [], "markers": [] })),
         "cooldown_models" => Ok(json!({ "models": [] })),
-        "reasoning_patch" => Ok(reasoning_patch(&params)),
+        "reasoning_patch" => Ok(reasoning::patch(&params)),
         "images.capabilities" => Ok(json!({ "generation": false, "editing": false })),
+        "checkin.claim" | "claim" | "claim.status" => Err(unverified_activity()),
+        "admin.action" => admin(&params),
+        _ => Err(Error::unsupported()),
+    }
+}
+fn status(params: &Value) -> u16 {
+    params["status"]
+        .as_u64()
+        .and_then(|status| u16::try_from(status).ok())
+        .unwrap_or(502)
+}
+fn unverified_activity() -> Error {
+    Error::http(
+        400,
+        "千问办公国内基线没有签到或领取接口证据，本插件未接入，也不会调用 Qoder 活动",
+    )
+    .with_code("capability_not_verified")
+}
+fn admin(params: &Value) -> Result<Value> {
+    let payload = &params["payload"];
+    match params["action"].as_str().unwrap_or("") {
+        "auth.methods" => Ok(login_methods::methods(
+            payload["locale"].as_str().unwrap_or("zh-CN"),
+        )),
+        "network.user-agent" => Ok(json!({ "accountWide": true })),
+        "quota.sources" => Ok(usage::sources(&payload["report"])),
+        "machine.status" => Ok(machine::status()),
+        "claim.status" | "claim.claim" => Err(unverified_activity()),
         _ => Err(Error::unsupported()),
     }
 }

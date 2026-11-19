@@ -1,284 +1,266 @@
-//! 设备授权登录（PKCE，轮询型）。verifier 只留在后端，不能进入前端状态或日志。
-//!
-//! ── 流程（2026-11-03 在 native 侧复核过）─────────────────────────
-//!   1. 生成 PKCE verifier + challenge（S256）、一个**标准 UUID** 的 `nonce`、
-//!      一个设备标识 `machine_id`；
-//!   2. 把用户引到 `https://gateway.qwenwork.ai/device/selectAccounts?challenge=…`
-//!      —— 这一家**必须**带 `client_id` 与 `redirect_uri`（深链 `qwenwork-cn://`），
-//!      它在 302 之后会校验这两项（见 `site::DEVICE_CLIENT_ID`）；
-//!   3. 网关按 `poll_interval_ms` 回调 `login.poll`，插件去
-//!      `GET {gateway}/api/v1/deviceToken/poll?nonce=…&verifier=…&challenge_method=S256`
-//!      问进度（202 / 404 = 还没授权）；
-//!   4. 拿到令牌后补一份用户资料（`account-context`），落成账号。
-//!
-//! ── 为什么不能走授权码 + 本机回调（native 的踩坑记录）─────────────
-//! 授权页只认客户端自己登记的 `https://gateway.qwenwork.*/oauth/callback`，
-//! 本机回环与深链一律 `redirect_uri does not match` —— 授权码回不到我们手里。
-//! 所以**不要**把这条流程改成授权码型。
-//!
-//! ── `nonce` 必须是标准 UUID（带横线）────────────────────────
-//! 上游按 UUID 解析它，去横线会让整条 query 被判非法
-//! （`400 INVALID_DEVICE_FLOW`，`details.field=query`）。native 曾因此误判成
-//! 「入口已停用」—— 这里保持带横线的 `uuid_v4`。
-//!
-//! ── 为什么 verifier 存宿主状态而不是插件全局 ─────────────────
-//! native 用进程内 `HashMap`（单进程、一次登录几分钟）。Wasm 里每次调用都是
-//! 新实例，进程内表活不过一次调用 —— 于是把 `{state, poll_url, machine_id}`
-//! 写进宿主的**登录作用域状态**（带版本号、比较再写），语义与 native 那张表
-//! 等价，且多了「宿主重启也不丢」的好处。
-//!
-//! ── 硬约束 ──────────────────────────────────────────────────
-//! 零 unwrap/expect/panic。
-
-use agent2api_wasm_sdk::{self as sdk, json, Error, Result, Value};
+//! 国际设备授权：S256 PKCE + 带横线 nonce + 原生国际 client_id/redirect_uri。
+//! 设备入口有原生复核记录；账号换证全过程与机器编号默认兼容性尚未在国际环境实测。
+//! 轮询取凭据，不监听本机回调；缺机器编号的 UUID 只生成一次，flow 内保存并随账号落地。
+use super::{
+    account, auth, client,
+    credentials::{self, Credentials},
+    endpoints, machine, util,
+};
+use agent2api_wasm_sdk::{
+    self as sdk, json,
+    state::{self, Scope},
+    Error, Result, Value,
+};
+use base64::Engine;
 use sha2::{Digest, Sha256};
 
-use super::crypto;
-use super::credentials::{self, Credentials};
-use super::machine;
-use super::site;
-
-/// 登录作用域里存设备流状态的键与 schema
-const LOGIN_KEY: &str = "device";
-const LOGIN_SCHEMA: u32 = 1;
-
-/// 一次设备授权会话
-struct DeviceLogin {
-    /// 插件侧生成的一次性标识（进 flow id，排障用）
-    state: String,
-    auth_url: String,
-    poll_url: String,
-    machine_id: String,
+const KEY: &str = "device-login";
+const TTL: i64 = 300_000;
+fn flow(params: &Value) -> Result<&str> {
+    params["flow"]
+        .as_str()
+        .filter(|flow| !flow.is_empty() && util::printable(flow, 256))
+        .ok_or_else(|| Error::http(400, "主程序未分配千问办公登录流程"))
 }
-
-/// 简单的 query 值转义（只保留 RFC 3986 的 unreserved 字符）。
-///
-/// PKCE 串、UUID 本身都在 unreserved 集合里，这里只是不把「拼接」交给运气。
-fn encode_query(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || b"-_.~".contains(&byte) {
-            out.push(byte as char);
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
+fn changed() -> Error {
+    Error::http(409, "千问办公登录已取消、过期或被替换")
 }
-
-impl DeviceLogin {
-    fn new() -> Self {
-        let verifier = crypto::random_secret();
-        let challenge = crypto::b64_url_nopad(&Sha256::digest(verifier.as_bytes()));
-        // nonce 必须是标准 UUID（带横线）：上游按 UUID 解析它（见模块头）
-        let nonce = crypto::uuid_v4();
-        let machine_id = machine::login_machine_id();
-        let mut auth_url = format!(
-            "{}?challenge={}&challenge_method=S256&machine_id={}&nonce={}",
-            site::device_login_url(),
-            encode_query(&challenge),
-            encode_query(&machine_id),
-            encode_query(&nonce),
-        );
-        // 这一家**必须**带 `client_id` 与 `redirect_uri`：授权页 302 之后会校验
-        // 它们（不带时报 `redirect_uri does not match`，且错误里看不出缺的是哪一项）。
-        if let Some(client_id) = site::DEVICE_CLIENT_ID {
-            auth_url.push_str("&client_id=");
-            auth_url.push_str(&encode_query(client_id));
-        }
-        if let Some(redirect) = site::DEVICE_REDIRECT {
-            auth_url.push_str("&redirect_uri=");
-            auth_url.push_str(&encode_query(redirect));
-        }
-        let poll_url = format!(
-            "{}?nonce={}&verifier={}&challenge_method=S256",
-            site::open_api_url(site::DEVICE_POLL_PATH),
-            encode_query(&nonce),
-            encode_query(&verifier),
-        );
-        Self {
-            state: crypto::random_secret(),
-            auth_url,
-            poll_url,
-            machine_id,
-        }
-    }
-
-    /// 问一次上游：`Ok(None)` = 还在等授权。
-    fn poll(&self) -> Result<Option<Credentials>> {
-        let response = super::auth::request(
-            "GET",
-            &self.poll_url,
-            None,
-            &super::auth::account_headers(None),
-        )?;
-        if response.status == 202 || response.status == 404 {
-            return Ok(None);
-        }
-        let data = super::auth::payload(response, "设备授权")?;
-        let token = credentials::secret(&data, &["token", "device_token"])?;
-        if token.is_empty() {
-            return Err(Error::http(502, "设备授权响应缺少 token"));
-        }
-        let refresh_token = credentials::secret(&data, &["refresh_token"])?;
-        if refresh_token.contains('|') {
-            return Err(Error::http(502, "设备授权响应的 refresh_token 格式无效"));
-        }
-        let user_id = credentials::text(&data, &["user_id", "uid"]);
-        let mut credentials = Credentials::from_payload(&json!({
-            "mode": site::MODE,
-            "accessToken": token,
-            "refreshToken": if refresh_token.is_empty() { String::new() }
-                else { format!("{}|{}|{}", refresh_token, user_id, self.machine_id) },
-            "userId": user_id,
-            "machineId": self.machine_id,
-            // 设备令牌的绝对到期时刻；缺省按 30 天算
-            "expiresAt": credentials::timestamp(data.get("expires_at"))
-                .unwrap_or_else(|| sdk::now() + 30 * 24 * 60 * 60 * 1000),
-        }))?;
-        match super::auth::fetch_profile(&credentials.access_token) {
-            Ok(profile) => super::auth::apply_profile(&mut credentials, &profile)?,
-            Err(error) if credentials.user_id.is_empty() => return Err(error),
-            Err(_) => {}
-        }
-        credentials.complete_identity()?;
-        Ok(Some(credentials))
-    }
+fn failed(message: &str) -> Value {
+    json!({ "state": "failed", "message": message, "interaction": null })
 }
-
-/// 读登录状态里那份设备流（拿不到给 None）
-fn load_flow() -> Option<Value> {
-    let snapshot = sdk::state::get(sdk::state::Scope::Login, LOGIN_KEY, LOGIN_SCHEMA).ok()?;
-    if !snapshot.compatible || !snapshot.value.is_object() {
-        return None;
-    }
-    Some(snapshot.value)
+fn localized(state: &Value, kind: &str) -> Value {
+    let locale = state["locale"].as_str().unwrap_or("zh-CN");
+    failed(super::login_methods::progress(locale, kind))
 }
-
-/// 写一份设备流状态（比较再写）
-fn store_flow(revision: u64, value: Value) -> Result<()> {
-    let updated = sdk::state::compare_exchange(
-        sdk::state::Scope::Login,
-        LOGIN_KEY,
-        LOGIN_SCHEMA,
-        revision,
-        value,
-        600_000,
-    )?;
-    if !updated {
-        return Err(Error::new("登录状态已变化，请重新发起"));
+fn put(before: &state::Snapshot, value: Value, ttl: i64) -> Result<()> {
+    if !state::compare_exchange(Scope::Login, KEY, 1, before.revision, value, ttl)? {
+        return Err(changed());
     }
     Ok(())
 }
-
-/// 清掉设备流状态（成功、失败、取消都清：它是一次性的）
-fn clear_flow() {
-    let Ok(snapshot) = sdk::state::get(sdk::state::Scope::Login, LOGIN_KEY, LOGIN_SCHEMA) else {
-        return;
-    };
-    let _ = sdk::state::compare_exchange(
-        sdk::state::Scope::Login,
-        LOGIN_KEY,
-        LOGIN_SCHEMA,
-        snapshot.revision,
-        Value::Null,
-        1000,
-    );
-}
-
-/// 添加账号弹窗里可用的登录方式（与 `metadata.json` 的 `login_methods` 同序）。
-///
-/// **只有一条**：这家没有 PAT（`/api/v1/jobToken/exchange` 不存在），界面上给
-/// 一个点了必然报错的「粘贴令牌」入口比不给更糟（native `Site::supports_pat`
-/// 为假的同一结论）。
-pub fn methods() -> Value {
-    json!({ "methods": [
-        {
-            "methodIndex": 0, "type": "oauth", "label": "网页登录", "prompts": [],
-            "browserMode": "choice", "manualCallback": false,
-            "instructions": "在浏览器里登录 千问办公 国际版，授权完成后会自动收下账号"
-        }
-    ] })
-}
-
-/// 发起登录：这一家**只有设备授权**这一条（没有可粘贴的令牌）。
 pub fn start(params: &Value) -> Result<Value> {
-    let flow = params["flow"].as_str().unwrap_or("").trim().to_string();
-    if flow.is_empty() {
-        return Err(Error::new("主程序未分配登录流程"));
+    if !matches!(
+        params["method"].as_str().unwrap_or(""),
+        "" | "browser" | "web"
+    ) || params["payload"]["methodIndex"].as_u64().unwrap_or(0) != 0
+    {
+        return Err(Error::http(
+            400,
+            "千问办公手工凭据请使用账号表单，设备授权请使用网页登录",
+        ));
     }
-    let device = DeviceLogin::new();
-    let snapshot = sdk::state::get(sdk::state::Scope::Login, LOGIN_KEY, LOGIN_SCHEMA)?;
-    store_flow(
-        snapshot.revision,
-        json!({
-            "state": device.state,
-            "poll_url": device.poll_url,
-            "machine_id": device.machine_id,
-        }),
-    )?;
-    Ok(json!({
-        "flow": flow,
-        "url": device.auth_url,
-        // 轮询型：授权在上游域名终结，网关按这个间隔问 `login.poll`
-        "poll_interval_ms": 2000,
-        "instructions": "在打开的页面里完成 千问办公 的授权，完成后会自动收下账号",
-        "external_browser": true,
-        "allowed_hosts": site::allowed_login_hosts(),
-        "login_ui": {
-            "browserMode": "choice",
-            "manualCallback": false,
-            "callbackInput": "url",
-            "cookieCapture": null,
-            "captureCallback": false,
-        },
-    }))
-}
-
-/// 轮询登录进度（设备授权型）。
-pub fn poll(params: &Value) -> Result<Value> {
-    let _ = params;
-    let Some(value) = load_flow() else {
-        return Ok(json!({
-            "state": "failed",
-            "message": "这次登录流程已失效（插件重启过或已取消），请重新发起",
-        }));
+    let mode = match params["payload"].get("mode") {
+        None | Some(Value::Null) => "",
+        Some(Value::String(mode)) => mode.as_str(),
+        Some(_) => return Err(Error::http(400, "千问办公登录窗口类型无效")),
     };
-    let poll_url = value["poll_url"].as_str().unwrap_or("").to_string();
-    let state = value["state"].as_str().unwrap_or("").to_string();
-    let machine_id = value["machine_id"].as_str().unwrap_or("").to_string();
-    if poll_url.is_empty() || machine_id.is_empty() {
-        clear_flow();
-        return Ok(json!({ "state": "failed", "message": "登录状态损坏，请重新发起" }));
+    if !matches!(mode, "" | "external") {
+        return Err(Error::http(400, "千问办公国际设备授权请在系统浏览器完成"));
     }
-    let device = DeviceLogin { state, auth_url: String::new(), poll_url, machine_id };
-    match device.poll() {
-        Ok(None) => Ok(json!({ "state": "pending", "hint": "等待你在浏览器里完成授权…" })),
-        Ok(Some(credentials)) => {
-            clear_flow();
-            Ok(json!({
-                "state": "done",
-                "account": super::account::account_of(&credentials, "web", None),
-            }))
+    let mut owner = params["payload"].clone();
+    if let Some(fields) = owner.as_object_mut() {
+        // 登录mode表示打开窗口的方式，不是凭据所属地区。
+        fields.remove("mode");
+    }
+    credentials::owner(&owner)?;
+    let flow = flow(params)?;
+    let before = state::get(Scope::Login, KEY, 1)?;
+    if !before.value.is_null() {
+        return Err(changed());
+    }
+    let verifier = util::random_secret()?;
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(Sha256::digest(verifier.as_bytes()));
+    let nonce = util::uuid()?;
+    let machine = machine::choose("")?;
+    let now = util::now()?;
+    let mut url = url::Url::parse(&client::url(endpoints::DEVICE_LOGIN)?)
+        .map_err(|_| Error::new("千问办公授权地址配置无效"))?;
+    url.query_pairs_mut()
+        .append_pair("challenge", &challenge)
+        .append_pair("challenge_method", "S256")
+        .append_pair("machine_id", &machine)
+        .append_pair("nonce", &nonce)
+        .append_pair("client_id", endpoints::CLIENT_ID)
+        .append_pair("redirect_uri", endpoints::REDIRECT_URI);
+    let locale = params["payload"]["locale"].as_str().unwrap_or("zh-CN");
+    put(
+        &before,
+        json!({ "flow": flow, "nonce": nonce, "verifier": verifier, "challenge": challenge, "machineId": machine,
+        "phase": "waiting", "expiresAt": now + TTL, "nextAt": now, "generation": util::uuid()?, "locale": locale }),
+        TTL,
+    )?;
+    Ok(
+        json!({ "flow": flow, "url": url.to_string(), "poll_interval_ms": 2000,
+        "instructions": super::login_methods::instructions(locale),
+        "external_browser": true, "allowed_hosts": ["gateway.qwenwork.ai", "qwenwork.ai"],
+        "login_ui": { "browserMode": "external", "manualCallback": false, "callbackInput": "url",
+            "cookieCapture": null, "captureCallback": false } }),
+    )
+}
+pub fn poll(params: &Value) -> Result<Value> {
+    let flow = flow(params)?;
+    let before = state::get(Scope::Login, KEY, 1)?;
+    let now = util::now()?;
+    if !before.value.is_null() && before.value["flow"] != flow {
+        return Err(changed());
+    }
+    if !before.compatible
+        || before.value.is_null()
+        || before.value["expiresAt"].as_i64().unwrap_or(0) <= now
+    {
+        put(&before, Value::Null, 1000)?;
+        return Ok(localized(&before.value, "expired"));
+    }
+    if before.value["phase"] == "polling" {
+        if before.value["busyUntil"].as_i64().unwrap_or(0) <= now {
+            put(&before, Value::Null, 1000)?;
+            return Ok(localized(&before.value, "unknown"));
         }
-        // 暂时不可达：继续等（与网关同一条处置）
-        Err(error) if error.code.as_deref() == Some("qoder_transport") => {
-            Ok(json!({ "state": "pending", "hint": "授权服务暂时不可达，正在重试…" }))
+        return Ok(sdk::login::pending(None));
+    }
+    if before.value["phase"] != "waiting" {
+        return Err(changed());
+    }
+    if before.value["nextAt"].as_i64().unwrap_or(0) > now {
+        return Ok(sdk::login::pending(None));
+    }
+    let mut working = before.value.clone();
+    let marker = util::uuid()?;
+    working["phase"] = json!("polling");
+    working["marker"] = json!(marker);
+    working["busyUntil"] = json!(now + 120_000);
+    let ttl = working["expiresAt"]
+        .as_i64()
+        .unwrap_or(now)
+        .saturating_sub(now)
+        .min(TTL);
+    put(&before, working.clone(), ttl)?;
+    let reserved = state::get(Scope::Login, KEY, 1)?;
+    if reserved.value["marker"] != marker || reserved.value["flow"] != flow {
+        return Err(changed());
+    }
+    let result = step(&working);
+    let current = state::get(Scope::Login, KEY, 1)?;
+    if !current.compatible
+        || current.revision != reserved.revision
+        || current.value["flow"] != flow
+        || current.value["marker"] != marker
+    {
+        return Err(changed());
+    }
+    if working["expiresAt"].as_i64().unwrap_or(0) <= util::now()? {
+        put(&reserved, Value::Null, 1000)?;
+        return Ok(localized(&working, "expired"));
+    }
+    match result {
+        Ok(Some(credentials)) => {
+            let result = account::normalized(credentials, "web", "");
+            put(&reserved, Value::Null, 1000)?;
+            result.map(sdk::login::done)
+        }
+        Ok(None) => {
+            working["phase"] = json!("waiting");
+            working["nextAt"] = json!(util::now()? + 2000);
+            working["busyUntil"] = json!(0);
+            put(&reserved, working, ttl)?;
+            Ok(sdk::login::pending(None))
+        }
+        Err(error) if error.code.as_deref() == Some("qwenwork_transport") => {
+            working["phase"] = json!("waiting");
+            working["nextAt"] = json!(util::now()? + 2000);
+            working["busyUntil"] = json!(0);
+            let locale = working["locale"].as_str().unwrap_or("zh-CN").to_string();
+            put(&reserved, working, ttl)?;
+            Ok(
+                json!({ "state": "pending", "hint": super::login_methods::progress(&locale, "retry") }),
+            )
         }
         Err(error) => {
-            clear_flow();
-            Ok(json!({ "state": "failed", "message": error.message }))
+            put(&reserved, Value::Null, 1000)?;
+            if util::terminal(&error) {
+                return Err(error);
+            }
+            Ok(failed(&error.message))
         }
     }
 }
-
-/// 取消一次登录。
-pub fn cancel() -> Value {
-    clear_flow();
-    Value::Null
+fn step(value: &Value) -> Result<Option<Credentials>> {
+    let mut url = url::Url::parse(&client::url(endpoints::DEVICE_POLL)?)
+        .map_err(|_| Error::new("千问办公轮询地址配置无效"))?;
+    let nonce = value["nonce"].as_str().ok_or_else(changed)?;
+    let verifier = value["verifier"].as_str().ok_or_else(changed)?;
+    let machine = value["machineId"].as_str().ok_or_else(changed)?;
+    url.query_pairs_mut()
+        .append_pair("nonce", nonce)
+        .append_pair("verifier", verifier)
+        .append_pair("challenge_method", "S256");
+    let path = format!("{}?{}", url.path(), url.query().unwrap_or(""));
+    let reply = client::request(
+        "GET",
+        &path,
+        client::account_headers(None),
+        None,
+        "设备授权轮询",
+    )?;
+    if matches!(reply.status, 202 | 404) {
+        return Ok(None);
+    }
+    let payload = client::accepted(reply, "设备授权")?;
+    let data = client::unwrap_data(&payload);
+    for (key, expected) in [
+        ("nonce", nonce),
+        ("code_challenge", value["challenge"].as_str().unwrap_or("")),
+        ("code_challenge_method", "S256"),
+    ] {
+        if data
+            .get(key)
+            .is_some_and(|returned| returned.as_str() != Some(expected))
+        {
+            return Err(Error::http(409, "千问办公返回的授权结果不属于本次设备流程")
+                .with_code("identity_changed"));
+        }
+    }
+    credentials::owner(data)?;
+    let access = util::secret(data, &["token", "device_token", "deviceToken"])?;
+    let refresh = util::secret(data, &["refresh_token", "refreshToken"])?;
+    if access.is_empty() {
+        // 部分授权服务用200空对象表示仍等待，不把它误记为登录失败。
+        return Ok(None);
+    }
+    if access.contains('|') || refresh.contains('|') {
+        return Err(Error::http(502, "千问办公设备授权未返回有效凭据"));
+    }
+    let user = util::text(data, &["user_id", "uid", "userId"]);
+    let mut credentials = Credentials::parse(
+        &json!({ "provider": endpoints::PROVIDER, "mode": "global", "accessToken": access, "refreshToken": refresh,
+        "userId": user, "machineId": machine, "expiresAt": util::token_expiry(data, &access)? }),
+    )?;
+    if let Err(error) = auth::profile(&mut credentials) {
+        if credentials.user.is_empty()
+            || util::terminal(&error)
+            || error.code.as_deref() == Some("capability_not_verified")
+        {
+            return Err(if error.code.as_deref() == Some("qwenwork_transport") {
+                Error::http(502, "千问办公已返回设备凭据但未能确认用户身份，请重新授权")
+            } else {
+                error
+            });
+        }
+    }
+    credentials.complete()?;
+    Ok(Some(credentials))
 }
-
-/// 设备授权是轮询型：内嵌窗口拦下回调也没有东西可兑换，按错误回。
-pub fn callback() -> Result<Value> {
-    Err(Error::http(400, "千问办公 国际版的网页登录是设备授权型，不接受回调"))
+pub fn cancel(params: &Value) -> Result<Value> {
+    let flow = flow(params)?;
+    for _ in 0..3 {
+        let before = state::get(Scope::Login, KEY, 1)?;
+        if !before.value.is_null() && before.value["flow"] != flow {
+            return Err(changed());
+        }
+        if state::compare_exchange(Scope::Login, KEY, 1, before.revision, Value::Null, 1000)? {
+            return Ok(Value::Null);
+        }
+    }
+    Err(changed())
 }

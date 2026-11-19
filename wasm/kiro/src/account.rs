@@ -1,201 +1,253 @@
-//! Kiro 账号：添加（API key / 本机登录态 / 文件）、公开视图、去重身份。
-//!
-//! ── 三条添加路径 ────────────────────────────────────────────
-//! ```text
-//!   manual     粘贴 ksk_… 的 API key（可选账号名）
-//!   desktop    读宿主提供的本机登录态，只记来源、不落 token
-//!   file_text  kiro-auth-token.json（OAuth 凭证）或一整行 API key
-//! ```
-//!
-//! ── 为什么 API key 不探活 ───────────────────────────────────
-//! 它的 profile / 邮箱 / 套餐只有问上游才知道，但添加账号是本地操作：探活失败
-//! 不该让用户加不进账号。真正不可用的 key 会在第一次对话时得到明确的 401/403
-//! （native 的取舍，逐条照搬）。
+//! 手工 API key、文本 JSON、OAuth 导入与公开投影；本机引用绝不暗读盘。
+//! 原生 key/邮箱+渠道身份保持不变，缺邮箱旧空身份改为只在新导入时摘要兜底。
 
+use crate::{
+    credentials::{self, Credentials},
+    errors, util,
+};
 use agent2api_wasm_sdk::{json, Error, Result, Value};
 
-use super::credentials::{self, Credentials};
-use super::refresh;
-
-/// 从表单 / 文件内容里取一个非空字符串。
-fn pick(payload: &Value, keys: &[&str]) -> String {
-    for key in keys {
-        if let Some(value) = payload.get(*key).and_then(Value::as_str) {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                return trimmed.to_string();
-            }
-        }
-    }
-    String::new()
+pub fn identity(secret: &Value) -> Result<String> {
+    credentials::identity(&Credentials::parse(secret)?)
 }
-
-/// `account.normalize`。
-pub fn normalize(params: &Value) -> Result<Value> {
-    let source = &params["source"];
-    let kind = source["kind"].as_str().unwrap_or("");
-    let name = params["name"].as_str().unwrap_or("").to_string();
-    match kind {
-        "desktop" => {
-            let secret = read_local_secret()?;
-            Ok(normalized(secret, &name, true))
-        }
-        "manual" => {
-            // 动态登录方式把表单整包放进 `payload.inputs`；旧入口是平铺字段。
-            let payload = &source["payload"];
-            let fields = payload
-                .get("inputs")
-                .filter(|value| value.is_object())
-                .unwrap_or(payload);
-            add(fields, &name)
-        }
-        "file_text" => {
-            let content = source["content"].as_str().unwrap_or("").trim();
-            if content.starts_with('{') {
-                add_json(content, &name)
-            } else if content.is_empty() {
-                Err(Error::http(400, "文件是空的"))
-            } else {
-                add_key(&json!({ "apiKey": content }), &name)
-            }
-        }
-        "file_base64" => Err(Error::http(
-            400,
-            "Kiro 不支持导入二进制文件，请粘贴 API key 或导入本机登录态",
-        )),
-        _ => Err(Error::http(400, "Kiro 请使用本机导入、API key 或 kiro-auth-token.json")),
+pub fn view(secret: &Value) -> Result<Value> {
+    let c = Credentials::parse(secret)?;
+    let name = if !c.name.is_empty() {
+        c.name.clone()
+    } else if !c.account_id.is_empty() {
+        c.account_id.clone()
+    } else if c.api_key() {
+        "Kiro API".into()
+    } else {
+        "Kiro".into()
+    };
+    let mut value = json!({ "name": name, "accountId": c.account_id, "uid": c.uid,
+        "hasCredentials": !c.access.is_empty() || c.local(), "hasRefreshToken": !c.local() && !c.refresh.is_empty(),
+        "desktop": c.local(), "canSyncCredentials": c.local(), "canRefresh": c.refreshable(), "available": true });
+    if !c.plan.is_empty() {
+        value["plan"] = json!(c.plan);
     }
-}
-
-/// 读本机登录态并折成 secret（宿主回的是 secret 形态）。
-fn read_local_secret() -> Result<Value> {
-    let raw = refresh::read_local()?;
-    let credentials = Credentials::from_secret(&raw);
-    let mut secret = json!({
-        "method": credentials.method,
-        "source": credentials.source,
-        "region": credentials.region,
-        "loginProvider": credentials.login_provider,
-        "uid": credentials.uid,
+    if let Some(expires) = c.expires {
+        value["expiresAt"] = json!(expires);
+    }
+    if c.api_key() {
+        value["longLived"] = json!(true);
+    }
+    if c.local() {
+        value["hasRefreshToken"] = json!(false);
+        value["source"] = json!(c.source);
+    }
+    let mut value = errors::sanitize(&value, &c.secrets());
+    let tail = if c.access.chars().count() > 8 {
+        c.access
+            .chars()
+            .rev()
+            .take(4)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<String>()
+    } else {
+        String::new()
+    };
+    value["tokenTail"] = json!(if c.local() {
+        util::text(secret, &["tokenTail"])
+            .chars()
+            .take(4)
+            .collect::<String>()
+    } else if errors::redact(&tail, &c.secrets()) == tail {
+        tail
+    } else {
+        String::new()
     });
-    // 本机登录态的邮箱 / 套餐是读数，best-effort 补进账号名。
-    if let Ok(payload) = super::usage::fetch(&credentials) {
-        let email = payload.pointer("/userInfo/email").and_then(Value::as_str).unwrap_or("");
-        let title = payload
-            .pointer("/subscriptionInfo/subscriptionTitle")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        if !email.is_empty() {
-            secret["accountId"] = json!(email);
-        }
-        if !title.is_empty() {
-            secret["plan"] = json!(super::usage::plan_name(title));
-        }
-    }
-    Ok(secret)
+    Ok(value)
 }
-
-/// 表单：API key 或一整段 auth JSON。
-fn add(fields: &Value, name: &str) -> Result<Value> {
-    if let Some(raw) = fields
-        .get("credentialJson")
-        .or_else(|| fields.get("json"))
-        .and_then(Value::as_str)
-        .filter(|text| !text.trim().is_empty())
-    {
-        return add_json(raw, name);
-    }
-    add_key(fields, name)
-}
-
-/// 粘贴 API key。
-fn add_key(payload: &Value, name: &str) -> Result<Value> {
-    let key = pick(payload, &["apiKey", "accessToken", "token", "key"]);
-    if key.is_empty() {
-        return Err(Error::http(400, "请填写 Kiro API key（ksk_ 开头）"));
-    }
-    if key.len() > 8192 {
-        return Err(Error::http(400, "这份凭据异常地长，请确认只粘贴了 Kiro API key"));
-    }
-    let credentials = Credentials {
-        method: "apikey".into(),
-        access: key,
-        region: "us-east-1".into(),
-        ..Default::default()
-    };
-    let mut secret = json!({ "name": if name.is_empty() { "Kiro API" } else { name } });
-    credentials.write_into(&mut secret);
-    Ok(normalized(secret, "", false))
-}
-
-/// 导入 `kiro-auth-token.json` 形态的 OAuth 凭证。
-fn add_json(text: &str, name: &str) -> Result<Value> {
-    let value: Value = serde_json::from_str(text)
-        .map_err(|_| Error::http(400, "这不是有效的 JSON，请粘贴 kiro-auth-token.json 或 API key"))?;
-    let access = pick(&value, &["accessToken", "access", "token"]);
-    if access.is_empty() {
-        return Err(Error::http(400, "JSON 里没有 accessToken"));
-    }
-    let mut credentials = Credentials {
-        access,
-        refresh: pick(&value, &["refreshToken", "refresh"]),
-        expires: value.get("expiresAt").and_then(expiring_ms).unwrap_or(0),
-        region: {
-            let region = pick(&value, &["region"]);
-            if region.is_empty() {
-                "us-east-1".to_string()
+pub fn normalized(mut c: Credentials, name: Option<&str>) -> Result<Value> {
+    let name = name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if !c.name.is_empty() {
+                c.name.clone()
+            } else if !c.account_id.is_empty() {
+                if c.uid.is_empty() {
+                    c.account_id.clone()
+                } else {
+                    format!("{} ({})", c.account_id, c.uid)
+                }
+            } else if c.api_key() {
+                "Kiro API".into()
             } else {
-                region
+                "Kiro 账号".into()
             }
-        },
-        profile: pick(&value, &["profileArn", "profile"]),
-        client_id: pick(&value, &["clientId"]),
-        client_secret: pick(&value, &["clientSecret"]),
-        token_url: pick(&value, &["tokenURL", "tokenUrl", "tokenEndpoint", "token_endpoint"]),
-        method: "idc".into(),
-        login_provider: "enterprise".into(),
-        uid: "enterprise".into(),
-        ..Default::default()
+        });
+    c.name = errors::redact(&name, &c.secrets())
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(100)
+        .collect();
+    c.plan = errors::redact(&c.plan, &c.secrets())
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(200)
+        .collect();
+    c.pin_identity();
+    let secret = if c.local() {
+        json!({"source":c.source,"method":c.method,"accountId":c.account_id,"uid":c.uid,"name":c.name,"region":c.region,
+            "loginProvider":c.login_provider,"profileArn":c.profile,"plan":c.plan,"expires":c.expires,"tokenTail":c.access.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect::<String>(),
+            "hasRefreshToken":false, "desktopReadOnly":true,
+            "desktopFingerprint": util::hash(&c.access, 32)})
+    } else {
+        c.value()
     };
-    if credentials.refresh.is_empty() {
-        credentials.method = "social".into();
+    Ok(
+        json!({ "identity": credentials::identity(&c)?, "public": view(&secret)?, "secret": secret, "desktop": c.local() }),
+    )
+}
+fn own_provider(value: &Value) -> Result<()> {
+    if value
+        .get("provider")
+        .and_then(Value::as_str)
+        .is_some_and(|provider| provider != "kiro")
+    {
+        return Err(Error::http(400, "凭据所属提供商不是Kiro"));
     }
-    if credentials.client_id.is_empty() && credentials.method == "idc" {
-        credentials.method = "social".into();
+    Ok(())
+}
+fn from_text(text: &str) -> Result<Value> {
+    if text.len() > 128 * 1024 {
+        return Err(Error::http(400, "Kiro 凭据文本过大"));
     }
-    if !credentials.token_url.is_empty() && credentials.method == "idc" {
-        // 带自有 token 端点的只能按外部 IdP 走（宿主代打）。
-        credentials.method = "external-idp".into();
+    let text = text.trim();
+    if !text.starts_with('{') {
+        return Ok(json!({ "apiKey": text, "method": "apikey" }));
     }
-    let mut secret = json!({ "name": if name.is_empty() { "Kiro" } else { name } });
-    credentials.write_into(&mut secret);
-    Ok(normalized(secret, "", false))
+    let value: Value =
+        serde_json::from_str(text).map_err(|_| Error::http(400, "Kiro 凭据 JSON 格式无效"))?;
+    if !value.is_object() {
+        return Err(Error::http(400, "Kiro 凭据 JSON 必须为对象"));
+    }
+    if value.get("secret").is_some_and(Value::is_object) {
+        if value
+            .get("provider")
+            .and_then(Value::as_str)
+            .is_some_and(|provider| provider != "kiro")
+        {
+            return Err(Error::http(400, "凭据所属提供商不是 Kiro"));
+        }
+        return Ok(value["secret"].clone());
+    }
+    Ok(value)
+}
+fn input(params: &Value) -> Result<Value> {
+    let source = &params["source"];
+    match source["kind"].as_str() {
+        Some("desktop") => Err(credentials::local_unavailable()),
+        Some("file_text") => from_text(source["content"].as_str().unwrap_or("")),
+        Some("manual") => {
+            let payload = &source["payload"];
+            if let Some(text) = payload.as_str() {
+                return from_text(text);
+            }
+            if !payload.is_object() {
+                return Err(Error::http(400, "Kiro 凭据必须是对象或文本"));
+            }
+            if let Some(index) = payload.get("methodIndex") {
+                own_provider(payload)?;
+                let index = index
+                    .as_u64()
+                    .ok_or_else(|| Error::http(400, "Kiro 登录方式无效"))?;
+                if !matches!(index, 2 | 3) {
+                    return Err(Error::http(400, "请选择 API key 或凭据 JSON 导入"));
+                }
+                let fields = payload["inputs"]
+                    .as_object()
+                    .ok_or_else(|| Error::http(400, "Kiro 登录字段必须为对象"))?;
+                let allowed: &[&str] = if index == 2 {
+                    &["apiKey", "name"]
+                } else {
+                    &["credentialJson", "name"]
+                };
+                if fields
+                    .iter()
+                    .any(|(key, value)| !allowed.contains(&key.as_str()) || !value.is_string())
+                {
+                    return Err(Error::http(400, "Kiro 登录包含未申报字段"));
+                }
+                let mut value = if index == 3 {
+                    from_text(
+                        fields
+                            .get("credentialJson")
+                            .and_then(Value::as_str)
+                            .unwrap_or(""),
+                    )?
+                } else {
+                    Value::Object(fields.clone())
+                };
+                if let Some(name) = fields.get("name") {
+                    value["name"] = name.clone();
+                }
+                return Ok(value);
+            }
+            Ok(payload.clone())
+        }
+        _ => Err(Error::http(
+            400,
+            "Kiro 请使用 API key、凭据 JSON 或网页登录",
+        )),
+    }
+}
+pub fn normalize(params: &Value) -> Result<Value> {
+    if params["source"]["kind"] == "desktop" {
+        let mut credentials = crate::local::read()?;
+        let profile = crate::usage::fetch(&credentials)?;
+        credentials.account_id = crate::usage::verified_email(&profile, &credentials)?;
+        credentials.plan = crate::usage::plan_name(
+            profile["subscriptionInfo"]["subscriptionTitle"]
+                .as_str()
+                .unwrap_or(""),
+        );
+        normalized(credentials, params["name"].as_str())
+    } else {
+        normalize_manual(params)
+    }
 }
 
-/// `expiresAt` 的两种形态：数字毫秒或 RFC3339 字符串。
-fn expiring_ms(value: &Value) -> Option<i64> {
-    if let Some(millis) = value.as_i64().filter(|value| *value > 0) {
-        return Some(if millis < 100_000_000_000 { millis.saturating_mul(1000) } else { millis });
+fn normalize_manual(params: &Value) -> Result<Value> {
+    let mut value = input(params)?;
+    if value.get("secret").is_some_and(Value::is_object) {
+        own_provider(&value)?;
+        value = value["secret"].clone();
     }
-    let text = value.as_str()?;
-    chrono::DateTime::parse_from_rfc3339(text).ok().map(|date| date.timestamp_millis())
-}
-
-/// 组装一条可落库的账号。
-fn normalized(secret: Value, name: &str, desktop: bool) -> Value {
-    let mut secret = secret;
-    if !name.trim().is_empty() {
-        secret["name"] = json!(name.trim().chars().take(128).collect::<String>());
+    for key in ["apiKey", "accessToken", "access", "token", "key"] {
+        if let Some(text) = value[key]
+            .as_str()
+            .filter(|text| text.trim_start().starts_with('{'))
+        {
+            own_provider(&value)?;
+            if value
+                .get("source")
+                .and_then(Value::as_str)
+                .is_some_and(|source| !source.is_empty())
+            {
+                return Err(credentials::local_unavailable());
+            }
+            let mut parsed = from_text(text)?;
+            if let Some(name) = value.get("name") {
+                parsed["name"] = name.clone();
+            }
+            value = parsed;
+            break;
+        }
     }
-    json!({
-        "identity": credentials::identity(&secret),
-        "public": credentials::public(&secret),
-        "secret": secret,
-        "desktop": desktop,
-    })
-}
-
-/// `account.view`。
-pub fn view(secret: &Value) -> Value {
-    credentials::public(secret)
+    let c = Credentials::parse(&value)?;
+    if c.local() {
+        return Err(Error::http(
+            400,
+            "本机引用请通过导入本机登录态入口添加，不接受手工声明本机来源",
+        ));
+    }
+    let name = util::text(params, &["name"]);
+    normalized(c, (!name.is_empty()).then_some(name.as_str()))
 }

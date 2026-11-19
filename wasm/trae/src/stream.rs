@@ -1,514 +1,585 @@
-//! 上游 SOLO SSE → OpenAI 形状的转换。
-//!
-//! ── 这条流上有三件事必须先想清楚再写代码 ──────────────────
-//! 1. **上游不发 `[DONE]`**。结束帧是 `event: done`，`[DONE]` 是这里补的；
-//!    上游中途断掉（没有 done）也要补，否则客户端永远等在最后一片上。
-//! 2. **业务错误藏在 200 的流里**（`event: error`）。它不是 chunk，
-//!    而是一条 `event: error` + 之后的 `[DONE]`；分类见 `errors.rs`。
-//! 3. `token_usage` 随下一帧发送；EOF 或传输失败时仍须冲刷已收到的用量。
-//!
-//! 帧的**键顺序**不是契约（Go 的 map 序列化按 key 排序，serde 按插入顺序），
-//! 所以对拍比的是解析后的 JSON；`id` 与 `created` 每次运行都不同。
+//! Trae output/token_usage/done → 标准Chat SSE。usage仅投影已给字段，不估算零值。
+//! 首有效输出前不发head；开始后错误不重放。error后只收真实usage，done/EOF均不改成功。
 
-use agent2api_wasm_sdk::{json, Value};
+use super::{errors, events::Event, util};
+use agent2api_wasm_sdk::{self as sdk, json, Error, Result, Value};
 
-use super::errors::{error_event_fields, stream_error_kind, ErrorKind};
-
-/// 上游流里的一行（不含行尾换行）。切行要跨 chunk 累积：一帧被切在 chunk
-/// 边界上是本文件最难查的一类 bug（症状是"偶尔少开头几个字"）。
-#[derive(Default)]
-pub struct ByteLines {
-    buffer: Vec<u8>,
-}
-
-impl ByteLines {
-    pub fn push(&mut self, bytes: &[u8]) -> Vec<String> {
-        let mut lines = Vec::new();
-        for byte in bytes {
-            if *byte == b'\n' {
-                let line = std::mem::take(&mut self.buffer);
-                lines.push(String::from_utf8_lossy(&line).into_owned());
-            } else if self.buffer.len() < 1024 * 1024 {
-                self.buffer.push(*byte);
-            }
-        }
-        lines
-    }
-
-    pub fn finish(&mut self) -> Option<String> {
-        if self.buffer.is_empty() {
-            return None;
-        }
-        let line = std::mem::take(&mut self.buffer);
-        Some(String::from_utf8_lossy(&line).into_owned())
-    }
-}
-
-/// 一条已解析的上游事件。`metadata` / `timing_cost` / `extra_info` / 未知名
-/// 都归到 `Other`：当前实现**不处理**它们（这是参考实现的既有行为）。
-#[derive(Clone, Debug, PartialEq)]
-pub enum SoloEvent {
-    Output { response: String, reasoning: String, tool_calls: Option<Value> },
-    TokenUsage(Value),
-    Done { finish_reason: String },
-    Error { code: i64, message: String },
-    Other,
-}
-
-/// 解析一条完整事件（`data` 是同一事件内多行 `data:` 累加后的结果）。
-/// JSON 不合法时返回 `None` —— 参考实现是"忽略这一帧"，不是"报错断流"。
-pub fn parse_solo_event(event: &str, data: &str) -> Option<SoloEvent> {
-    if data.trim().is_empty() || data.trim() == "[DONE]" {
-        return Some(match event {
-            "done" | "response_done" | "stream_done" => SoloEvent::Done { finish_reason: "stop".to_string() },
-            _ if data.trim() == "[DONE]" => SoloEvent::Done { finish_reason: "stop".to_string() },
-            _ => SoloEvent::Other,
-        });
-    }
-    let mut parsed: Value = serde_json::from_str(data).ok()?;
-    if let Some(inner) = parsed.as_str().and_then(|text| serde_json::from_str::<Value>(text).ok()) {
-        if inner.is_object() {
-            parsed = inner;
-        }
-    }
-    let event = if event.is_empty() {
-        parsed
-            .get("event")
-            .or_else(|| parsed.get("type"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-    } else {
-        event
-    };
-    let (code, message) = error_event_fields(&parsed);
-    if event == "error"
-        || parsed.get("error").is_some_and(|error| !error.is_null())
-        || (code != 0 && !message.is_empty() && !parsed.get("response").is_some_and(Value::is_string))
-    {
-        return Some(SoloEvent::Error { code, message });
-    }
-    Some(match event {
-        "" | "output" | "message" | "delta" | "content" | "text" | "answer" | "chunk" | "output_delta"
-        | "message_delta" => {
-            let empty = Value::Null;
-            let delta = parsed.get("delta").filter(|value| value.is_object()).unwrap_or(&empty);
-            let response = first_text(&[
-                parsed.get("response"),
-                parsed.get("content"),
-                delta.get("content"),
-                parsed.get("delta"),
-                parsed.get("text"),
-                parsed.get("message"),
-            ]);
-            let reasoning = first_text(&[
-                parsed.get("reasoning_content"),
-                parsed.get("reasoning"),
-                delta.get("reasoning_content"),
-                delta.get("reasoning"),
-            ]);
-            SoloEvent::Output {
-                response,
-                reasoning,
-                tool_calls: parsed
-                    .get("tool_calls")
-                    .or_else(|| delta.get("tool_calls"))
-                    .cloned()
-                    .filter(|value| !value.is_null()),
-            }
-        }
-        "token_usage" => SoloEvent::TokenUsage(parsed.get("usage").cloned().unwrap_or(parsed)),
-        "done" | "response_done" | "stream_done" => SoloEvent::Done { finish_reason: finish_reason(&parsed) },
-        _ => SoloEvent::Other,
-    })
-}
-
-fn first_text(values: &[Option<&Value>]) -> String {
-    values
-        .iter()
-        .filter_map(|value| value.and_then(Value::as_str))
-        .find(|text| !text.is_empty())
-        .unwrap_or_default()
-        .to_string()
-}
-
-fn finish_reason(value: &Value) -> String {
-    let reason = value
-        .get("finish_reason")
-        .or_else(|| value.get("stop_reason"))
-        .or_else(|| value.get("finishReason"))
-        .and_then(Value::as_str)
-        .unwrap_or("stop");
-    match reason {
-        "max_tokens" | "max_output_tokens" | "max_length" => "length",
-        "sensitive" => "content_filter",
-        "" => "stop",
-        other => other,
-    }
-    .to_string()
-}
-
-/// 一行一行的 SSE 状态机（跨行累积 `event:` 与多个 `data:`）。
-#[derive(Default, Debug)]
-pub struct SseScanner {
-    event: String,
-    data: String,
-}
-
-impl SseScanner {
-    /// 喂一行（不含行尾换行）。返回该行**触发**的事件；一行可以触发一个，
-    /// 也可以像大多数行那样返回 `None`（累积中）。
-    pub fn feed_line(&mut self, line: &str) -> Option<SoloEvent> {
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        if line.is_empty() {
-            if self.event.is_empty() && self.data.is_empty() {
-                self.reset();
-                return None;
-            }
-            let event = parse_solo_event(&self.event, &self.data);
-            self.reset();
-            return event;
-        }
-        if let Some(rest) = line.strip_prefix("event:") {
-            self.event = rest.trim().to_string();
-        } else if let Some(rest) = line.strip_prefix("data:") {
-            // 刻意不 trim：参考实现是**直接拼接**，多行 data 之间因此留下
-            // 一个空格（`{"response":` + ` "y"}`），拼出来才是合法 JSON。
-            self.data.push_str(rest);
-        }
-        // `:` 开头是注释行，忽略；其它前缀（含 `id:`）同样忽略。
-        None
-    }
-
-    pub fn finish(&mut self) -> Option<SoloEvent> {
-        let event = parse_solo_event(&self.event, &self.data);
-        self.reset();
-        event
-    }
-
-    fn reset(&mut self) {
-        self.event.clear();
-        self.data.clear();
-    }
-}
-
-/// 转换后的一帧出站内容。
-#[derive(Clone, Debug, PartialEq)]
-pub enum Frame {
-    /// 一个 OpenAI chunk（`data: {…}`）。
-    Chunk(Value),
-    /// 流内业务错误：一句转义后的文案（native 的 `render` 用它补一条
-    /// `{"error": …}` 事件，读的人自己判失败）。
-    Error { code: i64, message: String, kind: ErrorKind },
-    /// `data: [DONE]`
-    Done,
-}
-
-/// 流式转换器。
-pub struct SoloStream {
+pub struct Output {
     id: String,
+    model: String,
     created: i64,
-    scanner: SseScanner,
-    /// `token_usage` 读到后欠着，随下一帧一起发。
-    pending_usage: Option<Value>,
+    pub started: bool,
+    pub terminal: bool,
+    pub failure: Option<Error>,
+    usage: Option<Value>,
     reasoning: String,
     last_reasoning: String,
-    had_error: bool,
-    saw_output: bool,
-    tool_calls_seen: bool,
-    saw_done: bool,
-    completed: bool,
+    tools_seen: bool,
+    tool_calls: Vec<ToolCall>,
+    ended: bool,
 }
 
-impl SoloStream {
-    pub fn new(id: String, created: i64) -> Self {
-        Self {
-            id,
-            created,
-            scanner: SseScanner::default(),
-            pending_usage: None,
+#[derive(Default)]
+struct ToolCall {
+    id: String,
+    upstream_index: Option<u64>,
+    name: String,
+    arguments: String,
+}
+
+const MAX_TOOL_BUFFER: usize = 4 * 1024 * 1024;
+
+fn usage(value: &Value) -> Option<Value> {
+    let value = value
+        .get("usage")
+        .filter(|v| v.is_object())
+        .unwrap_or(value);
+    let mut out = json!({});
+    for key in [
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "input_tokens",
+        "output_tokens",
+        "promptTokens",
+        "completionTokens",
+        "totalTokens",
+        "inputTokens",
+        "outputTokens",
+        "reasoning_tokens",
+        "cached_tokens",
+        "cache_read_input_tokens",
+        "cacheReadInputTokens",
+        "cache_creation_input_tokens",
+        "cacheCreationInputTokens",
+        "prompt_cache_hit_tokens",
+    ] {
+        if let Some(v) = util::integer(&value[key]).filter(|v| *v >= 0) {
+            out[key] = json!(v);
+        }
+    }
+    for key in [
+        "prompt_tokens_details",
+        "completion_tokens_details",
+        "input_tokens_details",
+        "output_tokens_details",
+    ] {
+        let mut details = json!({});
+        for field in [
+            "cached_tokens",
+            "cache_write_tokens",
+            "reasoning_tokens",
+            "audio_tokens",
+            "accepted_prediction_tokens",
+            "rejected_prediction_tokens",
+        ] {
+            if let Some(v) = value
+                .get(key)
+                .and_then(|d| d.get(field))
+                .and_then(util::integer)
+                .filter(|v| *v >= 0)
+            {
+                details[field] = json!(v);
+            }
+        }
+        if details.as_object().is_some_and(|d| !d.is_empty()) {
+            out[key] = details;
+        }
+    }
+    for (target, aliases) in [
+        (
+            "prompt_tokens",
+            &[
+                "prompt_tokens",
+                "input_tokens",
+                "promptTokens",
+                "inputTokens",
+            ][..],
+        ),
+        (
+            "completion_tokens",
+            &[
+                "completion_tokens",
+                "output_tokens",
+                "completionTokens",
+                "outputTokens",
+            ][..],
+        ),
+        ("total_tokens", &["total_tokens", "totalTokens"][..]),
+        (
+            "cache_read_input_tokens",
+            &["cache_read_input_tokens", "cacheReadInputTokens"][..],
+        ),
+        (
+            "cache_creation_input_tokens",
+            &["cache_creation_input_tokens", "cacheCreationInputTokens"][..],
+        ),
+    ] {
+        let mut zero = None;
+        let count = aliases
+            .iter()
+            .filter_map(|key| util::integer(&value[*key]))
+            .filter(|n| *n >= 0)
+            .find(|n| {
+                if *n == 0 {
+                    zero = Some(0);
+                    false
+                } else {
+                    true
+                }
+            })
+            .or(zero);
+        if let Some(count) = count {
+            out[target] = json!(count);
+        }
+    }
+    if let Some(thought) = util::integer(&value["reasoning_tokens"]).filter(|n| *n >= 0) {
+        if !out["completion_tokens_details"].is_object() {
+            out["completion_tokens_details"] = json!({});
+        }
+        if out["completion_tokens_details"]["reasoning_tokens"].is_null() {
+            out["completion_tokens_details"]["reasoning_tokens"] = json!(thought);
+        }
+    }
+    let read = [
+        out.pointer("/prompt_tokens_details/cached_tokens"),
+        out.pointer("/input_tokens_details/cached_tokens"),
+        out.get("cached_tokens"),
+        out.get("prompt_cache_hit_tokens"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(util::integer)
+    .filter(|n| *n >= 0)
+    .max();
+    if let Some(read) = read {
+        if !out["prompt_tokens_details"].is_object() {
+            out["prompt_tokens_details"] = json!({});
+        }
+        out["prompt_tokens_details"]["cached_tokens"] = json!(read);
+    }
+    if let Some((prompt, completion)) = out["prompt_tokens"]
+        .as_i64()
+        .zip(out["completion_tokens"].as_i64())
+    {
+        out["total_tokens"] = json!(out["total_tokens"]
+            .as_i64()
+            .unwrap_or(0)
+            .max(prompt.saturating_add(completion)));
+    }
+    let known = [
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "cached_tokens",
+        "prompt_cache_hit_tokens",
+    ]
+    .iter()
+    .any(|key| out.get(*key).is_some())
+        || out
+            .pointer("/prompt_tokens_details/cached_tokens")
+            .is_some()
+        || out.pointer("/input_tokens_details/cached_tokens").is_some()
+        || out
+            .pointer("/prompt_tokens_details/cache_write_tokens")
+            .is_some();
+    if !known && out.as_object().is_some_and(|fields| !fields.is_empty()) {
+        out["magpie_cache_unknown"] = json!(true);
+    }
+    out.as_object()
+        .filter(|v| !v.is_empty())
+        .map(|_| out.clone())
+}
+
+fn merge_usage(previous: Option<Value>, incoming: Value) -> Value {
+    let mut previous = previous.unwrap_or_else(|| json!({}));
+    if incoming.get("prompt_tokens").is_some() || incoming.get("completion_tokens").is_some() {
+        previous
+            .as_object_mut()
+            .map(|fields| fields.remove("total_tokens"));
+    }
+    let names_cache = incoming.get("cache_read_input_tokens").is_some()
+        || incoming.get("cache_creation_input_tokens").is_some()
+        || incoming.get("cached_tokens").is_some()
+        || incoming.get("prompt_cache_hit_tokens").is_some()
+        || incoming
+            .pointer("/prompt_tokens_details/cached_tokens")
+            .is_some()
+        || incoming
+            .pointer("/input_tokens_details/cached_tokens")
+            .is_some();
+    if names_cache {
+        previous
+            .as_object_mut()
+            .map(|fields| fields.remove("magpie_cache_unknown"));
+    }
+    for (key, value) in incoming.as_object().into_iter().flatten() {
+        if value.is_object() {
+            if !previous[key].is_object() {
+                previous[key] = json!({});
+            }
+            for (field, value) in value.as_object().into_iter().flatten() {
+                previous[key][field] = value.clone();
+            }
+        } else {
+            previous[key] = value.clone();
+        }
+    }
+    if let Some((prompt, completion)) = previous["prompt_tokens"]
+        .as_i64()
+        .zip(previous["completion_tokens"].as_i64())
+    {
+        previous["total_tokens"] = json!(previous["total_tokens"]
+            .as_i64()
+            .unwrap_or(0)
+            .max(prompt.saturating_add(completion)));
+    }
+    // 末帧明确上报的零覆盖旧读数；没有上报的项仍保留，不能估算成零。
+    previous
+}
+
+fn complete_arguments(value: &str) -> bool {
+    !value.is_empty() && serde_json::from_str::<Value>(value).is_ok()
+}
+
+fn merge_piece(current: &mut String, incoming: &str) -> Result<()> {
+    if incoming.is_empty() || current == incoming || current.starts_with(incoming) {
+        return Ok(());
+    }
+    if incoming.starts_with(current.as_str()) {
+        *current = incoming.into();
+    } else if complete_arguments(incoming) && !complete_arguments(&(current.clone() + incoming)) {
+        *current = incoming.into();
+    } else {
+        if current.len().saturating_add(incoming.len()) > MAX_TOOL_BUFFER {
+            return Err(Error::http(502, "Trae 工具参数超过受控缓冲大小"));
+        }
+        current.push_str(incoming);
+    }
+    Ok(())
+}
+
+impl Output {
+    pub fn new(model: &str) -> Result<Self> {
+        Ok(Self {
+            id: format!("chatcmpl-{}", util::random_hex(16)?),
+            model: model.into(),
+            created: util::now()? / 1000,
+            started: false,
+            terminal: false,
+            failure: None,
+            usage: None,
             reasoning: String::new(),
             last_reasoning: String::new(),
-            had_error: false,
-            saw_output: false,
-            tool_calls_seen: false,
-            saw_done: false,
-            completed: false,
-        }
+            tools_seen: false,
+            tool_calls: Vec::new(),
+            ended: false,
+        })
     }
 
-    /// 喂一行，返回该行产生的帧。
-    pub fn feed_line(&mut self, line: &str) -> Vec<Frame> {
-        if self.completed {
-            return Vec::new();
+    fn head(&mut self) -> Result<()> {
+        if !self.started {
+            sdk::stream_head(200)?;
+            self.started = true;
         }
-        let Some(event) = self.scanner.feed_line(line) else {
-            return Vec::new();
+        Ok(())
+    }
+
+    fn frame(&mut self, delta: Value, finish: Option<&str>, only_usage: bool) -> Result<()> {
+        let choices = if only_usage {
+            json!([])
+        } else {
+            json!([{ "index": 0, "delta": delta, "finish_reason": finish }])
         };
-        self.apply(event)
-    }
-
-    fn apply(&mut self, event: SoloEvent) -> Vec<Frame> {
-        match event {
-            SoloEvent::Output { response, reasoning, tool_calls } => {
-                if self.had_error {
-                    return Vec::new();
-                }
-                let mut delta = serde_json::Map::new();
-                if !response.is_empty() {
-                    delta.insert("content".to_string(), json!(response));
-                }
-                let reasoning = self.reasoning_delta(reasoning);
-                if !reasoning.is_empty() {
-                    delta.insert("reasoning_content".to_string(), json!(reasoning));
-                }
-                if let Some(calls) = tool_calls {
-                    let calls = normalize_stream_tool_calls(calls);
-                    if calls.as_array().is_some_and(|calls| !calls.is_empty()) {
-                        self.tool_calls_seen = true;
-                        delta.insert("tool_calls".to_string(), calls);
-                    }
-                }
-                if delta.is_empty() {
-                    return Vec::new();
-                }
-                self.saw_output = true;
-                vec![self.chunk(Value::Object(delta), None)]
-            }
-            SoloEvent::TokenUsage(usage) => {
-                self.pending_usage = Some(usage);
-                Vec::new()
-            }
-            SoloEvent::Done { finish_reason } => {
-                self.completed = true;
-                let sent = self.saw_done;
-                self.saw_done = true;
-                let finish = if finish_reason == "stop" && self.tool_calls_seen {
-                    "tool_calls".to_string()
-                } else {
-                    finish_reason
-                };
-                let mut frames = if self.had_error {
-                    if self.pending_usage.is_some() {
-                        vec![self.chunk(json!({}), None)]
-                    } else {
-                        Vec::new()
-                    }
-                } else {
-                    vec![self.chunk(json!({}), Some(finish))]
-                };
-                if !sent {
-                    frames.push(Frame::Done);
-                }
-                frames
-            }
-            SoloEvent::Error { code, message } => {
-                self.had_error = true;
-                let kind = stream_error_kind(code, &message);
-                // error 后仍读取可能到来的用量；只有完整 done 事件结束读取。
-                vec![Frame::Error { code, message, kind }]
-            }
-            SoloEvent::Other => Vec::new(),
+        let mut frame = json!({ "id": self.id, "object": "chat.completion.chunk", "created": self.created,
+            "model": self.model, "choices": choices });
+        if let Some(usage) = self.usage.take() {
+            frame["usage"] = usage;
         }
+        self.head()?;
+        sdk::stream_event(&frame)
     }
 
-    fn reasoning_delta(&mut self, incoming: String) -> String {
-        let duplicate = (incoming == self.last_reasoning && incoming.chars().count() >= 8)
-            || (self.reasoning.chars().count() >= 16
+    fn reasoning(&mut self, incoming: String) -> Result<String> {
+        if self.reasoning.len().saturating_add(incoming.len()) > 8 * 1024 * 1024 {
+            return Err(Error::http(502, "Trae 思考流超过受控缓冲大小"));
+        }
+        let duplicate = incoming == self.last_reasoning && incoming.chars().count() >= 8
+            || self.reasoning.chars().count() >= 16
                 && incoming.chars().count() >= 16
-                && self.reasoning.ends_with(&incoming));
+                && self.reasoning.ends_with(&incoming);
         self.last_reasoning = incoming.clone();
         if duplicate {
-            return String::new();
+            return Ok(String::new());
         }
         let delta = if self.reasoning.chars().count() >= 16 {
-            incoming.strip_prefix(&self.reasoning).unwrap_or(&incoming).to_string()
+            incoming
+                .strip_prefix(&self.reasoning)
+                .unwrap_or(&incoming)
+                .to_string()
         } else {
             incoming
         };
         self.reasoning.push_str(&delta);
-        delta
+        Ok(delta)
     }
 
-    pub fn completed(&self) -> bool {
-        self.completed
+    pub fn fail(&mut self, error: Error) -> Result<()> {
+        if self.failure.is_none() {
+            if self.started {
+                sdk::stream_event(&errors::stream(&error))?;
+            }
+            self.failure = Some(error);
+        }
+        Ok(())
     }
 
-    /// 补发的 [DONE] 只供客户端收尾，不代表上游正常结束；判定前须冲刷尾事件。
-    pub fn missing_terminal(&self) -> bool {
-        self.saw_output && !self.completed && !self.had_error
-    }
-
-    pub fn flush_pending(&mut self) -> Vec<Frame> {
-        let mut frames = match self.scanner.finish() {
-            Some(event) => self.apply(event),
-            None => Vec::new(),
+    fn observe_tools(&mut self, value: Value) -> Result<()> {
+        let calls = match value {
+            Value::Array(calls) => calls,
+            Value::Object(_) => vec![value],
+            _ => return Err(Error::http(502, "Trae 工具调用片段格式无效")),
         };
-        if self.pending_usage.is_some() {
-            frames.push(self.chunk(json!({}), None));
+        if calls.len() > 512 {
+            return Err(Error::http(502, "Trae 工具数量超过限制"));
         }
-        frames
+        for call in calls {
+            if !call.is_object() {
+                return Err(Error::http(502, "Trae 工具调用片段不是对象"));
+            }
+            let function = call
+                .get("function_call")
+                .or_else(|| call.get("function"))
+                .unwrap_or(&call);
+            if !function.is_object() {
+                return Err(Error::http(502, "Trae 工具参数格式无效"));
+            }
+            let id = util::text(&call, &["id", "tool_call_id"]);
+            let name = util::text(function, &["name"]);
+            if id.len() > 1024
+                || name.len() > 512
+                || id.chars().chain(name.chars()).any(char::is_control)
+            {
+                return Err(Error::http(502, "Trae 工具名称或标识无效"));
+            }
+            let upstream_index = match call.get("index") {
+                None | Some(Value::Null) => None,
+                Some(value) => Some(
+                    value
+                        .as_u64()
+                        .filter(|index| *index <= 4096)
+                        .ok_or_else(|| Error::http(502, "Trae 工具索引无效"))?,
+                ),
+            };
+            let arguments = function
+                .get("arguments")
+                .or_else(|| function.get("args"))
+                .or_else(|| call.get("params"))
+                .or_else(|| call.get("input"))
+                .or_else(|| call.get("parameters"));
+            let arguments = match arguments {
+                None | Some(Value::Null) => String::new(),
+                Some(Value::String(text)) => text.clone(),
+                Some(value) => value.to_string(),
+            };
+            if arguments.len() > MAX_TOOL_BUFFER {
+                return Err(Error::http(502, "Trae 工具参数过长"));
+            }
+            let by_id = (!id.is_empty())
+                .then(|| self.tool_calls.iter().position(|old| old.id == id))
+                .flatten();
+            let by_index = upstream_index.and_then(|index| {
+                self.tool_calls
+                    .iter()
+                    .position(|old| old.upstream_index == Some(index))
+            });
+            if by_id.zip(by_index).is_some_and(|(id, index)| id != index) {
+                return Err(Error::http(502, "Trae 工具片段标识冲突"));
+            }
+            let index = by_id.or(by_index).or_else(|| {
+                if !id.is_empty() || upstream_index.is_some() {
+                    return None;
+                }
+                self.tool_calls.iter().rposition(|old| {
+                    (name.is_empty() || old.name == name) && !complete_arguments(&old.arguments)
+                })
+            });
+            let index = match index {
+                Some(index) => index,
+                None => {
+                    if name.is_empty() && id.is_empty() && upstream_index.is_none() {
+                        return Err(Error::http(502, "Trae 工具片段没有可确定的归属"));
+                    }
+                    if self.tool_calls.len() >= 512 {
+                        return Err(Error::http(502, "Trae 工具数量超过限制"));
+                    }
+                    self.tool_calls.push(ToolCall::default());
+                    self.tool_calls.len() - 1
+                }
+            };
+            let target = &mut self.tool_calls[index];
+            if !id.is_empty() {
+                if !target.id.is_empty() && target.id != id {
+                    return Err(Error::http(502, "Trae 工具ID已变化"));
+                }
+                target.id = id;
+            }
+            if let Some(index) = upstream_index {
+                if target.upstream_index.is_some_and(|old| old != index) {
+                    return Err(Error::http(502, "Trae 工具索引已变化"));
+                }
+                target.upstream_index = Some(index);
+            }
+            if !name.is_empty() {
+                if target.name.is_empty() || name.starts_with(target.name.as_str()) {
+                    target.name = name;
+                } else if !target.name.starts_with(&name) {
+                    target.name.push_str(&name);
+                }
+            }
+            merge_piece(&mut target.arguments, &arguments)?;
+            if self
+                .tool_calls
+                .iter()
+                .map(|call| call.arguments.len() + call.name.len() + call.id.len())
+                .sum::<usize>()
+                > MAX_TOOL_BUFFER
+            {
+                return Err(Error::http(502, "Trae 全部工具参数超过受控缓冲大小"));
+            }
+        }
+        Ok(())
     }
 
-    /// EOF 时保留已收到的尾数据与用量，结束标记只发一次。
-    pub fn finish(&mut self) -> Vec<Frame> {
-        let mut frames = self.flush_pending();
-        if !self.saw_done {
-            frames.push(Frame::Done);
+    fn flush_tools(&mut self) -> Result<()> {
+        let mut calls = Vec::new();
+        for (index, call) in self.tool_calls.iter_mut().enumerate() {
+            if call.name.is_empty() {
+                return Err(Error::http(502, "Trae 工具调用缺少名称"));
+            }
+            if call.arguments.is_empty() {
+                call.arguments = "{}".into();
+            }
+            if !complete_arguments(&call.arguments) {
+                return Err(Error::http(
+                    502,
+                    "Trae 工具参数在完成前被截断，未提交不完整调用",
+                ));
+            }
+            if call.id.is_empty() {
+                call.id = format!("call_{}", util::random_hex(12)?);
+            }
+            calls.push(json!({ "index": index, "id": call.id, "type": "function",
+                "function": { "name": call.name, "arguments": call.arguments } }));
         }
-        self.saw_done = true;
-        frames
+        if !calls.is_empty() {
+            self.tools_seen = true;
+            self.frame(json!({ "tool_calls": calls }), None, false)?;
+        }
+        Ok(())
     }
 
-    fn chunk(&mut self, delta: Value, finish_reason: Option<String>) -> Frame {
-        let mut choice = serde_json::Map::new();
-        choice.insert("index".to_string(), json!(0));
-        choice.insert("delta".to_string(), delta);
-        if let Some(reason) = finish_reason {
-            choice.insert("finish_reason".to_string(), json!(reason));
+    pub fn apply(&mut self, event: Event) -> Result<()> {
+        if self.terminal {
+            return Ok(());
         }
-        let mut chunk = serde_json::Map::new();
-        chunk.insert("id".to_string(), json!(self.id));
-        chunk.insert("object".to_string(), json!("chat.completion.chunk"));
-        chunk.insert("created".to_string(), json!(self.created));
-        // `model` 在这里留空：对外名字由 `forward::render` 改写成客户端请求的那个
-        // （上游帧里 `model` 恒为空串，参考实现如此）。
-        chunk.insert("model".to_string(), json!(""));
-        chunk.insert("choices".to_string(), Value::Array([Value::Object(choice)].to_vec()));
-        if let Some(usage) = self.pending_usage.take() {
-            chunk.insert("usage".to_string(), usage);
+        match event {
+            Event::Error(error) => self.fail(error)?,
+            Event::Other => {}
+            Event::Usage(value) => {
+                if let Some(value) = usage(&value) {
+                    self.usage = Some(merge_usage(self.usage.take(), value));
+                }
+            }
+            Event::Output {
+                text,
+                reasoning,
+                tools,
+            } if self.failure.is_none() => {
+                let mut delta = json!({});
+                if !text.is_empty() {
+                    delta["content"] = json!(text);
+                }
+                let reasoning = self.reasoning(reasoning)?;
+                if !reasoning.is_empty() {
+                    delta["reasoning_content"] = json!(reasoning);
+                }
+                if let Some(tools) = tools {
+                    self.observe_tools(tools)?;
+                }
+                if delta.as_object().is_some_and(|v| !v.is_empty()) {
+                    self.frame(delta, None, false)?;
+                }
+            }
+            Event::Output { .. } => {}
+            Event::Done {
+                reason,
+                usage: final_usage,
+            } => {
+                if let Some(value) = final_usage.as_ref().and_then(usage) {
+                    self.usage = Some(merge_usage(self.usage.take(), value));
+                }
+                self.terminal = true;
+                if matches!(reason.as_str(), "content_filter" | "safety") {
+                    self.fail(errors::upstream(
+                        403,
+                        &json!({ "providerCode": "trae_content_blocked" }),
+                    ))?;
+                } else if !matches!(
+                    reason.as_str(),
+                    "stop" | "tool_calls" | "function_call" | "length"
+                ) {
+                    self.fail(Error::http(502, "Trae 未给出可识别的结束原因"))?;
+                }
+                if self.failure.is_none() {
+                    if let Err(error) = self.flush_tools() {
+                        self.fail(error)?;
+                    }
+                }
+                if self.failure.is_none() && !self.started {
+                    self.fail(Error::http(502, "Trae 结束前没有返回有效回答"))?;
+                }
+                if self.failure.is_none() {
+                    let reason = if reason == "stop" && self.tools_seen {
+                        "tool_calls"
+                    } else {
+                        &reason
+                    };
+                    self.frame(json!({}), Some(reason), false)?;
+                } else if self.started && self.usage.is_some() {
+                    self.frame(json!({}), None, true)?;
+                }
+                if self.started {
+                    sdk::stream_bytes(b"data: [DONE]\n\n")?;
+                }
+            }
         }
-        Frame::Chunk(Value::Object(chunk))
-    }
-}
-
-/// 流式 tool_call 片段的字段整形：`function_call` → `function`，
-/// 并剥掉 SOLO 专属的 `namespace` / `partial_arguments`（上游带着它们）。
-fn normalize_stream_tool_calls(calls: Value) -> Value {
-    let Value::Array(list) = calls else {
-        return if calls.is_object() { Value::Array(vec![normalize_one_call(calls)]) } else { json!([]) };
-    };
-    Value::Array(list.into_iter().filter(|call| call.is_object()).map(normalize_one_call).collect())
-}
-
-fn normalize_one_call(call: Value) -> Value {
-    let Value::Object(mut call) = call else {
-        return call;
-    };
-    if let Some(function) = call.remove("function_call") {
-        call.insert("function".to_string(), strip_solo_only_fields(function));
-    } else if let Some(function) = call.get("function").cloned() {
-        call.insert("function".to_string(), strip_solo_only_fields(function));
-    }
-    Value::Object(call)
-}
-
-fn strip_solo_only_fields(function: Value) -> Value {
-    let Value::Object(mut function) = function else {
-        return function;
-    };
-    function.remove("namespace");
-    function.remove("partial_arguments");
-    Value::Object(function)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn feed(solo: &mut SoloStream, lines: &[&str]) -> Vec<Frame> {
-        let mut frames = Vec::new();
-        for line in lines {
-            frames.extend(solo.feed_line(line));
-        }
-        frames
-    }
-
-    #[test]
-    fn output_event_becomes_openai_chunk() {
-        let mut solo = SoloStream::new("chatcmpl-1".into(), 7);
-        let frames = feed(&mut solo, &["event: output", r#"data: {"response":"he"}"#, ""]);
-        assert_eq!(frames.len(), 1);
-        assert!(matches!(frames[0], Frame::Chunk(_)));
-        if let Frame::Chunk(chunk) = &frames[0] {
-            assert_eq!(chunk["choices"][0]["delta"]["content"], "he");
-            assert_eq!(chunk["object"], "chat.completion.chunk");
-            assert_eq!(chunk["model"], "");
-            assert!(chunk["choices"][0]["finish_reason"].is_null());
-        }
-    }
-
-    #[test]
-    fn multi_line_data_is_concatenated() {
-        // 上游按行切 JSON（`{"response":` + ` "y"}`），拼出来才是合法 JSON
-        let mut solo = SoloStream::new("chatcmpl-1".into(), 0);
-        let frames = feed(&mut solo, &["event: output", r#"data: {"response":"#, r#"data: "y"}"#, ""]);
-        assert!(matches!(frames[0], Frame::Chunk(_)));
-        if let Frame::Chunk(chunk) = &frames[0] {
-            assert_eq!(chunk["choices"][0]["delta"]["content"], "y");
-        }
+        Ok(())
     }
 
-    #[test]
-    fn usage_is_owed_to_the_next_frame() {
-        let mut solo = SoloStream::new("chatcmpl-1".into(), 0);
-        let frames = feed(&mut solo, &["event: token_usage", r#"data: {"usage":{"prompt_tokens":3}}"#, ""]);
-        assert!(frames.is_empty());
-        let frames = feed(&mut solo, &["event: done", r#"data: {"finish_reason":"stop"}"#, ""]);
-        assert_eq!(frames.len(), 2);
-        assert!(matches!(frames[0], Frame::Chunk(_)));
-        if let Frame::Chunk(chunk) = &frames[0] {
-            assert_eq!(chunk["usage"]["prompt_tokens"], 3);
-            assert_eq!(chunk["choices"][0]["finish_reason"], "stop");
-        }
-        assert_eq!(frames[1], Frame::Done);
-        assert!(solo.completed());
+    pub fn observed_tools(&self) -> bool {
+        !self.tool_calls.is_empty()
     }
 
-    #[test]
-    fn error_event_keeps_reading_and_skips_later_output() {
-        let mut solo = SoloStream::new("chatcmpl-1".into(), 0);
-        let frames = feed(&mut solo, &["event: error", r#"data: {"code":1005,"message":"quota"}"#, ""]);
-        assert!(matches!(frames[0], Frame::Error { .. }));
-        if let Frame::Error { code, message, kind } = &frames[0] {
-            assert_eq!(*code, 1005);
-            assert_eq!(message, "quota");
-            assert_eq!(*kind, ErrorKind::PlanLimit);
+    pub fn end(&mut self) -> Result<()> {
+        if self.ended {
+            return self.failure.clone().map_or(Ok(()), Err);
         }
-        // error 之后上游还会继续发帧：内容不再转出，但用量仍要收下
-        let frames = feed(&mut solo, &["event: output", r#"data: {"response":"x"}"#, ""]);
-        assert!(frames.is_empty());
-        let frames = feed(&mut solo, &["event: done", r#"data: {}"#, ""]);
-        assert_eq!(frames, vec![Frame::Done]);
-    }
-
-    #[test]
-    fn tool_calls_finish_reason() {
-        let mut solo = SoloStream::new("chatcmpl-1".into(), 0);
-        let frames = feed(&mut solo, &[
-            "event: output",
-            r#"data: {"tool_calls":[{"function_call":{"name":"f","arguments":"{}","namespace":"n"}}]}"#,
-            "",
-        ]);
-        assert!(matches!(frames[0], Frame::Chunk(_)));
-        if let Frame::Chunk(chunk) = &frames[0] {
-            assert_eq!(chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["name"], "f");
-            // SOLO 专属字段被剥掉
-            assert!(chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["namespace"].is_null());
+        self.ended = true;
+        if !self.terminal {
+            self.fail(
+                Error::http(502, "Trae 上游未给出完成事件即中断，回答可能不完整")
+                    .with_code("trae_missing_terminal"),
+            )?;
+            if self.started {
+                if self.usage.is_some() {
+                    self.frame(json!({}), None, true)?;
+                }
+                sdk::stream_bytes(b"data: [DONE]\n\n")?;
+            }
         }
-        let frames = feed(&mut solo, &["event: done", r#"data: {}"#, ""]);
-        assert!(matches!(frames[0], Frame::Chunk(_)));
-        if let Frame::Chunk(chunk) = &frames[0] {
-            // 见过 tool_calls 时 stop 要翻成 tool_calls
-            assert_eq!(chunk["choices"][0]["finish_reason"], "tool_calls");
+        match self.failure.clone() {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
-    }
-
-    #[test]
-    fn missing_terminal_only_when_output_seen() {
-        let mut solo = SoloStream::new("chatcmpl-1".into(), 0);
-        feed(&mut solo, &["event: output", r#"data: {"response":"x"}"#, ""]);
-        assert!(solo.missing_terminal());
-        let frames = solo.finish();
-        assert_eq!(frames.last(), Some(&Frame::Done));
     }
 }

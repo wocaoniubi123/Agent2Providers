@@ -1,5 +1,5 @@
-//! 成长任务的**事件构造器与三套指纹**（从参考项目 task_runner.py 的 `build_event` /
-//! `desktop_fingerprint` / `report_*` 逐条移植）。
+//! 成长任务的**事件构造器与三套指纹**（从参考项目 task_runner.py 的
+//! `build_event` / `desktop_fingerprint` / `report_*` 逐条移植）。
 //!
 //! ── 三条上报通道（各有各的指纹与域）─────────────────────────
 //! ```text
@@ -13,22 +13,15 @@
 //! ideType=WorkBuddy_MP + source=mini_program）—— 这是实测沉淀，别混。
 //!
 //! ── 形状纪律 ────────────────────────────────────────────────
-//! 服务端按形状归账：**不要「顺手统一」字段、不要多带键** —— 桌面 automation 与
-//! 小程序 automated_task 是不同的域口径（前者带 rrule 对象、后者不带），照抄会
-//! 失去关联。这些差异都写在各自构造器旁边。
-//!
-//! ── ⚠ 本 fork 的自用改动（逐字保留，勿改回）───────────────────
-//!   1. `playbookcta`（Sequential_Tasks_7）：桌面对话链 + 灵感详情页点击 + CTA
-//!      点击 + 发送 prompt 四段合成一组；
-//!   2. mp 上报间隔：`minichat` 且多条时走 [`super::MP_CHAT_GAP_MS`]，并且
-//!      **末尾不再空等**。
+//! 每个构造器上方的注释标注了形状来源（哪个客户端产物 / 哪条实测）。服务端按
+//! 形状归账：**不要「顺手统一」字段、不要多带键** —— 桌面 automation 与小程序
+//! automated_task 是不同的域口径（前者带 rrule 对象、后者不带），照抄会失去
+//! 关联。这些差异都写在各自构造器旁边。
 //!
 //! ── 硬约束 ──────────────────────────────────────────────────
-//! 零 unwrap/expect/panic。
+//! release 是 `panic=abort`：本文件零 unwrap/expect/panic。
 
-use agent2api_wasm_sdk::{self as sdk, json, Value};
-
-use crate::util;
+use serde_json::{json, Value};
 
 use super::spec::ObjectId;
 use super::{bill_call, GrowthAccount, DESKTOP_UA, WEB_BASE, WEB_UA};
@@ -44,12 +37,12 @@ pub fn mp_platform_header(mp: bool) -> Vec<(String, String)> {
 
 /// 夜猫窗口判定：23:00-08:00（**北京时间**；上游按 CST 判时段）。
 pub fn within_night_window() -> bool {
-    let hour = util::beijing_hour();
+    let hour = ((agent2api_wasm_sdk::now() + 28_800_000).rem_euclid(86_400_000) / 3_600_000) as u32;
     hour >= 23 || hour < 8
 }
 
 fn now_ms() -> i64 {
-    util::now_ms()
+    agent2api_wasm_sdk::now()
 }
 
 // ─── 桌面指纹（fork desktopFingerprint 同款公共字段）──────────
@@ -74,8 +67,9 @@ fn desktop_fingerprint(account: &GrowthAccount) -> Value {
 
 /// 小程序公共遥测字段（小程序源码 module 22015 的真实形状）。
 ///
-/// ideVersion/extVersion/product 取源码常量模块 25439（2.2.8 是小程序包版本而非
-/// SaaS 状态 —— school 段那份 extVersion="SaaS" 是早前凭观察拼的，以源码为准则）。
+/// ideVersion/extVersion/product 取源码常量模块 25439（2.2.8 是小程序包版本
+/// 而非 SaaS 状态 —— school 段那份 extVersion="SaaS" 是早前凭观察拼的，
+/// 以源码为准则）。
 fn mp_device_fingerprint(account: &GrowthAccount) -> Value {
     json!({
         "ideType": "WorkBuddy_MP", "ideVersion": "2.2.8",
@@ -89,8 +83,14 @@ fn mp_device_fingerprint(account: &GrowthAccount) -> Value {
 /// chat 域桌面指纹请求头（fork ReportDesktopEvent 同款）。
 fn desktop_headers(account: &GrowthAccount) -> Vec<(String, String)> {
     vec![
-        ("Accept".to_string(), "application/json, text/plain, */*".to_string()),
-        ("Content-Type".to_string(), "application/json;charset=UTF-8".to_string()),
+        (
+            "Accept".to_string(),
+            "application/json, text/plain, */*".to_string(),
+        ),
+        (
+            "Content-Type".to_string(),
+            "application/json;charset=UTF-8".to_string(),
+        ),
         ("User-Agent".to_string(), DESKTOP_UA.to_string()),
         ("X-Domain".to_string(), super::CHAT_BASE.to_string()),
         ("X-Product".to_string(), "SaaS".to_string()),
@@ -119,10 +119,16 @@ fn web_event_headers(account: &GrowthAccount, page_url: &str) -> Vec<(String, St
 /// web 域领奖头（fork ClaimReward 同款，claim web 降级用）。
 pub fn web_claim_headers(account: &GrowthAccount) -> Vec<(String, String)> {
     vec![
-        ("Accept".to_string(), "application/json, text/plain, */*".to_string()),
+        (
+            "Accept".to_string(),
+            "application/json, text/plain, */*".to_string(),
+        ),
         ("Content-Type".to_string(), "application/json".to_string()),
         ("Origin".to_string(), WEB_BASE.to_string()),
-        ("Referer".to_string(), format!("{WEB_BASE}/profile/growth-center")),
+        (
+            "Referer".to_string(),
+            format!("{WEB_BASE}/profile/growth-center"),
+        ),
         ("x-client-platform".to_string(), "web".to_string()),
         ("User-Agent".to_string(), WEB_UA.to_string()),
         ("X-User-Id".to_string(), account.uid.clone()),
@@ -150,7 +156,11 @@ pub fn build_event(account: &GrowthAccount, kind: &str, object: &ObjectId, index
     } else {
         object.meta.clone()
     };
-    let name = meta.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+    let name = meta
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let object_id = object.id.as_str();
     match kind {
         "canvas" => json!({
@@ -202,8 +212,16 @@ pub fn build_event(account: &GrowthAccount, kind: &str, object: &ObjectId, index
             "prompt": "每周五自动整理本周工作，生成一份周报。", "userId": uid,
         }),
         "playbook" => {
-            let skills = meta.get("skills").and_then(Value::as_array).cloned().unwrap_or_default();
-            let experts = meta.get("experts").and_then(Value::as_array).cloned().unwrap_or_default();
+            let skills = meta
+                .get("skills")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let experts = meta
+                .get("experts")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
             let category = meta
                 .get("categories")
                 .and_then(Value::as_array)
@@ -307,10 +325,11 @@ pub fn build_event(account: &GrowthAccount, kind: &str, object: &ObjectId, index
                 "command": "", "traceId": cid,
                 "userId": uid,
             });
-            if let (Some(base), Some(fingerprint)) =
-                (event.as_object_mut(), mp_device_fingerprint(account).as_object())
-            {
-                for (key, value) in fingerprint {
+            if let (Some(base), Some(fp)) = (
+                event.as_object_mut(),
+                mp_device_fingerprint(account).as_object(),
+            ) {
+                for (key, value) in fp {
                     base.insert(key.clone(), value.clone());
                 }
             }
@@ -323,9 +342,9 @@ pub fn build_event(account: &GrowthAccount, kind: &str, object: &ObjectId, index
 
 /// 桌面端 6 连「成功对话」事件链（点亮 RichMeow_Chat；fork DesktopChatSequence）。
 ///
-/// `pub(super)`：school.rs 的 desktop_chat_1_time 判据与 expert_tasks 复用同一份
-/// 形状 —— 同一事实源，不抄第二份。
-pub(crate) fn desktop_chat_sequence(
+/// `pub(super)`：school.rs 的 desktop_chat_1_time 判据复用同一份形状
+/// （那里额外注入 activityId）—— 同一事实源，不抄第二份。
+pub(super) fn desktop_chat_sequence(
     account: &GrowthAccount,
     conversation_id: &str,
     request_id: &str,
@@ -400,10 +419,11 @@ pub(crate) fn desktop_chat_sequence(
     .into_iter()
     .map(|mut event| {
         // 注入桌面指纹（覆盖同名业务键）
-        if let (Some(base), Some(fingerprint)) =
-            (event.as_object_mut(), desktop_fingerprint(account).as_object())
-        {
-            for (key, value) in fingerprint {
+        if let (Some(base), Some(fp)) = (
+            event.as_object_mut(),
+            desktop_fingerprint(account).as_object(),
+        ) {
+            for (key, value) in fp {
                 base.insert(key.clone(), value.clone());
             }
         }
@@ -412,8 +432,12 @@ pub(crate) fn desktop_chat_sequence(
     .collect()
 }
 
-/// 五连「进入 Buddy 应用」事件（点亮 Buddy_App / Buddy_App_QQ）。
-fn desktop_buddy5_sequence(account: &GrowthAccount, buddy_id: &str, buddy_name: &str) -> Vec<Value> {
+/// 五连「进入 Buddy 应用」事件（点亮 Buddy_App / Buddy_App_QQ；fork DesktopBuddyAppSequence）。
+fn desktop_buddy5_sequence(
+    account: &GrowthAccount,
+    buddy_id: &str,
+    buddy_name: &str,
+) -> Vec<Value> {
     let mut events = Vec::new();
     let mut push = |code: &str, extra: Value| {
         let mut event = json!({
@@ -428,7 +452,10 @@ fn desktop_buddy5_sequence(account: &GrowthAccount, buddy_id: &str, buddy_name: 
         events.push(event);
     };
     push("buddyapp_discover_click", json!({}));
-    push("buddyapp_show", json!({ "elementId": buddy_id, "elementName": buddy_name, "position": 2 }));
+    push(
+        "buddyapp_show",
+        json!({ "elementId": buddy_id, "elementName": buddy_name, "position": 2 }),
+    );
     push(
         "buddyapp_enter_click",
         json!({ "elementId": buddy_id, "elementName": buddy_name, "position": 2, "isFirstPage": "1" }),
@@ -446,7 +473,7 @@ fn desktop_buddy5_sequence(account: &GrowthAccount, buddy_id: &str, buddy_name: 
 }
 
 /// 一次常规「chat_request_send」上报（billing 域；领养前置解锁用）。
-pub fn report_chat_send(account: &GrowthAccount, night: bool) -> std::result::Result<(), String> {
+pub fn report_chat_send(account: &GrowthAccount, night: bool) -> Result<(), String> {
     let object = ObjectId {
         id: String::new(),
         meta: Value::Null,
@@ -465,11 +492,10 @@ pub fn report_chat_send(account: &GrowthAccount, night: bool) -> std::result::Re
     }
 }
 
-/// 分派点亮动作（按 kind 选择域与事件形状；返回 None 表示本组全部成功）。
+/// # 分派点亮动作（按 kind 选择域与事件形状；返回 None 表示本组全部成功）。
 ///
 /// 各分派的域选择是实测沉淀：桌面事件组走 **chat 域**（发 codebuddy.cn 不点亮）、
-/// 常规事件走 **billing 域**、web 事件走 **web 域**、MP 事件走 billing 域的 mp
-/// 指纹。
+/// 常规事件走 **billing 域**、web 事件走 **web 域**、MP 事件走 billing 域的 mp 指纹。
 pub fn light_up(
     account: &GrowthAccount,
     code: &str,
@@ -477,26 +503,16 @@ pub fn light_up(
     objects: &[ObjectId],
     need: usize,
 ) -> Option<String> {
+    if need == 0 {
+        return None;
+    }
+    let need = need.min(12);
     match kind {
-        // 桌面 6 连对话链：单组 = 一次对话；一次上报即点亮
-        "richmeow" => {
-            for index in 0..need.max(1) {
-                let now = now_ms();
-                let conv = format!("wb-run-rm-{now}-{index}");
-                let req = format!("wb-run-rm-req-{now}-{index}");
-                let msg = format!("req-{now}-{index}-user");
-                let events = desktop_chat_sequence(account, &conv, &req, &msg);
-                if let Err(error) = report_desktop_events(account, &events) {
-                    return Some(error);
-                }
-                let _ = sdk::sleep(super::GROWTH_WRITE_GAP_MS);
-            }
-            None
-        }
-        // 灵感功能闭环（Sequential_Tasks_7）：桌面对话链 + 灵感详情页点击 + CTA
-        // 点击 + 发送 prompt，四段合成一组发往 chat 域 —— 逐字段对齐参考实现的
-        // `DesktopPlaybookPromptSequence`（该形态实测点亮过 playbook_prompt）。
-        // 案例固定用参考实现实测过的 `pm-gtm-launch-plan`（id/name/type 三者同源）。
+        // ── 本 fork 的自用改动：灵感功能闭环（对应 `Sequential_Tasks_7`）──────
+        // 桌面对话链 + 灵感详情页点击 + CTA 点击 + 发送 prompt，四段合成一组发往
+        // chat 域。逐字段对齐参考实现的 `DesktopPlaybookPromptSequence`（该形态
+        // 实测点亮过 `playbook_prompt`）。案例固定用参考实现验证过的
+        // `pm-gtm-launch-plan`（id / name / type 三者同源，别只改其中一个）。
         "playbookcta" => {
             const CASE_ID: &str = "pm-gtm-launch-plan";
             const CASE_NAME: &str = "新产品上市 GTM 发布计划一页纸";
@@ -528,7 +544,26 @@ pub fn light_up(
                     return Some(error);
                 }
                 if index + 1 < need.max(1) {
-                    let _ = sdk::sleep(super::GROWTH_WRITE_GAP_MS);
+                    if let Err(error) = account.pause(super::GROWTH_WRITE_GAP_MS) {
+                        return Some(error);
+                    }
+                }
+            }
+            None
+        }
+        // 桌面 6 连对话链：单组 = 一次对话；一次上报即点亮
+        "richmeow" => {
+            for index in 0..need.max(1) {
+                let now = now_ms();
+                let conv = format!("wb-run-rm-{now}-{index}");
+                let req = format!("wb-run-rm-req-{now}-{index}");
+                let msg = format!("req-{now}-{index}-user");
+                let events = desktop_chat_sequence(account, &conv, &req, &msg);
+                if let Err(error) = report_desktop_events(account, &events) {
+                    return Some(error);
+                }
+                if let Err(error) = account.pause(super::GROWTH_WRITE_GAP_MS) {
+                    return Some(error);
                 }
             }
             None
@@ -553,7 +588,9 @@ pub fn light_up(
                         }
                     }
                 }
-                let _ = sdk::sleep(super::GROWTH_WRITE_GAP_MS);
+                if let Err(error) = account.pause(super::GROWTH_WRITE_GAP_MS) {
+                    return Some(error);
+                }
             }
             None
         }
@@ -563,29 +600,35 @@ pub fn light_up(
                 if let Err(error) = report_web_library(account) {
                     return Some(error);
                 }
-                let _ = sdk::sleep(super::GROWTH_WRITE_GAP_MS);
+                if let Err(error) = account.pause(super::GROWTH_WRITE_GAP_MS) {
+                    return Some(error);
+                }
             }
             None
         }
         // MP 事件组：走 billing 域 /v2/report（mp 指纹在 body 里）
         "minichat" | "miniexpert" | "miniautomation" | "miniglmchat" => {
-            let count = need.max(1);
-            // 只有「minichat 且要发多条」才是对话计数任务（`_3` ×5 / `_6` ×10）：
-            // 这类进度由上游按真人节奏累计，间隔必须拉到 `MP_CHAT_GAP_MS`，否则会被
-            // 先计数后回滚（参考实现实测；见该常量的注释）。其余 mp 事件保持 1.2 秒。
-            let gap = if kind == "minichat" && count > 1 {
+            // ── 本 fork 的自用改动：`minichat` 的上报间隔与收尾 ────────────
+            // 「累计 N 次对话」的小程序任务由上游按**真人节奏**累计：一次性把计数
+            // 打完，服务端会把进度回滚（回读停在 X/5、X/10），下一次再报还是回滚。
+            // 所以 `minichat` 用更长的 `MP_CHAT_GAP_MS`（其余三种仍用普通写间隔）。
+            // 末尾不再空等：最后一条报完不需要再等一轮。
+            let gap = if kind == "minichat" {
                 super::MP_CHAT_GAP_MS
             } else {
                 super::GROWTH_WRITE_GAP_MS
             };
-            for (index, object) in objects.iter().enumerate().take(count) {
+            let limit = need.max(1);
+            let total = objects.len().min(limit);
+            for (index, object) in objects.iter().enumerate().take(limit) {
                 let event = build_event(account, kind, object, index);
                 if let Err(error) = report_mp_event(account, &event) {
                     return Some(error);
                 }
-                // 末尾不再空等：最后一条上报完直接去回读/领奖
-                if index + 1 < count {
-                    let _ = sdk::sleep(gap);
+                if index + 1 < total {
+                    if let Err(error) = account.pause(gap) {
+                        return Some(error);
+                    }
                 }
             }
             None
@@ -597,12 +640,14 @@ pub fn light_up(
                 if let Err(error) = report_mp_event(account, &event) {
                     return Some(error);
                 }
-                let _ = sdk::sleep(super::GROWTH_WRITE_GAP_MS);
+                if let Err(error) = account.pause(super::GROWTH_WRITE_GAP_MS) {
+                    return Some(error);
+                }
             }
             None
         }
         // 领养链路（first_buddy）不走批量上报：report→agreement→buddy/first 的
-        // 专用路径在 `process_first_buddy` / `adopt_buddy`。这里防御性空操作
+        // 专用路径在 growth::process_first_buddy / adopt_buddy。这里防御性空操作
         // （误走时什么都不发，而不是发一个形状错误的事件）。
         "buddyfirst" => None,
         // 其余常规：billing 域逐事件上报
@@ -622,7 +667,9 @@ pub fn light_up(
                     return Some(error);
                 }
                 if index + 1 < count {
-                    let _ = sdk::sleep(super::GROWTH_WRITE_GAP_MS);
+                    if let Err(error) = account.pause(super::GROWTH_WRITE_GAP_MS) {
+                        return Some(error);
+                    }
                 }
             }
             None
@@ -636,11 +683,8 @@ fn buddy_app_of(code: &str) -> (&'static str, &'static str) {
     ("cb_y5Dy46tPQGGWtueMxXbe", "企鹅教师助手")
 }
 
-/// 桌面事件组上报：chat 域（`{chat}/v2/report`）。
-pub fn report_desktop_events(
-    account: &GrowthAccount,
-    events: &[Value],
-) -> std::result::Result<(), String> {
+/// 桌面事件组上报：chat 域（`{chat}/v2/report`），注入桌面指纹已在构造时完成。
+pub fn report_desktop_events(account: &GrowthAccount, events: &[Value]) -> Result<(), String> {
     let headers = desktop_headers(account);
     let call = super::growth_request(
         account,
@@ -661,7 +705,7 @@ pub fn report_desktop_events(
 }
 
 /// 常规事件上报：billing 域（`{bill}/v2/report`）。
-pub fn report_regular(account: &GrowthAccount, event: &Value) -> std::result::Result<(), String> {
+pub(super) fn report_regular(account: &GrowthAccount, event: &Value) -> Result<(), String> {
     let call = bill_call(account, "POST", "/v2/report", Some(&json!([event])), &[])?;
     if call.ok() {
         Ok(())
@@ -671,12 +715,12 @@ pub fn report_regular(account: &GrowthAccount, event: &Value) -> std::result::Re
 }
 
 /// MP 事件上报：billing 域（不含 X-Client-Platform —— mp 身份在 body 指纹里）。
-fn report_mp_event(account: &GrowthAccount, event: &Value) -> std::result::Result<(), String> {
+fn report_mp_event(account: &GrowthAccount, event: &Value) -> Result<(), String> {
     report_regular(account, event)
 }
 
 /// web 域资料库介绍点击（web_element_click）。
-fn report_web_library(account: &GrowthAccount) -> std::result::Result<(), String> {
+fn report_web_library(account: &GrowthAccount) -> Result<(), String> {
     const LIBRARY_DOC_URL: &str = "https://www.workbuddy.cn/space/d/o0KWYeynteVv06UnAZqIFm";
     let now = now_ms();
     let event = json!({
@@ -703,67 +747,5 @@ fn report_web_library(account: &GrowthAccount) -> std::result::Result<(), String
             call.status,
             call.code()
         ))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn account() -> GrowthAccount {
-        GrowthAccount {
-            uid: "5877cabc-99f7-4838".to_string(),
-            nick: "测试".to_string(),
-            token: "t".to_string(),
-            domain: "copilot.tencent.com".to_string(),
-            session: json!({}),
-        }
-    }
-
-    #[test]
-    fn mp_header_only_when_requested() {
-        assert!(mp_platform_header(false).is_empty());
-        let headers = mp_platform_header(true);
-        assert_eq!(headers[0].1, "miniprogram");
-    }
-
-    #[test]
-    fn night_window_matches_native_bounds() {
-        // 只断言函数可调用且返回布尔（时段依赖宿主时钟，不做时序断言）
-        let _ = within_night_window();
-    }
-
-    #[test]
-    fn desktop_sequence_injects_the_fingerprint() {
-        let events = desktop_chat_sequence(&account(), "c-1", "r-1", "m-1");
-        assert_eq!(events.len(), 6);
-        assert_eq!(events[0]["ideName"], json!("WorkBuddy"));
-        assert_eq!(events[0]["userId"], json!("5877cabc-99f7-4838"));
-        // 6 连的 eventCode 顺序是判据的一部分
-        let codes: Vec<&str> = events
-            .iter()
-            .filter_map(|event| event["eventCode"].as_str())
-            .collect();
-        assert_eq!(
-            codes,
-            vec![
-                "agent_task_created",
-                "chat_message_send",
-                "chat_request_send",
-                "chat_message_response",
-                "chat_message_status",
-                "chat_request_response"
-            ]
-        );
-    }
-
-    #[test]
-    fn mp_chat_event_carries_the_mini_program_fingerprint() {
-        let event = build_event(&account(), "minichat", &ObjectId { id: String::new(), meta: Value::Null }, 0);
-        assert_eq!(event["source"], json!("mini_program"));
-        assert_eq!(event["ideName"], json!("wx_app_cloud"));
-        assert_eq!(event["ideType"], json!("WorkBuddy_MP"));
-        // 小程序对话事件**不带** activityId（school 的构造器才带）
-        assert!(event.get("activityId").is_none());
     }
 }

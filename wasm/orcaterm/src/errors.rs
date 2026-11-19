@@ -1,82 +1,122 @@
-//! OrcaTerm 错误分类。
-//!
-//! ── 为什么这里恒 `fatal` ────────────────────────────────────
-//! 逐字沿用 native `mod.rs` 的决策：上游**没有 HTTP 429**（限额错误在流内
-//! `LLM_ERROR` 帧里），且配额按月重置 —— 做冷却记账的收益为负（冷却键是
-//! 账号级配额，误冷却一整个月比透传错误更糟）。所以网关那边换账号/冷却的
-//! 那一套对本家一律不启用，只把状态码与文案如实交出去。
-//!
-//! ── 契约要窄 ────────────────────────────────────────────────
-//! 网关的 `upstream::provider_loop` 只认识四档处置（限额换号 / 凭证刷新 /
-//! 内容拦截降级 / 终态透传），多发明一档会静默落进 Fatal，反而更难查。
+//! 四档错误由实际 HTTP / CGI 业务码判定，不把未知 LLM_ERROR 猜成月度额度耗尽。
 
-use agent2api_wasm_sdk::{json, Value};
+use agent2api_wasm_sdk::{json, Error, Value};
 
-/// 非 2xx 的分类（`classify`）。
-pub fn classify(status: u16, body: &Value) -> Value {
-    let message = body["message"]
-        .as_str()
-        .filter(|text| !text.is_empty())
-        .unwrap_or("上游错误")
-        .to_string();
-    json!({
-        "kind": "fatal",
-        "status": status,
-        "message": message,
-        "reset_at": Value::Null,
-        "upstream_code": Value::Null,
+fn description(body: &Value) -> &str {
+    [
+        "/message",
+        "/Message",
+        "/error/message",
+        "/Error/Message",
+        "/error",
+    ]
+    .iter()
+    .find_map(|path| {
+        body.pointer(path)
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
     })
+    .or_else(|| body.as_str())
+    .unwrap_or("OrcaTerm 上游错误")
 }
 
-/// 这个响应算不算错误（内容拦截判定的挂点）。
-///
-/// 本家没有「HTTP 200 里塞业务错误信封」的形态（流内错误由 `chat.rs` 在
-/// 首帧门与流内帧各自判掉），所以只按状态码回答。
-pub fn is_error_response(status: u16) -> bool {
-    status >= 400
+fn code(body: &Value) -> String {
+    ["/Error/Code", "/error/code", "/Code", "/code"]
+        .iter()
+        .find_map(|path| body.pointer(path).filter(|value| !value.is_null()))
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| value.to_string())
+        })
+        .unwrap_or_default()
+        .to_ascii_uppercase()
 }
 
-/// 是否停手（不再换账号）。
-///
-/// 本家没有「换账号也没用」的判据落在状态码上：额度是账号级月度配额，
-/// 凭证失效 401 正是要换账号/续期的场景。所以一律不停手。
-pub fn policy() -> Value {
-    json!({ "stop": false })
-}
-
-/// 流内错误帧的形态（与 native `sse::error_bytes` 逐字一致：
-/// `{"error":{"message":…,"type":"proxy_error"}}`）。
-///
-/// 客户端此时已经收到 200 与部分内容，唯一能告诉它「失败」的办法就是
-/// 在流里写一条错误帧。
-pub fn error_event(message: &str) -> Value {
-    json!({ "error": { "message": message, "type": "proxy_error" } })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn classify_is_always_fatal() {
-        let value = classify(500, &json!({ "message": "boom" }));
-        assert_eq!(value["kind"], json!("fatal"));
-        assert_eq!(value["message"], json!("boom"));
-        // 空 message 要有兜底文案，不能把空串塞给界面
-        assert_eq!(classify(502, &json!({}))["message"], json!("上游错误"));
+fn authentication(status: u16, body: &Value) -> bool {
+    if status >= 500 {
+        return false;
     }
+    let code = code(body);
+    let text = description(body).to_ascii_lowercase();
+    status == 401
+        || [
+            "TOKEN_EXPIRED",
+            "SESSION_EXPIRED",
+            "INVALID_REFRESH_TOKEN",
+            "PROVIDER_AUTH_EXPIRED",
+        ]
+        .contains(&code.as_str())
+        || text.contains("token")
+            && ["invalid", "expired", "失效", "过期"]
+                .iter()
+                .any(|part| text.contains(part))
+}
 
-    #[test]
-    fn error_frame_shape_matches_native() {
-        let value = error_event("断了");
-        assert_eq!(value["error"]["type"], json!("proxy_error"));
-        assert_eq!(value["error"]["message"], json!("断了"));
-    }
+pub fn classify(params: &Value) -> Value {
+    let status = params["status"]
+        .as_u64()
+        .and_then(|value| u16::try_from(value).ok())
+        .unwrap_or(502);
+    classified(status, &params["body"], &[])
+}
 
-    #[test]
-    fn only_http_errors_are_errors() {
-        assert!(!is_error_response(200));
-        assert!(is_error_response(400));
-        assert_eq!(policy()["stop"], json!(false));
+fn classified(status: u16, body: &Value, credentials: &[&str]) -> Value {
+    let message = message(description(body), credentials);
+    if authentication(status, body) {
+        return json!({ "kind": "token_expired", "message": message });
     }
+    if status == 429 {
+        return json!({ "kind": "quota_limited", "status": status, "message": message,
+            "upstream_code": body["code"].as_i64(), "reset_at": null });
+    }
+    json!({ "kind": "fatal", "status": if (400..600).contains(&status) { status } else { 502 },
+        "message": message, "upstream_code": body.get("Code").or_else(|| body.get("code")).and_then(Value::as_i64) })
+}
+
+pub fn business_failed(body: &Value) -> bool {
+    body.get("Error")
+        .or_else(|| body.get("error"))
+        .is_some_and(|error| !error.is_null())
+        || body
+            .get("Code")
+            .or_else(|| body.get("code"))
+            .is_some_and(|value| !value.is_null() && value != 0 && value != "0")
+}
+
+pub fn upstream(status: u16, body: &Value, credentials: &[&str]) -> Error {
+    let class = classified(status, body, credentials);
+    let status = if class["kind"] == "token_expired" {
+        401
+    } else {
+        class["status"].as_u64().unwrap_or(502) as u16
+    };
+    let mut error = Error::http(
+        status,
+        class["message"].as_str().unwrap_or("OrcaTerm 请求失败"),
+    )
+    .with_code("orcaterm_upstream");
+    error.upstream_code = class["upstream_code"].as_i64();
+    error
+}
+
+pub fn is_auth(error: &Error) -> bool {
+    error.status == Some(401)
+}
+
+pub fn message(raw: &str, credentials: &[&str]) -> String {
+    let mut redacted = raw.to_string();
+    for credential in credentials
+        .iter()
+        .filter(|credential| !credential.is_empty())
+    {
+        redacted = redacted.replace(credential, "[已隐藏]");
+    }
+    redacted.chars().take(1000).collect()
+}
+
+pub fn event(error: &Error) -> Value {
+    json!({ "error": { "message": error.message, "type": "proxy_error",
+        "status": error.status.unwrap_or(502), "code": error.code, "upstream_code": error.upstream_code } })
 }

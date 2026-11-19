@@ -1,371 +1,281 @@
-//! MonkeyCode 模型目录：`GET /api/v1/users/models` + 宿主会话缓存。
-//!
-//! ── 上游形态（`mvp/models.py::list_models` + `docs/03-llm/01-model-management-api.md`）──
-//! `{"code":0,"data":{"models":[{…}]}}`（也有 `{"models":[…]}` 的兼容形态）。
-//! 每个条目的关键字段（参考 `domain/model.go` 的 Model 实体）：
-//!   - `id`           模型 UUID（**创建任务时用的 `model_id`**，`task.rs` 反查它）；
-//!   - `provider`     提供商名（`siliconflow` / `openai` / …）；
-//!   - `model`        上游模型名（`gpt-4o` / `Qwen/Qwen3.5-Plus`）；
-//!   - `display_name` 展示名（可能为空）；
-//!   - `interface_type` `openai_chat` / `openai_responses` / `anthropic`；
-//!   - `context_limit` / `output_limit` 上下文与输出上限（可能为 0）；
-//!   - `is_free` / `is_default` / `access_level` 免费 / 默认 / 订阅档。
-//!
-//! 参考实现（`proxy/src/models.ts`）给下游的模型 id 是
-//! `monkeycode/{provider}/{model}` —— 本模块的目录 `id` 采用同一形态
-//! （`{provider}/{model}`，provider 为空时退化成 `model`），UUID 另存为
-//! `upstreamId`。`interface_type` 保留为目录元数据；云任务统一使用 OpenCode，
-//! 不能按接口类型选择执行器。目录中的 `cliName` 仅用于展示，不参与任务创建。
-//!
-//! ── 目录的 id 与「发什么给上游」是两回事 ────────────────────────
-//! 客户端请求的 `id` 是本目录的 `{provider}/{model}`；转发时必须反查
-//! `upstreamId`（UUID）作为建任务的 `model_id`，不能只保留展示字段。
-//!
-//! ── 缓存（迁移时改了：进程内 → 宿主会话存储）──────────────────
-//! native 是「进程内 `Mutex` + 网关 `catalog_cache` 落盘」。wasm 实例**一次调用
-//! 一个沙箱**，静态变量不跨请求，所以缓存改用 `sdk::session_*`（`sessions.v1`）：
-//! 键是全局的（不带账号），与 native 的进程级全局缓存同义。
-//! 另外多了一条**回落读取**：会话缓存为空时问一次 `catalog.get`（网关侧持久化的
-//! 模型目录快照），这样插件换了沙箱、网关重启后也不必先刷一次目录才能对话。
-//!
-//! ── 硬约束 ──────────────────────────────────────────────────
-//! release 是 `panic=abort`：本文件零 unwrap/expect/panic。
+//! 展示清单不是完整账号权限目录；catalog.accounts.v1 只用于同账号保存与聚合。
+//! 官方模型可能带 api_key/base_url，必须字段白名单投影。支持源码中的 is_hidden、
+//! 订阅内置档位判断，兼容显式 enable/enabled=false；未知权益不广告为可用。
+//! 来源：chaitin/MonkeyCode ad169c9... frontend/src/utils/common.tsx 与 Api.ts；
+//! {provider}/{model} -> UUID 沿本仓原生和 Apache 历史对照，绝不模糊回落另一模型。
 
-use agent2api_wasm_sdk::{self as sdk, json, Error, Result, Value};
+use std::collections::{BTreeMap, BTreeSet};
 
-use super::{client, credentials, endpoints, logging};
+use agent2api_wasm_sdk::{json, Error, Result, Value};
 
-/// 自动路径的缓存 TTL（与客户端自己的节奏同档）
-const TTL_MS: i64 = 10 * 60 * 1000;
+use crate::{endpoints::ReadEndpoint, errors, util};
 
-/// 会话缓存的键
-const CACHE_KEY: &str = "monkeycode:model-catalog";
+pub const MAX_ROWS: usize = 4096;
 
-/// 从上游条目里取字符串（trim 后非空才算有值）
-fn text_of(row: &Value, key: &str) -> String {
-    row.get(key)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or("")
-        .to_string()
-}
-
-/// 把一个上游模型条目映射成聚合层认的形态。
-///
-/// 键名对照 `core/models/shape.rs::list_item`：`id` / `name` /
-/// `maxInputTokens` / `maxOutputTokens` / `supportsImages` / `supportsVideo` /
-/// `supportsReasoning` / `supportsToolCall` / `isDefault`。另保留三个元数据键：
-/// `upstreamId`（UUID）、`cliName`、`interfaceType`。只有 `upstreamId` 参与转发。
-///
-/// 没有 `model` 字段的条目直接跳过（没有上游模型名就无法建任务）；
-/// `display_name` 空时用 `model` 兜底展示名。
-fn map_entry(row: &Value) -> Option<Value> {
-    let model_name = text_of(row, "model");
-    if model_name.is_empty() {
-        return None;
-    }
-    let provider = text_of(row, "provider");
-    // 目录 id：`{provider}/{model}`（provider 为空时退化成 `model`）—— 与参考
-    // 实现 `toOpenAIModelId` 同形态（去掉 `monkeycode/` 前缀，因为网关按 provider
-    // 区分归属）
-    let id = if provider.is_empty() {
-        model_name.clone()
-    } else {
-        format!("{provider}/{model_name}")
-    };
-    let display_name = text_of(row, "display_name");
-    let name = if display_name.is_empty() {
-        model_name.clone()
-    } else {
-        display_name
-    };
-    let mut item = serde_json::Map::new();
-    item.insert("id".to_string(), json!(id));
-    item.insert("name".to_string(), json!(name));
-    item.insert("provider".to_string(), json!(provider));
-    item.insert("model".to_string(), json!(model_name));
-    item.insert("upstreamId".to_string(), json!(text_of(row, "id")));
-    item.insert("interfaceType".to_string(), json!(text_of(row, "interface_type")));
-    item.insert("cliName".to_string(), json!(endpoints::TASK_CLI_NAME));
-    // 能力位：本家目录没有 capabilities 对象。工具调用是**上游 coding agent
-    // 网关**的固有能力（opencode / codex / claude 都走工具循环），给 true；
-    // 思考位如实取 `thinking_enabled`（创建模型时的字段，目录里可能缺失）；
-    // 图片位参考没给依据，保守 false。
-    item.insert("supportsToolCall".to_string(), Value::Bool(true));
-    item.insert("supportsImages".to_string(), Value::Bool(false));
-    item.insert("supportsVideo".to_string(), Value::Bool(false));
-    item.insert(
-        "supportsReasoning".to_string(),
-        Value::Bool(
-            row.get("thinking_enabled")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-        ),
-    );
-    item.insert(
-        "isDefault".to_string(),
-        Value::Bool(row.get("is_default").and_then(Value::as_bool).unwrap_or(false)),
-    );
-    // 免费 / 订阅档：非聚合层字段，但账号页与排障会看（保留原样）
-    if let Some(is_free) = row.get("is_free").and_then(Value::as_bool) {
-        item.insert("isFree".to_string(), Value::Bool(is_free));
-    }
-    let access_level = text_of(row, "access_level");
-    if !access_level.is_empty() {
-        item.insert("accessLevel".to_string(), json!(access_level));
-    }
-    for (key, target) in [
-        ("context_limit", "maxInputTokens"),
-        ("output_limit", "maxOutputTokens"),
-    ] {
-        if let Some(value) = row.get(key).and_then(Value::as_i64) {
-            if value > 0 {
-                item.insert(target.to_string(), Value::from(value));
+fn uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
             }
-        }
-    }
-    Some(Value::Object(item))
-}
-
-/// 解析 `/api/v1/users/models` 响应（`{code,data:{models:[]}}` 或 `{models:[]}`）
-pub fn parse_models(payload: &Value) -> Vec<Value> {
-    let data = payload.get("data").unwrap_or(payload);
-    let rows = data
-        .get("models")
-        .and_then(Value::as_array)
-        .or_else(|| data.as_array())
-        .cloned()
-        .unwrap_or_default();
-    rows.iter().filter_map(map_entry).collect()
-}
-
-/// 读会话缓存里的 `(models, fetched_at)`（读不到给空）。
-fn cached() -> (Vec<Value>, i64) {
-    let Ok(value) = sdk::session_get(CACHE_KEY) else {
-        return (Vec::new(), 0);
-    };
-    let models = value
-        .get("models")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|item| {
-            item.get("id")
-                .and_then(Value::as_str)
-                .is_some_and(|id| !id.trim().is_empty())
         })
-        .collect();
-    let fetched_at = value.get("fetched_at").and_then(Value::as_i64).unwrap_or(0);
-    (models, fetched_at)
+        && value
+            .bytes()
+            .any(|byte| matches!(byte, b'1'..=b'9' | b'a'..=b'f' | b'A'..=b'F'))
 }
 
-/// 写会话缓存（写失败不影响本次结果）。
-fn store(models: &[Value], fetched_at: i64) {
-    let _ = sdk::session_put(
-        CACHE_KEY,
-        json!({ "models": models, "fetched_at": fetched_at }),
-        TTL_MS * 2,
-    );
-}
-
-/// 网关侧持久化的目录快照（`catalog.get`，本包申报了 `catalog.v1`）。
-///
-/// 只是一条**回落**：会话缓存为空（新沙箱 / 网关刚重启）时读它，省掉「先刷一次
-/// 目录才能对话」这一轮。读不到就是空表，不报错。
-fn persisted() -> (Vec<Value>, i64) {
-    let Ok(value) = sdk::host("catalog.get", json!({})) else {
-        return (Vec::new(), 0);
-    };
-    let models = value
-        .get("models")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let fetched_at = value
-        .pointer("/meta/refreshed_at")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    (models, fetched_at)
-}
-
-/// 当前可用的模型清单（会话缓存 → 网关快照 → 空）。
-pub fn current() -> Vec<Value> {
-    let (models, _) = cached();
-    if !models.is_empty() {
-        return models;
+fn tier(value: &str) -> Option<u8> {
+    match value {
+        "basic" => Some(0),
+        "pro" => Some(1),
+        "ultra" | "flagship" => Some(2),
+        _ => None,
     }
-    persisted().0
 }
 
-/// 最近一次成功刷新的时刻（毫秒；没刷过为 0）—— 界面「更新日期」列读它。
-pub fn last_refreshed_at() -> i64 {
-    let (models, fetched_at) = cached();
-    if models.is_empty() {
-        persisted().1
+/// 只反映本次目录可见性与已知订阅门槛；不是上游任务授权保证。
+fn eligibility(row: &Value, subscription: Option<&Value>) -> (Option<bool>, &'static str) {
+    for key in ["enable", "enabled"] {
+        match row.get(key) {
+            Some(Value::Bool(false)) => return (Some(false), "upstream_disabled"),
+            Some(Value::Bool(true)) | None | Some(Value::Null) => {}
+            _ => return (None, "invalid_enable_field"),
+        }
+    }
+    // 官方 canUseModelBySubscription 只按内置套餐前缀判断；普通配置的
+    // access_level 是展示字段，不扩大为额外资格门而隐藏用户模型。
+    let model = util::text(row, &["model"]).to_ascii_lowercase();
+    let required: u8 = if model.starts_with("monkeycode-ultra") {
+        2
+    } else if model.starts_with("monkeycode-pro") {
+        1
     } else {
-        fetched_at
+        0
+    };
+    if required == 0 {
+        return (Some(true), "visible_without_known_subscription_gate");
     }
-}
-
-/// `models.list`：当前清单 + 来源标记。
-///
-/// 上游没有内置兜底清单：有内容就等于远程拉到过。
-pub fn list() -> Value {
-    let models = current();
-    json!({
-        "models": models,
-        "meta": {
-            "remote": !models.is_empty(),
-            "refreshed_at": last_refreshed_at(),
+    let Some(subscription) = subscription else {
+        return (None, "subscription_unavailable");
+    };
+    let plan = util::text(subscription, &["plan"]);
+    let Some(actual) = tier(plan) else {
+        return (None, "subscription_plan_unknown");
+    };
+    if !subscription["expires_at"].is_null() && subscription["expiresAt"].is_null() {
+        return (None, "subscription_expiry_unknown");
+    }
+    if let Some(expiry) = subscription["expiresAt"].as_i64() {
+        let Some(observed) = subscription["observedAt"].as_i64() else {
+            return (None, "subscription_time_unknown");
+        };
+        if expiry <= observed {
+            return (None, "subscription_expiry_requires_confirmation");
+        }
+    }
+    (
+        Some(actual >= required),
+        if actual >= required {
+            "subscription_matches"
+        } else {
+            "subscription_required"
         },
-    })
-}
-
-/// `models.refresh`：拉一次目录并落会话缓存。
-///
-/// ── 失败为什么不返回错误 ────────────────────────────────────
-/// 与 native 同一取舍：目录刷新失败时**保留现有清单**、把原因放进返回体
-/// （`catalog::failed`），编排层据此提示「已保留旧清单」，而不是让整个账号进入
-/// 错误态（模型清单过期不影响已有模型继续对话）。
-pub fn refresh(force: bool, account: &str) -> Result<Value> {
-    let count_now = current().len();
-    let credentials = match credentials::current() {
-        Ok(credentials) => credentials,
-        Err(_) => {
-            // 「一个账号都没有」不是失败 —— 那是「用户还没添加账号」的正常状态，
-            // 返回 unchanged（脚本 / CI 不该看到一个红色失败）。
-            if account.trim().is_empty() {
-                logging::verbose("[MonkeyCode] 模型目录刷新跳过：尚未添加账号");
-                return Ok(sdk::catalog::unchanged(count_now));
-            }
-            return Ok(sdk::catalog::failed("指定的账号不存在或不可用，请重新选择"));
-        }
-    };
-    if !force {
-        let (models, fetched_at) = cached();
-        if !models.is_empty() && sdk::now().saturating_sub(fetched_at) < TTL_MS {
-            return Ok(sdk::catalog::unchanged(models.len()));
-        }
-    }
-    let payload = match client::get_json(endpoints::MODELS_PATH, &credentials.session, "模型目录查询") {
-        Ok(payload) => payload,
-        Err(error) => return Ok(sdk::catalog::failed(&error.message)),
-    };
-    let models = parse_models(&payload);
-    if models.is_empty() {
-        return Ok(sdk::catalog::failed(
-            "MonkeyCode 模型目录为空或格式不认识（保留现有清单）",
-        ));
-    }
-    let count = models.len();
-    store(&models, sdk::now());
-    logging::verbose(&format!("[MonkeyCode] 模型目录已刷新：{count} 个"));
-    Ok(sdk::catalog::refreshed(models))
-}
-
-/// 建任务要用的目录字段（客户端请求的模型名 → 上游 UUID）。
-pub struct TaskTarget {
-    /// 上游模型 UUID（建任务的 `model_id`）
-    pub model_id: String,
-    /// 上游模型名（日志与报错文案用）
-    pub model: String,
-}
-
-/// 按客户端请求的名字反查建任务参数。
-///
-/// ── 判据链（都是精确匹配，不做模糊 / 默认回落）──────────────────
-///   1. 目录 id（`{provider}/{model}`，客户端点名的就是这个）—— 主判据；
-///   2. 上游真名 `model`（客户端可能直接写上游名）；
-///   3. 展示名 `name`；
-///   4. `upstreamId`（UUID，排障时可能直接点）。
-/// 全部大小写不敏感。取到的条目必须带**非空** `upstreamId`（没有 UUID 就建不出
-/// 任务），否则视为查不到 —— 返回 `None` 让调用方报可读错误，而不是拿空串去撞
-/// 上游的 400。
-///
-/// ── 为什么不做参考实现那样的「模糊匹配 + 默认模型回落」────────────
-/// 参考的 `resolveModel` 在找不到时回落到 `is_default` / `models[0]`。网关侧
-/// 不能这么做：入口校验已按**广告视图**解析过模型名，走到转发这一步时名字必然
-/// 是清单里的某一个；把「找不到」静默换成另一个模型，就是「选了 A、用的是 B」
-/// —— 本仓对这类静默错误一律报错。
-pub fn resolve_task_model(requested: &str) -> Option<TaskTarget> {
-    let requested = requested.trim();
-    if requested.is_empty() {
-        return None;
-    }
-    let models = current();
-    let matched = models
-        .iter()
-        .find(|item| text_of(item, "id").eq_ignore_ascii_case(requested))
-        .or_else(|| models.iter().find(|item| text_of(item, "model").eq_ignore_ascii_case(requested)))
-        .or_else(|| models.iter().find(|item| text_of(item, "name").eq_ignore_ascii_case(requested)))
-        .or_else(|| {
-            models
-                .iter()
-                .find(|item| text_of(item, "upstreamId").eq_ignore_ascii_case(requested))
-        })?;
-    let model_id = text_of(matched, "upstreamId");
-    if model_id.is_empty() {
-        return None;
-    }
-    Some(TaskTarget { model_id, model: text_of(matched, "model") })
-}
-
-/// 目录里找不到模型时的可读错误（转发入口与目录刷新共用一条文案）。
-pub fn missing_model_error(requested: &str) -> Error {
-    Error::http(
-        503,
-        format!("MonkeyCode 模型目录里找不到模型「{requested}」：请在模型管理页刷新清单后重试"),
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn entry_mapping_matches_the_aggregate_shape() {
-        let payload = json!({
-            "code": 0,
-            "data": { "models": [
-                {
-                    "id": "uuid-1", "provider": "siliconflow", "model": "Qwen/Qwen3.5-Plus",
-                    "display_name": "通义千问 3.5", "interface_type": "openai_chat",
-                    "context_limit": 131072, "output_limit": 8192,
-                    "is_free": true, "is_default": true, "thinking_enabled": true
-                },
-                // 没有 model 的条目必须跳过（建不出任务）
-                { "id": "uuid-2", "provider": "x" }
-            ] }
-        });
-        let models = parse_models(&payload);
-        assert_eq!(1, models.len());
-        let item = models.first().cloned().unwrap_or(Value::Null);
-        assert_eq!("siliconflow/Qwen/Qwen3.5-Plus", item["id"].as_str().unwrap_or(""));
-        assert_eq!("通义千问 3.5", item["name"].as_str().unwrap_or(""));
-        assert_eq!("uuid-1", item["upstreamId"].as_str().unwrap_or(""));
-        assert_eq!("opencode", item["cliName"].as_str().unwrap_or(""));
-        assert_eq!(131072, item["maxInputTokens"].as_i64().unwrap_or(0));
-        assert_eq!(true, item["supportsReasoning"].as_bool().unwrap_or(false));
-        assert_eq!(true, item["isDefault"].as_bool().unwrap_or(false));
-        assert_eq!(true, item["isFree"].as_bool().unwrap_or(false));
-        assert_eq!(false, item["supportsImages"].as_bool().unwrap_or(true));
+fn bool_field(row: &Value, key: &str) -> Result<Option<bool>> {
+    match row.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        _ => Err(errors::protocol(
+            ReadEndpoint::Models,
+            "模型布尔字段格式无效",
+        )),
     }
+}
 
-    #[test]
-    fn parse_accepts_both_envelopes() {
-        let flat = json!({ "models": [{ "id": "u", "model": "m" }] });
-        assert_eq!(1, parse_models(&flat).len());
-        let array = json!([{ "id": "u", "model": "m", "provider": "" }]);
-        let first = parse_models(&array).first().cloned().unwrap_or(Value::Null);
-        assert_eq!("m", first["id"].as_str().unwrap_or(""));
-        assert!(parse_models(&Value::Null).is_empty());
+pub fn project(row: &Value, subscription: Option<&Value>, session: &str) -> Result<Option<Value>> {
+    if !row.is_object() {
+        return Err(errors::protocol(ReadEndpoint::Models, "模型条目不是对象"));
     }
+    if bool_field(row, "is_hidden")? == Some(true) {
+        return Ok(None);
+    }
+    let model = util::text(row, &["model"]);
+    let provider = util::text(row, &["provider"]);
+    let upstream = util::text(row, &["id"]);
+    if model.is_empty()
+        || model.len() > 384
+        || provider.len() > 96
+        || !uuid(upstream)
+        || [model, provider, upstream].iter().any(|value| {
+            value.chars().any(char::is_control) || !session.is_empty() && value.contains(session)
+        })
+    {
+        return Err(errors::protocol(
+            ReadEndpoint::Models,
+            "模型名称或上游 UUID 缺失／无效，保留旧清单",
+        ));
+    }
+    let id = if provider.is_empty() {
+        model.to_string()
+    } else {
+        format!("{provider}/{model}")
+    };
+    let label = util::text(row, &["display_name", "remark"]);
+    let (enabled, reason) = eligibility(row, subscription);
+    let mut entry = json!({
+        "id": id,
+        "name": util::public_text(if label.is_empty() { model } else { label }, session, 256),
+        "provider": provider, "model": model, "upstreamId": upstream,
+        "interfaceType": util::public_text(util::text(row, &["interface_type"]), session, 64),
+        "cliName": "opencode",
+        "isDefault": bool_field(row, "is_default")?,
+        "isFree": bool_field(row, "is_free")?,
+        "accessLevel": util::public_text(util::text(row, &["access_level"]), session, 64),
+        "enable": enabled, "eligibilityKnown": enabled.is_some(), "eligibilityReason": reason,
+        "upstreamImageSupport": bool_field(row, "support_image")?,
+        "upstreamThinkingEnabled": bool_field(row, "thinking_enabled")?,
+        "supportsToolCall": true, "supportsImages": false, "supportsVideo": false,
+        "supportsReasoning": bool_field(row, "thinking_enabled")?.unwrap_or(false), "chatReady": true,
+        "capabilityState": "complete", "catalogScope": "display_only"
+    });
+    if let Some(limit) = util::positive_limit(row, "context_limit") {
+        entry["maxInputTokens"] = json!(limit);
+    }
+    if let Some(limit) = util::positive_limit(row, "output_limit") {
+        entry["maxOutputTokens"] = json!(limit);
+    }
+    Ok(Some(entry))
+}
 
-    #[test]
-    fn missing_model_error_is_a_503() {
-        let error = missing_model_error("x");
-        assert_eq!(Some(503), error.status);
-        assert!(error.message.contains("模型管理页"));
+/// 重复显示 ID 但 UUID 不同不能任选一个；该 ID 从广告剔除并在账号审阅快照保留。
+pub fn finish(rows: Vec<Value>, at: i64, pagination_complete: Option<bool>) -> Result<Value> {
+    let mut groups: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    for row in rows {
+        let key = util::text(&row, &["id"]).to_ascii_lowercase();
+        let group = groups.entry(key).or_default();
+        if let Some(previous) = group
+            .iter()
+            .find(|previous| previous["upstreamId"] == row["upstreamId"])
+        {
+            if previous != &row {
+                return Err(errors::protocol(
+                    ReadEndpoint::Models,
+                    "同一模型在分页期间发生变化，请重新刷新",
+                ));
+            }
+        } else {
+            group.push(row);
+        }
     }
+    let mut visible = Vec::new();
+    let mut advertised = Vec::new();
+    let mut ambiguous = 0;
+    for group in groups.into_values() {
+        let conflict = group.len() > 1;
+        if conflict {
+            ambiguous += 1;
+        }
+        for mut row in group {
+            if conflict {
+                row["enable"] = json!(false);
+                row["eligibilityReason"] = json!("ambiguous_display_id");
+            } else if row["enable"] == true {
+                advertised.push(row.clone());
+            }
+            visible.push(row);
+        }
+    }
+    let unavailable = visible.iter().filter(|row| row["enable"] != true).count();
+    Ok(
+        json!({ "schema": 1, "provider": "monkeycode", "models": advertised,
+        "visibleModels": visible, "scope": "display_only", "completeAccountPermissions": false,
+        "paginationComplete": pagination_complete, "filteredOrUnknown": unavailable,
+        "ambiguousIds": ambiguous, "meta": { "remote": true, "refreshed_at": at } }),
+    )
+}
+
+pub fn empty() -> Value {
+    json!({ "models": [], "meta": { "remote": false, "refreshed_at": 0 },
+        "scope": "display_only", "completeAccountPermissions": false })
+}
+
+pub fn valid(list: &Value) -> bool {
+    const FIELDS: &[&str] = &[
+        "id",
+        "name",
+        "provider",
+        "model",
+        "upstreamId",
+        "interfaceType",
+        "cliName",
+        "isDefault",
+        "isFree",
+        "accessLevel",
+        "enable",
+        "eligibilityKnown",
+        "eligibilityReason",
+        "upstreamImageSupport",
+        "upstreamThinkingEnabled",
+        "supportsToolCall",
+        "supportsImages",
+        "supportsVideo",
+        "supportsReasoning",
+        "chatReady",
+        "capabilityState",
+        "catalogScope",
+        "maxInputTokens",
+        "maxOutputTokens",
+    ];
+    list["meta"]["remote"].is_boolean()
+        && list["meta"]["refreshed_at"]
+            .as_i64()
+            .is_some_and(|at| at >= 0)
+        && list["models"].as_array().is_some_and(|rows| {
+            rows.len() <= MAX_ROWS
+                && rows.iter().all(|row| {
+                    row.as_object().is_some_and(|fields| {
+                        fields.keys().all(|key| FIELDS.contains(&key.as_str()))
+                    }) && !util::text(row, &["id"]).is_empty()
+                        && uuid(util::text(row, &["upstreamId"]))
+                        && row["catalogScope"] == "display_only"
+                })
+        })
+}
+
+pub fn cursor(data: &Value, seen: &mut BTreeSet<String>) -> Result<(Option<String>, Option<bool>)> {
+    let Some(page) = data.get("page").filter(|page| !page.is_null()) else {
+        return Ok((None, None));
+    };
+    if !page.is_object() {
+        return Err(errors::protocol(ReadEndpoint::Models, "分页信息不是对象"));
+    }
+    match page["has_next_page"].as_bool() {
+        Some(false) => Ok((None, Some(true))),
+        Some(true) => {
+            let cursor = util::text(page, &["cursor"]);
+            if cursor.is_empty()
+                || cursor.len() > 4096
+                || cursor.chars().any(char::is_control)
+                || !seen.insert(cursor.to_string())
+            {
+                return Err(errors::protocol(
+                    ReadEndpoint::Models,
+                    "下一页游标无效或重复，保留旧清单",
+                ));
+            }
+            Ok((Some(cursor.to_string()), Some(false)))
+        }
+        None => Err(errors::protocol(ReadEndpoint::Models, "缺少分页完成标志")),
+    }
+}
+
+pub fn too_large() -> Error {
+    errors::protocol(
+        ReadEndpoint::Models,
+        "目录超过大小或分页上限，未发布不完整的新清单",
+    )
 }

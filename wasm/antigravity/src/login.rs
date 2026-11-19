@@ -1,371 +1,192 @@
-//! Antigravity 的网页登录：Google 授权页 → **回调 URL 回填** → 换凭据。
-//!
-//! ── 与 native 的结构差别（迁移时改的）───────────────────────
-//! native 每轮自绑一个 loopback 端口收回调；wasm 没有 socket，改成回填：
-//!
-//! ```text
-//!   login.start    → 造 Google 授权地址 + 把 state / redirect_uri 存进登录状态
-//!   login.poll     → 只读状态（网关按 poll_interval_ms 来问）
-//!   login.callback → 用户把地址栏那条 URL 粘回来 → 当场换码 → 状态翻成 done
-//!   login.cancel   → 清掉那一条
-//! ```
-//!
-//! ── `redirect_uri` 必须逐字一致 ────────────────────────────
-//! Google 会比对发起授权时与换码时的 `redirect_uri`，差一个字符就
-//! `redirect_uri_mismatch`。所以它作为常量只出现一次（[`REDIRECT_URI`]），
-//! 两处都取同一个值；浏览器跳不到这个地址是**预期**的 —— 用户复制地址栏即可。
-//!
-//! ── 流程标识用网关给的那一个 ────────────────────────────────
-//! 宿主在 `login.start` 分配 `flow` 并在回调时逐字比对，所以**原样回传
-//! `params["flow"]`**，上游自己的 `state` 存在登录状态里、只在本地比对。
+//! OAuth state 使用宿主 login_ + 32随机字节hex，新流程将 S256 verifier 仅保存在本次登录状态。
+//! 唯一回调路径 /oauth-callback。预约换证后清理敏感材料，取消/并发 CAS 拒绝迟到落库。
 
-use agent2api_wasm_sdk::{self as sdk, json, Error, Result, Value};
+use super::{account, callback, credentials, i18n, oauth, project, util};
+use agent2api_wasm_sdk::{
+    self as sdk, json,
+    state::{Scope, Snapshot},
+    Error, Result, Value,
+};
 
-use super::credentials::AntigravityCredentials;
-use super::endpoints;
-use super::refresh;
-
-/// 登录状态在宿主 Login 作用域里的键。
-const STATE_KEY: &str = "flow";
-const SCHEMA: u32 = 1;
-
-/// 一次登录的有效期（10 分钟）。
-const TTL_MS: i64 = 10 * 60 * 1000;
-
-/// 本轮回填用的回环回调（**两处逐字共用**）。
-pub const REDIRECT_URI: &str = "http://localhost:3129/oauth-callback";
-
-/// `admin.action = auth.methods`。
-///
-/// 两条：Google 授权页（回填回调 URL）+ 粘贴 refresh token。native 的
-/// `login_methods` 就是这两条；`desktop`（本机导入）在本家没有宿主 helper
-/// （`desktop_credentials::helper("antigravity")` 为空），所以不列。
-pub fn methods() -> Value {
-    json!({ "methods": [
-        {
-            "methodIndex": 0,
-            "type": "oauth",
-            "label": "网页登录",
-            "instructions": "打开 Google 授权页，完成后把地址栏里那条完整 URL 粘贴回来（本机访问 Google 需经代理时，请先开启系统代理）",
-            "prompts": [],
-            "browserMode": "choice",
-            "manualCallback": true,
-            "callbackInput": "url",
-            "validatesCallback": true,
-            "localOnly": false
-        },
-        {
-            "methodIndex": 1,
-            "type": "api",
-            "label": "登录凭据",
-            "instructions": "粘贴 Google refresh token（以 1// 开头）。",
-            "prompts": [{
-                "key": "refreshToken",
-                "type": "text",
-                "label": "refresh token",
-                "placeholder": "1//…",
-                "secret": true,
-                "optional": false
-            }],
-            "browserMode": "choice",
-            "localOnly": false,
-            "manualCallback": false,
-            "callbackInput": "url"
-        }
-    ] })
+const KEY: &str = "oauth";
+const TTL: i64 = 900_000;
+fn flow(params: &Value) -> Result<&str> {
+    params["flow"]
+        .as_str()
+        .filter(|f| {
+            f.strip_prefix("login_")
+                .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        })
+        .ok_or_else(|| Error::http(503, "Antigravity 需要主程序分配受控登录流程"))
 }
-
-fn put_state(value: Value) -> Result<()> {
-    let snapshot = sdk::host("state.get", json!({ "scope": "login", "key": STATE_KEY, "schema": SCHEMA }))
-        .unwrap_or(Value::Null);
-    let revision = snapshot.get("revision").and_then(Value::as_u64).unwrap_or(0);
-    let updated = sdk::host(
-        "state.compare_exchange",
-        json!({
-            "scope": "login", "key": STATE_KEY, "schema": SCHEMA,
-            "revision": revision, "value": value, "ttl_ms": TTL_MS,
-        }),
-    )?;
-    if updated["updated"] != true {
-        return Err(Error::new("登录状态已被另一轮流程改写，请重新发起"));
+fn load() -> Result<Snapshot> {
+    let state = sdk::state::get(Scope::Login, KEY, 1)?;
+    if !state.compatible {
+        return Err(Error::http(409, "Antigravity 登录状态已变化，请重新发起"));
+    }
+    Ok(state)
+}
+fn active(state: &Snapshot) -> Result<()> {
+    if !matches!(state.value["phase"].as_str(), Some("pending" | "exchange"))
+        || state.value["deadline"]
+            .as_i64()
+            .is_none_or(|at| util::now().map_or(true, |now| now >= at))
+    {
+        return Err(Error::http(409, "Antigravity 登录已取消、完成或过期"));
+    }
+    Ok(())
+}
+fn save(previous: &Snapshot, value: Value) -> Result<()> {
+    if previous.value["deadline"]
+        .as_i64()
+        .is_some_and(|at| util::now().map_or(true, |now| now >= at))
+    {
+        return Err(Error::http(409, "Antigravity 登录已过期，未写入迟到结果"));
+    }
+    if !sdk::state::compare_exchange(Scope::Login, KEY, 1, previous.revision, value, TTL)? {
+        return Err(Error::http(409, "Antigravity 登录步骤已变化，未重复换证"));
+    }
+    Ok(())
+}
+fn current(previous: &Snapshot) -> Result<()> {
+    let state = load()?;
+    active(&state)?;
+    if state.revision != previous.revision {
+        return Err(Error::http(409, "Antigravity 登录已取消或步骤变化"));
     }
     Ok(())
 }
 
-fn get_state() -> Value {
-    sdk::host("state.get", json!({ "scope": "login", "key": STATE_KEY, "schema": SCHEMA }))
-        .ok()
-        .and_then(|value| value.get("value").cloned())
-        .unwrap_or(Value::Null)
-}
-
-fn clear_state() {
-    let snapshot = sdk::host("state.get", json!({ "scope": "login", "key": STATE_KEY, "schema": SCHEMA }))
-        .unwrap_or(Value::Null);
-    let revision = snapshot.get("revision").and_then(Value::as_u64).unwrap_or(0);
-    let _ = sdk::host(
-        "state.compare_exchange",
-        json!({ "scope": "login", "key": STATE_KEY, "schema": SCHEMA, "revision": revision, "value": Value::Null, "ttl_ms": 1000 }),
-    );
-}
-
-/// 宿主随机字节 → base64url（无填充）。
-fn random_state() -> Result<String> {
-    let value = sdk::host("random.bytes", json!({ "length": 24 }))
-        .map_err(|_| Error::new("无法生成安全的登录凭据，请重新发起"))?;
-    let raw = value
-        .as_str()
-        .ok_or_else(|| Error::new("无法生成安全的登录凭据，请重新发起"))?;
-    let bytes = base64_decode(raw).ok_or_else(|| Error::new("无法生成安全的登录凭据，请重新发起"))?;
-    Ok(base64url_encode(&bytes))
-}
-
-fn base64url_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::new();
-    for chunk in bytes.chunks(3) {
-        let first = chunk[0] as u32;
-        let second = chunk.get(1).copied().unwrap_or(0) as u32;
-        let third = chunk.get(2).copied().unwrap_or(0) as u32;
-        let value = (first << 16) | (second << 8) | third;
-        out.push(ALPHABET[(value >> 18) as usize & 63] as char);
-        out.push(ALPHABET[(value >> 12) as usize & 63] as char);
-        if chunk.len() > 1 {
-            out.push(ALPHABET[(value >> 6) as usize & 63] as char);
-        }
-        if chunk.len() > 2 {
-            out.push(ALPHABET[value as usize & 63] as char);
-        }
-    }
-    out
-}
-
-fn base64_decode(value: &str) -> Option<Vec<u8>> {
-    let mut output = Vec::new();
-    let mut accumulator: u32 = 0;
-    let mut bits = 0u32;
-    for byte in value.bytes() {
-        let digit = match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52,
-            b'+' | b'-' => 62,
-            b'/' | b'_' => 63,
-            b'=' | b'\n' | b'\r' => continue,
-            _ => return None,
-        };
-        accumulator = (accumulator << 6) | u32::from(digit);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            output.push((accumulator >> bits) as u8);
-            accumulator &= (1 << bits) - 1;
-        }
-    }
-    Some(output)
-}
-
-/// `login.start`。
 pub fn start(params: &Value) -> Result<Value> {
-    let method = params["method"].as_str().unwrap_or("browser");
-    let index = params["methodIndex"].as_u64().unwrap_or(0);
-    if method != "browser" && method != "" {
-        return Err(Error::http(400, "Antigravity 的登录请用「网页登录」或「登录凭据」"));
+    let flow = flow(params)?;
+    if params["payload"]["methodIndex"]
+        .as_u64()
+        .is_some_and(|index| index != 0)
+        || params["method"].as_str().is_some_and(|m| m != "browser")
+    {
+        return Err(Error::http(
+            400,
+            "Antigravity 请使用网页登录；手工续期凭据请从添加账号提交",
+        ));
     }
-    if index != 0 {
-        return Err(Error::http(400, "Antigravity 登录凭据请直接在账号页粘贴，不需要登录流程"));
-    }
-    let flow = params["flow"]
+    let trusted = params["callback_url"]
         .as_str()
-        .map(str::trim)
-        .filter(|flow| !flow.is_empty())
-        .map(str::to_string)
-        .ok_or_else(|| Error::http(400, "主程序未分配登录流程"))?;
-    let state = random_state()?;
-    let url = format!(
-        "{}?client_id={}&redirect_uri={}&response_type=code&scope={}&access_type=offline&prompt=consent&include_granted_scopes=true&state={}",
-        endpoints::AUTH_URL,
-        refresh::urlencode(endpoints::CLIENT_ID),
-        refresh::urlencode(REDIRECT_URI),
-        refresh::urlencode(&endpoints::SCOPES.join(" ")),
-        refresh::urlencode(&state),
-    );
-    put_state(json!({ "flow": flow, "phase": "waiting", "state": state }))?;
-    Ok(json!({
-        "flow": flow,
-        "url": url,
-        "poll_interval_ms": 2000,
-        "instructions": "在打开的页面里完成 Google 授权。页面最后会停在「无法访问 localhost」——这是正常的：请把地址栏里那条完整 URL 复制回填",
-        "external_browser": true,
-        "login_ui": {
-            "browserMode": "choice",
-            "manualCallback": true,
-            "callbackInput": "url",
-            "captureCallback": false
-        }
-    }))
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| Error::http(503, "主程序没有提供可信的本机 OAuth 回调地址"))?;
+    let redirect = callback::redirect(trusted)?;
+    let previous = load()?;
+    if !previous.value.is_null() {
+        return Err(Error::http(409, "Antigravity 登录流程已存在"));
+    }
+    let deadline = util::now()?.saturating_add(TTL);
+    let verifier = util::random_hex(32)?;
+    let url = oauth::authorize(&redirect, flow, &verifier)?;
+    let payload = params["payload"]
+        .get("inputs")
+        .filter(|value| value.is_object())
+        .unwrap_or(&params["payload"]);
+    let name = util::safe_text(&util::text(payload, &["name"]), 100);
+    let project = util::header(&util::text(payload, &["projectId", "project_id"]), 1024)?;
+    let locale = params["payload"]["locale"].as_str().unwrap_or("zh-CN");
+    save(
+        &previous,
+        json!({ "phase": "pending", "deadline": deadline, "state": flow,
+        "redirect": redirect, "verifier": verifier, "name": name, "projectId": project }),
+    )?;
+    Ok(json!({ "flow": flow, "url": url, "poll_interval_ms": 0,
+        "instructions": i18n::instructions(locale),
+        "external_browser": true, "allowed_hosts": [],
+        "login_ui": { "browserMode": "external", "manualCallback": true, "callbackInput": "url",
+            "captureCallback": true, "cookieCapture": null, "loopbackTargets": [redirect] } }))
 }
 
-/// `login.poll`：只读状态。
-pub fn poll(params: &Value) -> Result<Value> {
-    let state = get_state();
-    if !state.is_object() {
-        return Ok(json!({ "state": "failed", "message": "这次登录已失效，请重新发起" }));
-    }
-    let flow = params["flow"].as_str().unwrap_or("");
-    if !flow.is_empty() && state["flow"].as_str() != Some(flow) {
-        return Ok(json!({ "state": "pending", "hint": "另一轮登录正在进行，请等待它完成" }));
-    }
-    match state["phase"].as_str() {
-        Some("done") => {
-            let account = state["account"].clone();
-            clear_state();
-            Ok(json!({ "state": "done", "account": account }))
-        }
-        Some("failed") => {
-            let message = state["message"].as_str().unwrap_or("这轮登录没有成功").to_string();
-            clear_state();
-            Ok(json!({ "state": "failed", "message": message }))
-        }
-        _ => Ok(json!({
-            "state": "pending",
-            "hint": "等待你在浏览器里完成授权，然后把地址栏那条 URL 回填"
-        })),
-    }
-}
-
-/// `login.callback`：用户把回调 URL 贴回来 → 换码 → 收账号。
 pub fn callback(params: &Value) -> Result<Value> {
-    let state = get_state();
-    if !state.is_object() {
-        return Ok(json!({ "state": "failed", "message": "这次登录已失效，请重新发起" }));
+    let flow = flow(params)?;
+    let previous = load()?;
+    active(&previous)?;
+    if previous.value["phase"] != "pending" || previous.value["state"] != flow {
+        return Err(Error::http(409, "Antigravity 授权已在处理，不能重复提交"));
     }
-    let flow = params["flow"].as_str().unwrap_or("").to_string();
-    if !flow.is_empty() && state["flow"].as_str() != Some(flow.as_str()) {
-        return Ok(json!({ "state": "failed", "message": "这次登录已失效，请重新发起" }));
-    }
-    let raw = params["url"]
+    let redirect = previous.value["redirect"]
         .as_str()
-        .filter(|text| !text.trim().is_empty())
-        .or_else(|| params["code"].as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    let query = match raw.split_once('?') {
-        Some((_, query)) => query.to_string(),
-        None => raw,
-    };
-    let mut code = String::new();
-    let mut received = String::new();
-    let mut error_text = String::new();
-    for pair in query.split('&') {
-        let Some((key, value)) = pair.split_once('=') else {
-            continue;
-        };
-        let value = percent_decode(value);
-        match key {
-            "code" => code = value,
-            "state" => received = value,
-            "error" => error_text = value,
-            "error_description" => {
-                if error_text.is_empty() {
-                    error_text = value;
-                }
-            }
-            _ => {}
-        }
-    }
-    if !error_text.is_empty() {
-        return fail(&flow, &format!("Google 授权被拒绝：{error_text}"));
-    }
-    if code.is_empty() {
-        return Ok(json!({ "state": "failed", "message": "回调里没有授权码" }));
-    }
-    if received != state["state"].as_str().unwrap_or("") {
-        return Ok(json!({ "state": "failed", "message": "登录 state 与本次发起的不一致，请重新发起" }));
-    }
-    let token = match refresh::exchange_code(&code, REDIRECT_URI) {
-        Ok(token) => token,
-        Err(error) => return fail(&flow, &error.message),
-    };
-    let refresh_token = match token.refresh_token {
-        Some(refresh) if !refresh.trim().is_empty() => refresh,
-        _ => {
-            return fail(
-                &flow,
-                "Google 未返回 refresh token（该授权此前完成过，重复授权不会再次下发）：请在 Google 账号的「第三方访问 / 已授权的应用」里撤销本应用后重新发起网页登录",
-            )
+        .ok_or_else(|| Error::http(409, "登录回调地址已失效"))?;
+    let received = match callback::parse(params["url"].as_str().unwrap_or(""), redirect, flow) {
+        Ok(received) => received,
+        Err(error) => {
+            return Ok(json!({ "state": "pending", "retryable": true, "hint": error.message }))
         }
     };
-    let expires_in = if (1..=7 * 24 * 3600).contains(&token.expires_in) {
-        token.expires_in
-    } else {
-        3600
-    };
-    let email = refresh::fetch_email(&token.access_token).unwrap_or_default();
-    let project = refresh::discover_project(&token.access_token).unwrap_or_default();
-    let credentials = AntigravityCredentials {
-        refresh_token,
-        access_token: token.access_token,
-        expires_at: sdk::now() + expires_in * 1000,
-        project_id: project,
-        email,
-        name: String::new(),
-    };
-    let mut secret = json!({});
-    credentials.write_into(&mut secret);
-    let account = json!({
-        "identity": super::credentials::identity(&secret),
-        "public": super::credentials::public(&secret),
-        "secret": secret,
-        "desktop": false,
-    });
-    if flow.is_empty() {
-        return Ok(json!({ "state": "done", "account": account }));
+    if received.denied {
+        save(&previous, json!({ "phase": "done" }))?;
+        return Ok(json!({ "state": "failed", "message": "Google 授权已取消或被拒绝" }));
     }
-    let _ = put_state(json!({ "flow": flow, "phase": "done", "account": account }));
-    Ok(json!({ "state": "done", "account": account }))
-}
-
-fn fail(flow: &str, message: &str) -> Result<Value> {
-    if !flow.is_empty() {
-        let _ = put_state(json!({ "flow": flow, "phase": "failed", "message": message }));
+    let code = received
+        .code
+        .as_deref()
+        .ok_or_else(|| Error::http(400, "Google 回调没有授权码"))?;
+    let marker = util::random_hex(24)?;
+    save(
+        &previous,
+        json!({ "phase": "exchange", "marker": marker, "deadline": previous.value["deadline"] }),
+    )?;
+    let reserved = load()?;
+    if reserved.value["marker"] != marker {
+        return Err(Error::http(409, "Antigravity 换证预约已失效"));
     }
-    Ok(json!({ "state": "failed", "message": message }))
-}
-
-/// `login.cancel`。
-pub fn cancel(params: &Value) -> Result<Value> {
-    let state = get_state();
-    if state.is_object() {
-        let flow = params["flow"].as_str().unwrap_or("");
-        if flow.is_empty() || state["flow"].as_str() == Some(flow) {
-            clear_state();
+    let result = (|| {
+        current(&reserved)?;
+        let mut secret = oauth::exchange(code, redirect, previous.value["verifier"].as_str())?;
+        current(&reserved)?;
+        let token = credentials::token(&secret)?;
+        if let Some(email) = oauth::email(&token, || current(&reserved))? {
+            secret["email"] = json!(email);
         }
-    }
-    Ok(Value::Null)
-}
-
-/// 百分号解码。
-fn percent_decode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut output: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or("");
-            if let Ok(decoded) = u8::from_str_radix(hex, 16) {
-                output.push(decoded);
-                index += 3;
-                continue;
-            }
-        }
-        if bytes[index] == b'+' {
-            output.push(b' ');
+        current(&reserved)?;
+        let provided_project = util::text(&previous.value, &["projectId"]);
+        if !provided_project.is_empty() {
+            secret["projectId"] = json!(provided_project);
         } else {
-            output.push(bytes[index]);
+            let found = project::discover(&token, || current(&reserved));
+            current(&reserved)?;
+            if let Ok(project) = found {
+                secret["projectId"] = json!(project);
+            }
         }
-        index += 1;
+        account::normalized(secret, "web-login", previous.value["name"].as_str())
+    })();
+    current(&reserved)?;
+    save(&reserved, json!({ "phase": "done" }))?;
+    match result {
+        Ok(account) => Ok(sdk::login::done(account)),
+        Err(error) => {
+            Ok(json!({ "state": "failed", "message": error.message, "code": error.code }))
+        }
     }
-    String::from_utf8_lossy(&output).to_string()
+}
+
+pub fn poll(params: &Value) -> Result<Value> {
+    flow(params)?;
+    let state = load()?;
+    Ok(if active(&state).is_ok() {
+        json!({ "state": "pending", "hint": "等待 Google 授权回调或换证完成" })
+    } else {
+        json!({ "state": "failed", "message": "Antigravity 登录流程已结束或过期" })
+    })
+}
+pub fn cancel(params: &Value) -> Result<Value> {
+    flow(params)?;
+    for _ in 0..3 {
+        let state = load()?;
+        if sdk::state::compare_exchange(
+            Scope::Login,
+            KEY,
+            1,
+            state.revision,
+            json!({ "phase": "cancelled" }),
+            TTL,
+        )? {
+            return Ok(Value::Null);
+        }
+    }
+    Err(Error::http(409, "Antigravity 登录状态仍在变化，请稍后取消"))
 }

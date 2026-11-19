@@ -1,140 +1,283 @@
-//! MonkeyCode 凭证：**只有一条来源** —— 账号记录里的登录 session（粘贴形态）。
-//!
-//! ── 与别家最大的不同：粘贴式登录、没有续期 ────────────────────
-//! 本家的密码登录要 go-cap 验证码、OAuth 要百智云 SCaptcha + 短信（见
-//! `endpoints.rs` 的模块头），两条都不适合网关代跑。参考给出的结论是：
-//! 从浏览器复制 `monkeycode_ai_session` cookie 是最可靠的一条路。
-//! 上游**没有 refresh 接口**（session 30 天硬限制，`docs/02-auth/03-login-methods.md`），
-//! 过期只能重新粘贴 —— 因此 `capabilities.refresh = false`，本模块比别家薄：
-//! 没有「续期单飞」、也不需要 `locks.v1`（同批有包因为漏申报 `locks.v1`
-//! 导致续期失败；本家根本没有续期，所以那条坑不适用于本包）。
-//!
-//! ── image_id 为什么是账号字段 ────────────────────────────────
-//! 创建任务（`task.rs` 的会话转发第一步）必须带 `image_id`（VM 镜像 UUID），
-//! 而它**不在**登录响应里：参考实现 `discoverImageId` 从**已有任务列表**的
-//! `task.image.id` 里取 —— 新用户一个任务都没有时取不到，必须手动填。因此本
-//! 模块把它作为账号记录的一个字段（可为空串），并在 `login.rs` 里做一次
-//! best-effort 自动发现。
-//!
-//! ── 与 native 的差异：记录从 `sdk::account()` 来 ───────────────
-//! native 的 `from_record(record: Option<&Value>)` 由调用方从账号库取记录；
-//! wasm 插件**没有账号库访问权**，只有 `sdk::account()` —— 它返回宿主绑定到
-//! 本次调用的那条记录（含 `secret`），所以 `from_secret` 直接吃 `record["secret"]`。
-//! 「没有记录」在两侧都落成同一个 401 文案。
-//!
-//! ── 硬约束 ──────────────────────────────────────────────────
-//! release 是 `panic=abort`：本文件零 unwrap/expect/panic。
+//! 原生 Cookie 协议的严格归一化；不读文件、环境变量或浏览器。
+//! 手工 Cookie 头没有到期属性，绝不推算 addedAt + 30 天。旧 expiresAt
+//! 可能是原生估算值，本批不把它升级为可信期限，也不预先接受尚未定义的宿主标记。
 
-use agent2api_wasm_sdk::{self as sdk, Error, Result, Value};
+use agent2api_wasm_sdk::{Error, Result, Value};
 
-/// 会话有效期（`docs/02-auth/03-login-methods.md`：30 天硬限制）
-pub const SESSION_TTL_MS: i64 = 30 * 24 * 3600 * 1000;
+use crate::endpoints;
 
-/// 临期窗口：到期前 1 天提示重新粘贴（上游无续期，只能重登）
-pub const EXPIRY_MARGIN_MS: i64 = 24 * 3600 * 1000;
+const MAX_INPUT: usize = 64 * 1024;
+const MAX_SESSION: usize = 8192;
 
-/// 一次转发 / 查询用的 MonkeyCode 凭证快照。
-///
-/// native 的结构还带 `id` / `region` / `user_id` / `name` 四个展示字段（网关
-/// 账号层与日志读它们）。wasm 侧这三个值要么由宿主持有（账号 id）、要么由包
-/// 身份决定（地区），要么只出现在公开视图里（`userId` / `name`），转发链路一个
-/// 都不需要，因此不搬 —— 少一个字段就少一处「两份实现逐字对齐」的负担。
-#[derive(Clone, Debug, Default)]
-pub struct Credentials {
-    /// 登录 session（`monkeycode_ai_session` 的值）
-    pub session: String,
-    /// VM 镜像 UUID（创建任务必需；可能为空 —— 见模块头）
-    pub image_id: String,
-    /// 估算的过期时刻（毫秒；来自记录 `expiresAt`，缺失时用 `addedAt + 30 天`）
-    pub expires_at: i64,
-}
-
-impl Credentials {
-    /// 是否已过期或进入临期窗口（上游无续期手段，这个判定只用于提示重登）。
-    pub fn expiring(&self) -> bool {
-        self.expires_at > 0 && self.expires_at - EXPIRY_MARGIN_MS <= sdk::now()
-    }
-
-    /// 创建任务是否具备必要条件（session + image_id）。转发入口（`conversation.rs`）
-    /// 用它在自己真正建任务前给出可读的错误，而不是把空 image_id 发给上游。
-    pub fn ready_for_task(&self) -> bool {
-        !self.session.trim().is_empty() && !self.image_id.trim().is_empty()
-    }
-}
-
-/// 从一条取值链里挑第一个非空字符串（记录可能被手工编辑过，宽容读取）。
-pub fn pick(record: &Value, keys: &[&str]) -> String {
-    for key in keys {
-        let value = record
-            .get(*key)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .unwrap_or("");
-        if !value.is_empty() {
-            return value.to_string();
-        }
-    }
-    String::new()
-}
-
-/// 从账号 `secret` 解析凭证。
-///
-/// 键名沿用网关那份账号记录的形态（`accessToken` / `imageId` / `expiresAt` /
-/// `addedAt`），见 `accounts.rs::account_of` 的落库字段。
-pub fn from_secret(secret: &Value) -> Result<Credentials> {
-    let session = pick(secret, &["accessToken", "session", "token"]);
-    if session.is_empty() {
-        return Err(Error::http(401, "MonkeyCode 账号缺少 session，请重新粘贴登录态"));
-    }
-    let image_id = pick(secret, &["imageId", "image_id"]);
-    let explicit_expiry = secret.get("expiresAt").and_then(Value::as_i64).unwrap_or(0);
-    let added_at = secret.get("addedAt").and_then(Value::as_i64).unwrap_or(0);
-    let expires_at = if explicit_expiry > 0 {
-        explicit_expiry
-    } else if added_at > 0 {
-        added_at.saturating_add(SESSION_TTL_MS)
+fn unquote(text: &str) -> &str {
+    let text = text.trim();
+    if text.len() >= 2
+        && ((text.starts_with('"') && text.ends_with('"'))
+            || (text.starts_with('\'') && text.ends_with('\'')))
+    {
+        text.get(1..text.len() - 1).unwrap_or("").trim()
     } else {
-        0
+        text
+    }
+}
+
+fn invalid() -> Error {
+    Error::http(
+        400,
+        "请粘贴 MonkeyCode 国内版的 Session 或完整 Cookie；不接受多个不同 Session、空白或控制字符",
+    )
+    .with_code("monkeycode_invalid_session")
+}
+
+fn validate(value: &str) -> Result<String> {
+    if value.is_empty()
+        || value.len() > MAX_SESSION
+        || !value.bytes().all(
+            |byte| matches!(byte, 0x21 | 0x23..=0x2b | 0x2d..=0x3a | 0x3c..=0x5b | 0x5d..=0x7e),
+        )
+    {
+        return Err(invalid());
+    }
+    Ok(value.to_string())
+}
+
+pub fn normalize(raw: &str) -> Result<String> {
+    if raw.len() > MAX_INPUT || raw.chars().any(char::is_control) {
+        return Err(invalid());
+    }
+    let mut text = unquote(raw);
+    let has_header = text
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("cookie:"));
+    if has_header {
+        text = unquote(text.get(7..).unwrap_or(""));
+    }
+    let mut found: Option<String> = None;
+    for part in text.split(';') {
+        let Some((name, value)) = part.trim().split_once('=') else {
+            continue;
+        };
+        if name.trim() != endpoints::SESSION_COOKIE {
+            continue;
+        }
+        let value = validate(unquote(value))?;
+        if found.as_ref().is_some_and(|previous| previous != &value) {
+            return Err(invalid());
+        }
+        found = Some(value);
+    }
+    if let Some(value) = found {
+        return Ok(value);
+    }
+    // 与原生一致：含等号却没有本家 Cookie 名，不能猜成某个会话值。
+    if has_header || text.contains([';', '=']) {
+        return Err(invalid());
+    }
+    validate(unquote(text))
+}
+
+#[derive(Default)]
+pub struct Input {
+    pub session: String,
+    pub user_id: Option<String>,
+    pub image_id: Option<String>,
+    pub name: Option<String>,
+}
+
+#[derive(Default)]
+struct Collector {
+    session: Option<String>,
+    user_id: Option<String>,
+    image_id: Option<String>,
+    name: Option<String>,
+    remaining: usize,
+}
+
+fn consensus(target: &mut Option<String>, value: String) -> Result<()> {
+    if target.as_ref().is_some_and(|previous| previous != &value) {
+        return Err(invalid());
+    }
+    *target = Some(value);
+    Ok(())
+}
+
+fn optional_text(raw: &Value, limit: usize) -> Result<Option<String>> {
+    match raw {
+        Value::Null => Ok(None),
+        Value::String(text) if text.trim().is_empty() => Ok(None),
+        Value::String(text) if text.len() <= limit && !text.chars().any(char::is_control) => {
+            Ok(Some(text.trim().to_string()))
+        }
+        _ => Err(invalid()),
+    }
+}
+
+impl Collector {
+    fn visit(&mut self, value: &Value, depth: usize, user: bool) -> Result<()> {
+        if depth > 8 || self.remaining == 0 {
+            return Err(invalid());
+        }
+        self.remaining -= 1;
+        if let Some(raw) = value.as_str() {
+            let text = raw.trim();
+            if text.len() > MAX_INPUT {
+                return Err(invalid());
+            }
+            if text.starts_with('{') {
+                let parsed: Value = serde_json::from_str(text).map_err(|_| invalid())?;
+                return self.visit(&parsed, depth + 1, user);
+            }
+            return consensus(&mut self.session, normalize(raw)?);
+        }
+        let fields = value.as_object().ok_or_else(invalid)?;
+        if fields.len() > 128 {
+            return Err(invalid());
+        }
+        if fields
+            .get("methodIndex")
+            .is_some_and(|index| !index.is_null() && !matches!(index.as_u64(), Some(0 | 2)))
+        {
+            return Err(crate::gates::web_login());
+        }
+        if fields
+            .get("desktop")
+            .is_some_and(|value| !value.is_null() && value != false)
+            || fields
+                .get("provider")
+                .is_some_and(|value| !value.is_null() && value != endpoints::ID)
+        {
+            return Err(Error::http(
+                403,
+                "MonkeyCode 导入只接受国内手工凭据，不从 JSON 授予本机或其它地区权限",
+            ));
+        }
+        for key in [
+            "accessToken",
+            "session",
+            "token",
+            "cookie",
+            "Cookie",
+            "monkeycode_ai_session",
+        ] {
+            if let Some(raw) = fields.get(key) {
+                if let Some(text) = optional_text(raw, MAX_INPUT)? {
+                    consensus(&mut self.session, normalize(&text)?)?;
+                }
+            }
+        }
+        for key in ["userId", "user_id"] {
+            if let Some(raw) = fields.get(key) {
+                if let Some(id) = optional_text(raw, 128)? {
+                    consensus(&mut self.user_id, id)?;
+                }
+            }
+        }
+        if user {
+            if let Some(raw) = fields.get("id") {
+                if let Some(id) = optional_text(raw, 128)? {
+                    consensus(&mut self.user_id, id)?;
+                }
+            }
+        }
+        for key in ["imageId", "image_id"] {
+            if let Some(raw) = fields.get(key) {
+                if let Some(image) = optional_text(raw, 128)? {
+                    consensus(&mut self.image_id, image)?;
+                }
+            }
+        }
+        if self.name.is_none() {
+            if let Some(raw) = fields.get("name") {
+                self.name = optional_text(raw, 256)?;
+            }
+        }
+        for key in [
+            "inputs",
+            "credentialJson",
+            "credentials",
+            "secret",
+            "pluginSecret",
+            "payload",
+            "data",
+            "user",
+        ] {
+            if let Some(value) = fields
+                .get(key)
+                .filter(|value| !value.is_null() && value.as_str() != Some(""))
+            {
+                self.visit(value, depth + 1, key == "user")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 显式表单、完整账号 JSON 和登录窗口凭据均归一到同一值；别名冲突不任选一项。
+pub fn input(payload: &Value) -> Result<Input> {
+    if payload.to_string().len() > MAX_INPUT {
+        return Err(invalid());
+    }
+    let mut input = Collector {
+        remaining: 64,
+        ..Default::default()
     };
-    Ok(Credentials { session, image_id, expires_at })
+    input.visit(payload, 0, false)?;
+    Ok(Input {
+        session: input.session.ok_or_else(|| {
+            Error::http(400, "请提供 MonkeyCode 国内 Session、Cookie 或完整 JSON")
+        })?,
+        user_id: input.user_id,
+        image_id: input.image_id,
+        name: input.name,
+    })
 }
 
-/// 本次调用绑定的账号凭证（`token.ensure` / `conversation` / 目录刷新共用）。
-pub fn current() -> Result<Credentials> {
-    let record = sdk::account().map_err(|_| {
-        Error::http(401, "没有可用的 MonkeyCode 账号：请在账号页粘贴 session 添加")
-    })?;
-    from_secret(&record["secret"])
+pub fn session(secret: &Value) -> Result<String> {
+    let mut found = None;
+    for key in ["accessToken", "session", "token", "cookie", "Cookie"] {
+        let Some(raw) = secret.get(key).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        let raw = raw.as_str().ok_or_else(invalid)?.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let value = normalize(raw)?;
+        if found.as_ref().is_some_and(|previous| previous != &value) {
+            return Err(invalid());
+        }
+        found = Some(value);
+    }
+    found.ok_or_else(|| {
+        Error::http(401, "MonkeyCode 账号缺少登录态，请重新粘贴 Session")
+            .with_code("monkeycode_session_missing")
+    })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub fn valid_image_id(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+        && value
+            .bytes()
+            .any(|byte| matches!(byte, b'1'..=b'9' | b'a'..=b'f' | b'A'..=b'F'))
+}
 
-    #[test]
-    fn missing_session_is_a_401() {
-        let error = from_secret(&json_empty()).err().unwrap_or_else(|| Error::new("必须报错"));
-        assert_eq!(Some(401), error.status);
-        assert!(error.message.contains("session"));
+pub fn tail(session: &str) -> String {
+    // 短值不展示完整凭证，正常值也最多六个字符。
+    if session.chars().count() <= 6 {
+        return String::new();
     }
+    let start = session.chars().count().saturating_sub(6);
+    session.chars().skip(start).collect()
+}
 
-    #[test]
-    fn aliases_and_expiry_are_read() {
-        // `accessToken` 是网关落库的键；`session` / `token` 是手工编辑后的兼容键
-        let credentials = from_secret(&agent2api_wasm_sdk::json!({ "session": "s-1" }))
-            .unwrap_or_default();
-        assert_eq!("s-1", credentials.session);
-        assert!(!credentials.ready_for_task());
-        let credentials = agent2api_wasm_sdk::json!({
-            "accessToken": "s-2", "imageId": "img-1", "addedAt": 1_000i64
-        });
-        let credentials = from_secret(&credentials).unwrap_or_default();
-        assert!(credentials.ready_for_task());
-        // 没有显式 expiresAt 时用 addedAt + 30 天
-        assert_eq!(1_000 + SESSION_TTL_MS, credentials.expires_at);
-    }
-
-    fn json_empty() -> Value {
-        agent2api_wasm_sdk::json!({})
-    }
+pub fn expiry(_secret: &Value) -> Option<i64> {
+    // 可信浏览器事件合同未确定前，没有可证明的 Cookie 实际期限。
+    None
 }

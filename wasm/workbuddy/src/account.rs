@@ -1,504 +1,315 @@
-//! 账号面：取 token（含临期单飞续期）、公开视图、稳定身份、账号规范化。
-//!
-//! 合并自 native 的 `auth.rs` + `refresh.rs` + `accounts.rs` 三块：
-//! • 凭证读取与单飞续期（`ensure` / `refresh` / `expiring`）
-//! • `account_view` / `identity_of` / `normalize`
-//!
-//! ── 续期为什么要单飞 + 比较再写 ────────────────────────────
-//! refresh token 换发后旧值失效，只有新凭证已经落盘才能向等待者报告成功。
-//! 写回冲突时保留最新的非鉴权字段；凭证已被替换则不覆盖新登录态。
-//! wasm 侧没有进程内表（宿主每次调用后回收实例），所以用宿主的账号锁
-//! （`lock.acquire`）+ `account.update` 的 CAS（`expect` 是读到时的那份 secret）。
-//!
-//! ── 默认登录态（native 的 `WORKBUDDY_TOKEN` 旁路）不迁 ─────────
-//! native 允许「一个账号都没有时用环境变量 token 转发」。wasm 沙箱既没有
-//! 环境变量，网关也**明文禁止** wasm 包申报隐式本机凭证
-//! （`capabilities.anonymous_default_session` / `env_credentials` 必须为 false，
-//! 见 `metadata.json`）。所以这里没有那条分支：没有账号就返回可读错误。
-//!
-//! ── 硬约束 ──────────────────────────────────────────────────
-//! 零 unwrap/expect/panic。
+//! 显式本机导入是一次性快照，与原生一致；后续不读本机、不使用环境变量旁路。
+//! uid/identity、组织和授权字段保持原契约，公开视图仅令牌尾号。
+use super::{desktop, endpoints, headers, network, util};
+use agent2api_wasm_sdk::{self as sdk, json, Error, Result, Value};
 
-use agent2api_wasm_sdk::{self as sdk, json, AccountLock, Error, Result, Value};
-
-use crate::auth;
-use crate::endpoints::Context;
-use crate::outbound;
-use crate::util;
-use crate::{refresh_identity, Region};
-
-/// 令牌长度上限（与账号存储的 `MAX_TOKEN_LENGTH` 同量级）
-const MAX_TOKEN_LENGTH: usize = 32_768;
-/// 身份字段长度上限
-const MAX_IDENTITY_LENGTH: usize = 256;
-/// 备注名长度上限
-const MAX_NAME_LENGTH: usize = 100;
-
-/// 当前账号的扁平 secret（没有账号时给空对象）。
-pub fn secret() -> Result<Value> {
-    let record = sdk::account()?;
-    Ok(record.get("secret").cloned().unwrap_or(Value::Null))
+pub fn identity(secret: &Value) -> String {
+    let uid = util::text(secret, &["uid"]);
+    if uid.is_empty() {
+        String::new()
+    } else {
+        format!("user-{uid}")
+    }
+}
+fn nested(payload: &Value, group: &str, keys: &[&str]) -> String {
+    let inside = util::text(&payload[group], keys);
+    if inside.is_empty() {
+        util::text(payload, keys)
+    } else {
+        inside
+    }
+}
+fn text_field(value: &str, max: usize, label: &str) -> Result<()> {
+    if value.len() > max || value.chars().any(char::is_control) {
+        return Err(Error::http(400, format!("WorkBuddy{label}字段无效或过长")));
+    }
+    Ok(())
+}
+pub fn parse(payload: &Value, name: Option<&str>) -> Result<Value> {
+    if !payload.is_object() || payload.to_string().len() > endpoints::MAX_CREDENTIALS {
+        return Err(Error::http(
+            400,
+            "WorkBuddy凭据必须为不超过256KiB的JSON对象",
+        ));
+    }
+    for key in ["edition", "realm", "region"] {
+        let edition = util::text(payload, &[key]);
+        if !edition.is_empty()
+            && !["cn", "china", "mainland", "workbuddy", "zh", "cn-intl"]
+                .contains(&edition.to_ascii_lowercase().as_str())
+        {
+            return Err(Error::http(
+                400,
+                "该登录态不是WorkBuddy国内版，请使用对应地区插件",
+            ));
+        }
+    }
+    // 平台/前缀只做地区识别，不能当协议校验：wb2api 等第三方导出会带自己的
+    // 通道名（如 "CLI"），官方 .info 也不写这两个字段。它们不参与请求，解析后
+    // 统一按国内版规范值写回，所以这里只拦明确属于国际版的标记。
+    if payload
+        .get("platform")
+        .and_then(|value| value.as_str())
+        .is_some_and(|platform| {
+            matches!(
+                platform.trim().to_ascii_lowercase().as_str(),
+                "workbuddy-ai" | "workbuddyai" | "workbuddy.ai"
+            )
+        })
+    {
+        return Err(Error::http(400, "这是WorkBuddy国际版登录态，请使用国际版插件"));
+    }
+    for key in [
+        "accessToken",
+        "token",
+        "access_token",
+        "refreshToken",
+        "refresh_token",
+    ] {
+        if payload["auth"]
+            .get(key)
+            .or_else(|| payload.get(key))
+            .is_some_and(|value| value.is_object() && value.get("$wbEncrypted").is_some())
+        {
+            return Err(Error::http(
+                400,
+                "WorkBuddy 客户端已加密保存此登录态，无法直接导入；请改用网页登录，不需要手动复制令牌",
+            ));
+        }
+    }
+    let token = util::strip(&nested(
+        payload,
+        "auth",
+        &["accessToken", "token", "access_token"],
+    ));
+    let refresh = util::strip(&nested(payload, "auth", &["refreshToken", "refresh_token"]));
+    if token.is_empty()
+        || token.len() > 32_768
+        || refresh.len() > 32_768
+        || token.chars().any(char::is_whitespace)
+        || refresh.chars().any(char::is_whitespace)
+    {
+        return Err(Error::http(
+            400,
+            "WorkBuddy登录态缺少有效accessToken或令牌格式无效",
+        ));
+    }
+    let uid = nested(payload, "account", &["uid"]);
+    text_field(&uid, 256, "账号身份")?;
+    if uid.is_empty() {
+        return Err(Error::http(400, "WorkBuddy登录态缺少uid，无法标识账号"));
+    }
+    if util::claims(&token)
+        .map(|claims| util::text(&claims, &["sub", "userId", "uid"]))
+        .is_some_and(|claimed| !claimed.is_empty() && claimed != uid)
+    {
+        return Err(Error::http(
+            400,
+            "WorkBuddy令牌身份与账号uid不一致，未导入另一账号的凭据",
+        ));
+    }
+    let mut secret = json!({ "uid": uid, "accessToken": token, "endpoint": endpoints::endpoint(payload)?,
+        "edition": "cn", "prefixPath": "/plugin", "platform": "workbuddy" });
+    if !refresh.is_empty() {
+        secret["refreshToken"] = json!(refresh);
+    }
+    for key in [
+        "nickname",
+        "type",
+        "enterpriseId",
+        "enterpriseName",
+        "departmentFullName",
+        "oneidAccountId",
+        "idp",
+    ] {
+        let value = nested(payload, "account", &[key]);
+        text_field(&value, 256, key)?;
+        if !value.is_empty() {
+            secret[key] = json!(value);
+        }
+    }
+    for key in ["domain", "tokenType"] {
+        let value = nested(payload, "auth", &[key]);
+        text_field(&value, 256, key)?;
+        if key == "domain" && !value.is_empty() {
+            let domain = url::Url::parse(&value)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_string))
+                .unwrap_or_else(|| value.to_ascii_lowercase());
+            if ["workbuddy.ai", "codebuddy.ai"]
+                .iter()
+                .any(|intl| domain == *intl || domain.ends_with(&format!(".{intl}")))
+            {
+                return Err(Error::http(
+                    400,
+                    "这是WorkBuddy国际版登录态，请使用国际版插件",
+                ));
+            }
+        }
+        if !value.is_empty() {
+            secret[key] = json!(value);
+        }
+    }
+    for (key, alias) in [
+        ("expiresAt", "expires_at"),
+        ("refreshExpiresAt", "refresh_expires_at"),
+    ] {
+        let value = [
+            payload["auth"].get(key),
+            payload["auth"].get(alias),
+            payload.get(key),
+            payload.get(alias),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(|value| util::integer(value).filter(|at| *at > 0));
+        let token = if key == "expiresAt" { &token } else { &refresh };
+        if let Some(at) = value.or_else(|| {
+            util::claims(token)
+                .and_then(|claims| util::integer(&claims["exp"]))
+                .filter(|seconds| *seconds > 0)
+                .and_then(|seconds| seconds.checked_mul(1000))
+        }) {
+            secret[key] = json!(at);
+        }
+    }
+    let nickname = util::text(&secret, &["nickname"]);
+    let name = name
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| (!nickname.is_empty()).then_some(nickname))
+        .unwrap_or_else(|| format!("账号 {}", uid.chars().take(8).collect::<String>()));
+    text_field(&name, 400, "备注")?;
+    secret["name"] = json!(name.chars().take(100).collect::<String>());
+    secret["tokenTail"] = json!(util::tail(&token));
+    Ok(secret)
+}
+pub fn view(secret: &Value) -> Value {
+    let mut value = json!({ "uid": util::text(secret, &["uid"]), "name": util::text(secret, &["name", "nickname"]),
+        "nickname": util::text(secret, &["nickname"]), "type": util::text(secret, &["type"]),
+        "enterpriseId": util::text(secret, &["enterpriseId"]), "enterpriseName": util::text(secret, &["enterpriseName"]),
+        "tokenTail": util::tail(&util::text(secret, &["accessToken"])), "hasRefreshToken": !util::text(secret, &["refreshToken"]).is_empty(),
+        "edition": "cn", "editionLabel": "国内版", "endpoint": secret["endpoint"], "prefixPath": "/plugin",
+        "available": !util::text(secret, &["accessToken"]).is_empty(), "expiresAt": secret["expiresAt"], "refreshTokenExpiresAt": secret["refreshExpiresAt"] });
+    if value["name"] == "" {
+        value["name"] = json!("WorkBuddy国内账号");
+    }
+    value
+}
+pub fn bundle(secret: Value) -> Result<Value> {
+    let public = view(&secret);
+    let display = public.to_string();
+    if ["accessToken", "refreshToken"]
+        .iter()
+        .filter_map(|key| secret[*key].as_str())
+        .filter(|v| v.len() > 6)
+        .any(|v| display.contains(v))
+    {
+        return Err(Error::http(
+            400,
+            "公开账号信息含有令牌，请修改备注或组织名称",
+        ));
+    }
+    Ok(
+        json!({ "identity": identity(&secret), "public": public, "secret": secret, "desktop": false }),
+    )
+}
+fn legacy_import() -> Result<Value> {
+    let auth = sdk::legacy_credentials::take()?;
+    let token = util::strip(&util::text(&auth, &["accessToken"]));
+    let expected = util::claims(&token).map(|claims| util::text(&claims, &["sub", "userId", "uid"]))
+        .unwrap_or_default();
+    let mut profile = network::raw_timeout("GET", endpoints::ORIGIN, "/v2/plugin/account",
+        headers::login_account(&auth)?, None, 10_000).and_then(|reply| reply.checked(&[&token]))
+        .unwrap_or(Value::Null);
+    if profile["account"].is_object() { profile = profile["account"].clone(); }
+    if util::text(&profile, &["uid"]).is_empty() {
+        let list = network::raw_timeout("GET", endpoints::ORIGIN, "/v2/plugin/accounts",
+            headers::login_account(&auth)?, None, 10_000)?.checked(&[&token])?;
+        let candidates: Vec<_> = list["accounts"].as_array().into_iter().flatten()
+            .filter(|row| expected.is_empty() || util::text(row, &["uid"]) == expected).collect();
+        let recent: Vec<_> = candidates.iter().copied().filter(|row| util::truth(&row["lastLogin"])).collect();
+        profile = if candidates.len() == 1 { candidates[0].clone() }
+            else if recent.len() == 1 { recent[0].clone() } else { Value::Null };
+    }
+    let uid = util::text(&profile, &["uid"]);
+    if uid.is_empty() || !expected.is_empty() && uid != expected {
+        return Err(Error::http(409, "WorkBuddy 旧环境凭据的账号身份未确认，请改用网页登录"));
+    }
+    Ok(json!({ "account": profile, "auth": auth, "edition": "cn" }))
 }
 
-/// 当前账号的完整记录（`{id, secret, public, ...}`）。
+pub fn normalize(params: &Value) -> Result<Value> {
+    let source = &params["source"];
+    let payload = match source["kind"].as_str() {
+        Some("desktop") => desktop::read()?,
+        Some("manual") if source["payload"]["methodIndex"] == 3 => legacy_import()?,
+        Some("manual") => {
+            let payload = &source["payload"];
+            if payload.get("methodIndex").is_none() {
+                payload.clone()
+            } else if payload["methodIndex"] == 1 {
+                let text = payload["inputs"]["credentialJson"]
+                    .as_str()
+                    .ok_or_else(|| Error::http(400, "请粘贴登录态JSON"))?;
+                serde_json::from_str(text).map_err(|_| Error::http(400, "登录态不是有效JSON"))?
+            } else {
+                return Err(Error::http(400, "此方式不是手动JSON入口"));
+            }
+        }
+        Some("file_text") => serde_json::from_str(source["content"].as_str().unwrap_or(""))
+            .map_err(|_| Error::http(400, "请选择官方客户端的文本.info文件"))?,
+        _ => return Err(Error::http(400, "WorkBuddy不支持该凭据来源")),
+    };
+    bundle(parse(
+        &payload,
+        params["name"].as_str().or_else(|| payload["name"].as_str()),
+    )?)
+}
 pub fn record() -> Result<Value> {
     sdk::account()
 }
-
-/// 取 access token（含临期主动刷新并回写账号）。
-///
-/// - 有账号 → 该账号的 token；临期且可刷新时自动刷新。
-///
-/// 与 native 的差别：native 在 `account == ""` 时回落到「环境变量 token / 队首
-/// 账号」；wasm 侧没有这两条路（见模块头），所以恒用宿主给出的当前账号。
-pub fn ensure() -> Result<String> {
-    let record = record()?;
-    let secret = record.get("secret").cloned().unwrap_or(Value::Null);
-    if !secret.is_object() {
-        return Err(Error::http(401, "WorkBuddy 当前没有可用账号，请先完成登录"));
+pub fn save(record: &Value, secret: &Value) -> Result<bool> {
+    let validated = parse(secret, secret["name"].as_str())?;
+    let mut public = view(&validated);
+    if let Some(name) = record["public"]["name"].as_str().filter(|s| !s.is_empty()) {
+        public["name"] = json!(name);
     }
-    let session = outbound::session_of_record(&secret);
-    let expires_at = session
-        .pointer("/auth/expiresAt")
-        .and_then(Value::as_f64)
-        .unwrap_or(0.0);
-    let refresh_token = util::pick(&secret, &["refreshToken"]);
-    // 临期主动刷新（改造前 `auth::get_current_session` 的行为）
-    if auth::is_token_expiring(expires_at) && !refresh_token.is_empty() {
-        match refresh() {
-            Ok(token) => return Ok(token),
-            // 续期失败不阻断转发：拿现有的 token 试一次（编排层会在 401 时走
-            // `token.refresh` 那条强制刷新）
-            Err(_) => {}
-        }
-    }
-    let token = util::pick(&secret, &["accessToken"]);
-    if token.is_empty() {
-        return Err(Error::http(401, "WorkBuddy 账号缺少 accessToken，请重新登录"));
-    }
-    Ok(token)
-}
-
-/// 401（token 被服务端拒绝）后的**强制**刷新：不看临期窗口，直接续期。
-///
-/// ── 为什么必须与 `ensure` 分开 ──────────────────────────────
-/// `ensure` 只在「临期」时才刷新，而 401 完全可能发生在一个时间上还很新的 token
-/// 上（服务端侧失效、账号被顶下线、refreshToken 轮换）。此时只调 ensure 会拿回
-/// 同一个被拒的 token，编排层的「刷新后同账号重试一次」就退化成「用同一个坏
-/// token 再打一次」。
-pub fn refresh() -> Result<String> {
-    let before = record()?;
-    let previous = before.get("secret").cloned().unwrap_or(Value::Null);
-    let refresh_token = util::pick(&previous, &["refreshToken"]);
-    if refresh_token.is_empty() {
-        return Err(Error::http(400, "缺少 refreshToken，无法续期，请重新登录"));
-    }
-    let _lock = AccountLock::acquire()?;
-    let current = record()?;
-    let current_secret = current.get("secret").cloned().unwrap_or(Value::Null);
-    // 并发请求可能刚好在前一轮落盘后到达：凭证已被别人换掉就直接用新的
-    if !same_auth(&previous, &current_secret) {
-        return access_of(&current_secret);
-    }
-    let session = outbound::session_of_record(&current_secret);
-    let mut auth_value = session.get("auth").cloned().unwrap_or(Value::Null);
-    auth_value["account"] = session.get("account").cloned().unwrap_or(Value::Null);
-    let context = Context::make(
-        current_secret.get("endpoint").and_then(Value::as_str),
-        current_secret.get("prefixPath").and_then(Value::as_str),
-        current_secret.get("platform").and_then(Value::as_str),
-        Some(Region::edition_id()),
-    );
-    let next = auth::refresh_session(&auth_value, &context)?;
-    // 上游换发成功还必须能取回**同一个账号身份**才允许替换本地凭证
-    let identity = refresh_identity::verify(&current_secret, &next, &session)?;
-    let updated = with_refresh(&current_secret, &next, &identity);
-    let result = sdk::host(
+    Ok(sdk::host(
         "account.update",
-        json!({ "expect": current_secret, "secret": updated, "public": view(&updated) }),
-    )?;
-    if result.get("updated").and_then(Value::as_bool) != Some(true) {
-        // 别的轮次已经写过：以磁盘上那份为准
-        return access_of(&secret()?);
-    }
-    Ok(next.access_token)
+        json!({ "expect": record["secret"], "secret": secret, "public": public }),
+    )?["updated"]
+        == true)
 }
-
-/// 临期判定（`token.expiring`）。
-///
-/// 取不到会话（账号不存在 / 已无凭证）时返回 false（判不出来就不刷）。
-/// 没有 refreshToken 的账号刷不了 —— 同样判成「不临期」（与网关同口径）。
-pub fn expiring() -> Result<bool> {
-    let record = match record() {
-        Ok(record) => record,
-        Err(_) => return Ok(false),
-    };
-    let secret = record.get("secret").cloned().unwrap_or(Value::Null);
-    if util::pick(&secret, &["refreshToken"]).is_empty() {
-        return Ok(false);
-    }
-    let session = outbound::session_of_record(&secret);
-    let expires_at = session
-        .pointer("/auth/expiresAt")
-        .and_then(Value::as_f64)
-        .unwrap_or(0.0);
-    Ok(auth::is_token_expiring(expires_at))
-}
-
-fn access_of(secret: &Value) -> Result<String> {
-    let token = util::pick(secret, &["accessToken"]);
-    if token.is_empty() {
-        Err(Error::http(401, "WorkBuddy 账号缺少 accessToken，请重新登录"))
-    } else {
-        Ok(token)
-    }
-}
-
-/// 参与「同一份凭证」判定的字段（refresh.rs 的 `AUTH_KEYS`）。
-const AUTH_KEYS: &[&str] = &[
-    "uid",
-    "enterpriseId",
-    "type",
-    "departmentFullName",
-    "oneidAccountId",
-    "idp",
-    "tokenType",
-    "accessToken",
-    "refreshToken",
-    "domain",
-    "endpoint",
-    "prefixPath",
-    "platform",
-    "edition",
-];
-
-fn same_auth(left: &Value, right: &Value) -> bool {
-    AUTH_KEYS
-        .iter()
-        .all(|key| left.get(*key) == right.get(*key))
-}
-
-/// 把续期结果摊回扁平 secret（只覆盖确实拿到了的字段）。
-fn with_refresh(secret: &Value, next: &auth::RefreshedAuth, identity: &Value) -> Value {
-    let mut merged = secret.as_object().cloned().unwrap_or_default();
-    merged.insert("accessToken".into(), json!(next.access_token));
-    merged.insert("tokenTail".into(), json!(util::token_tail(&next.access_token)));
-    if let Some(token) = next
-        .refresh_token
-        .as_ref()
-        .filter(|token| !token.is_empty())
-    {
-        merged.insert("refreshToken".into(), json!(token));
-    }
-    if let Some(value) = next.expires_at.filter(|value| *value > 0.0) {
-        merged.insert("expiresAt".into(), json!(value));
-    }
-    if let Some(value) = next.refresh_expires_at.filter(|value| *value > 0.0) {
-        merged.insert("refreshExpiresAt".into(), json!(value));
-    }
-    if let Some(identity) = identity.as_object() {
-        for (key, value) in identity {
-            merged.insert(key.clone(), value.clone());
-        }
-    }
-    Value::Object(merged)
-}
-
-// ─── 公开视图与身份 ─────────────────────────────────────────
-
-/// 公开视图（界面账号卡读的那几个键）。
-///
-/// 键名与 native `accounts::account_view` 对齐 —— 前端按 provider 渲染列，
-/// 少一个 `editionLabel` 会让这一家的版本徽章变成空白。
-pub fn view(secret: &Value) -> Value {
-    let uid = util::pick(secret, &["uid"]);
-    let name = util::pick(secret, &["name"]);
-    let nickname = util::pick(secret, &["nickname"]);
-    let edition = util::pick(secret, &["edition"]);
-    let edition = if edition.is_empty() {
-        Region::edition()
-    } else {
-        crate::endpoints::resolve_edition(Some(&edition))
-    };
-    let mut view = json!({
-        "uid": uid,
-        "name": if name.is_empty() { nickname.clone() } else { name },
-        "nickname": nickname,
-        "type": util::pick(secret, &["type"]),
-        "enterpriseId": util::pick(secret, &["enterpriseId"]),
-        "enterpriseName": util::pick(secret, &["enterpriseName"]),
-        "tokenTail": util::token_tail(&util::pick(secret, &["accessToken"])),
-        "hasRefreshToken": !util::pick(secret, &["refreshToken"]).is_empty(),
-        "edition": edition.id,
-        "editionLabel": edition.label,
-        "endpoint": util::pick(secret, &["endpoint"]),
-        "prefixPath": util::pick(secret, &["prefixPath"]),
-        "available": !util::pick(secret, &["accessToken"]).is_empty(),
-    });
-    let expires_at = secret.get("expiresAt").cloned().unwrap_or(Value::Null);
-    if let Some(object) = view.as_object_mut() {
-        object.insert("expiresAt".to_string(), expires_at);
-        object.insert(
-            "refreshTokenExpiresAt".to_string(),
-            secret.get("refreshExpiresAt").cloned().unwrap_or(Value::Null),
-        );
-    }
-    view
-}
-
-/// 稳定身份：`user-<uid>`（与内置 `add_account` 逐字一致）。
-///
-/// 口径分叉的代价很具体：同一个账号「重新导入 / 重新粘贴」会被当成新记录，
-/// 而内置实现那边是就地更新 —— 用户会看到两份一模一样的账号。
-pub fn identity(secret: &Value) -> String {
-    let uid = util::pick(secret, &["uid"]);
-    if uid.is_empty() {
-        return String::new();
-    }
-    format!("user-{uid}")
-}
-
-// ─── 账号规范化（`account.normalize`）────────────────────────
-
-/// 把各种来源统一成一条可落库的账号。
-///
-/// ── 三条来源（对照 native `accounts::normalize`）──────────────
-/// ```text
-///   manual      粘贴嵌套形 auth.json，或 wb2api 那种扁平形
-///   file_text   用户手选的登录态文件（内容与 Desktop 那份同构）
-///   desktop     读本机官方客户端目录 —— wasm 没有文件系统，给出可读错误
-///   file_base64 不支持（登录态是文本 JSON）
-/// ```
-pub fn normalize(params: &Value) -> Result<Value> {
-    let source = &params["source"];
-    let explicit_name = params["name"].as_str().map(str::trim).filter(|value| !value.is_empty());
-    let payload = match source["kind"].as_str() {
-        Some("manual") => {
-            // 表单提交的原始 JSON；宿主把输入框整包放在 `inputs` 里时先拆一层
-            let payload = &source["payload"];
-            if payload["inputs"].is_object() {
-                payload["inputs"].clone()
-            } else {
-                payload.clone()
-            }
-        }
-        Some("file_text") => {
-            let text = source["content"].as_str().unwrap_or("").trim();
-            if text.is_empty() {
-                return Err(Error::http(400, "凭证文件是空的"));
-            }
-            serde_json::from_str::<Value>(text)
-                .map_err(|_| Error::http(400, "凭证文件不是合法 JSON（请选择官方客户端登录后生成的 .info 文件）"))?
-        }
-        Some("desktop") => {
-            return Err(Error::http(
-                400,
-                "Wasm 插件读不到本机登录态文件（宿主沙箱里没有文件系统）。\
-                 请在官方客户端目录里找到 workbuddy-desktop.info，用「文件导入」或「粘贴」这一项导入",
-            ))
-        }
-        Some("file_base64") => {
-            return Err(Error::http(
-                400,
-                "WorkBuddy 的登录态是文本 JSON，请用「文件导入」选择 .info 文件（不支持二进制）",
-            ))
-        }
-        _ => return Err(Error::http(400, "未知的 WorkBuddy 账号来源")),
-    };
-    account_of(&payload, explicit_name)
-}
-
-/// payload（嵌套形或扁平形）→ 账号。字段口径与内置 `add_account` 对齐。
-fn account_of(payload: &Value, explicit_name: Option<&str>) -> Result<Value> {
-    let Some(object) = payload.as_object() else {
-        return Err(Error::http(400, "账号内容必须是 JSON 对象"));
-    };
-    let auth = object.get("auth").and_then(Value::as_object);
-    let account = object.get("account").and_then(Value::as_object);
-
-    // 嵌套形优先（官方客户端 / wb2api 导出），没有 `auth` 壳再回退顶层
-    let access_token = pick_nested(auth, object, &["accessToken", "token", "access_token"]);
-    let refresh_token = pick_nested(auth, object, &["refreshToken", "refresh_token"]);
-    if access_token.is_empty() {
-        return Err(Error::http(400, "缺少 accessToken"));
-    }
-    if access_token.chars().count() > MAX_TOKEN_LENGTH
-        || refresh_token.chars().count() > MAX_TOKEN_LENGTH
-    {
-        return Err(Error::http(400, "token 过长"));
-    }
-    let uid = {
-        let nested = account
-            .and_then(|map| map.get("uid"))
-            .or_else(|| object.get("uid"));
-        util::truncate_text(&nested.map(value_text).unwrap_or_default(), MAX_IDENTITY_LENGTH)
-    };
-    if uid.is_empty() {
-        return Err(Error::http(400, "缺少 uid（无法标识账号）"));
-    }
-
-    let mut secret = serde_json::Map::new();
-    secret.insert("uid".to_string(), Value::String(uid.clone()));
-    secret.insert("accessToken".to_string(), Value::String(access_token.clone()));
-    if !refresh_token.is_empty() {
-        secret.insert("refreshToken".to_string(), Value::String(refresh_token));
-    }
-    // 展示与组织字段：`account` 子对象优先，其次顶层（扁平形 wb2api 只给令牌）
-    for (key, nested_key) in [
-        ("nickname", "nickname"),
-        ("type", "type"),
-        ("enterpriseId", "enterpriseId"),
-        ("enterpriseName", "enterpriseName"),
-        ("departmentFullName", "departmentFullName"),
-        ("oneidAccountId", "oneidAccountId"),
-        ("idp", "idp"),
+pub fn authority(secret: &Value) -> Value {
+    let mut value = json!({ "region": "cn", "endpoint": secret["endpoint"] });
+    for key in [
+        "uid",
+        "type",
+        "enterpriseId",
+        "oneidAccountId",
+        "departmentFullName",
+        "idp",
+        "domain",
+        "tokenType",
     ] {
-        let value = account
-            .and_then(|map| map.get(nested_key))
-            .or_else(|| object.get(key))
-            .map(value_text)
-            .unwrap_or_default();
-        if !value.is_empty() {
-            secret.insert(
-                key.to_string(),
-                Value::String(util::truncate_text(&value, MAX_IDENTITY_LENGTH)),
-            );
+        if let Some(field) = secret.get(key) {
+            value[key] = field.clone();
         }
     }
-    for (key, candidates) in [
-        ("expiresAt", ["expiresAt", "expires_at"]),
-        ("refreshExpiresAt", ["refreshExpiresAt", "refresh_expires_at"]),
-    ] {
-        let value = pick_number(auth, object, &candidates);
-        if value > 0.0 {
-            secret.insert(key.to_string(), json!(value));
-        }
-    }
-    let domain = pick_nested(auth, object, &["domain"]);
-    if !domain.is_empty() {
-        secret.insert("domain".to_string(), Value::String(domain));
-    }
-    if let Some(value) = auth
-        .and_then(|fields| fields.get("tokenType"))
-        .or_else(|| object.get("tokenType"))
-    {
-        if value.is_string() {
-            secret.insert("tokenType".into(), value.clone());
-        }
-    }
-    // 端点 / 前缀 / 平台：payload 显式给了就用它（自建网关场景），否则按地区兜底。
-    // 三项都**必须**落下来：转发链的 `session_endpoint_of` 从记录读它们，缺了会
-    // 退到地区默认值 —— 对自建网关就是打错站点（症状是「刚加的账号不能用」）。
-    let info = Region::edition();
-    for (key, fallback) in [
-        ("endpoint", info.endpoint),
-        ("prefixPath", info.prefix_path),
-        ("platform", info.platform),
-    ] {
-        let given = object.get(key).map(value_text).unwrap_or_default();
-        secret.insert(
-            key.to_string(),
-            Value::String(if given.is_empty() {
-                fallback.to_string()
-            } else {
-                given
-            }),
-        );
-    }
-    secret.insert(
-        "edition".to_string(),
-        Value::String(Region::edition_id().to_string()),
-    );
-    secret.insert(
-        "tokenTail".to_string(),
-        Value::String(util::token_tail(&access_token)),
-    );
-
-    // 名字：显式给的 > 账号昵称 > `账号 <uid 前 8 位>`（与内置同款兜底）
-    let nickname = secret
-        .get("nickname")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let name = explicit_name
-        .map(|value| util::truncate_text(value, MAX_NAME_LENGTH))
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| Some(nickname).filter(|value| !value.is_empty()))
-        .unwrap_or_else(|| format!("账号 {}", util::truncate_text(&uid, 8)));
-    secret.insert("name".to_string(), Value::String(name));
-
-    let secret = Value::Object(secret);
-    Ok(json!({
-        "public": view(&secret),
-        "identity": identity(&secret),
-        "secret": secret,
-        // 快照形态：凭证落在记录里，没有「转发时实时读」那一层
-        "desktop": false,
-    }))
+    value
 }
-
-/// 嵌套 `auth` 对象优先、顶层兜底，取第一个非空文本。
-fn pick_nested(
-    auth: Option<&serde_json::Map<String, Value>>,
-    object: &serde_json::Map<String, Value>,
-    keys: &[&str],
-) -> String {
-    for key in keys {
-        if let Some(value) = auth.and_then(|map| map.get(*key)) {
-            let text = value_text(value);
-            if !text.is_empty() {
-                return text;
-            }
-        }
-    }
-    for key in keys {
-        if let Some(value) = object.get(*key) {
-            let text = value_text(value);
-            if !text.is_empty() {
-                return text;
-            }
-        }
-    }
-    String::new()
+pub fn fingerprint(secret: &Value) -> String {
+    util::hash(&authority(secret).to_string())
 }
-
-/// 同上，取第一个正数（毫秒时间戳）。
-fn pick_number(
-    auth: Option<&serde_json::Map<String, Value>>,
-    object: &serde_json::Map<String, Value>,
-    keys: &[&str],
-) -> f64 {
-    let read = |value: &Value| -> f64 {
-        match value {
-            Value::Number(number) => number.as_f64().unwrap_or(0.0),
-            Value::String(text) => text.trim().parse::<f64>().unwrap_or(0.0),
-            _ => 0.0,
-        }
-    };
-    for key in keys {
-        if let Some(value) = auth.and_then(|map| map.get(*key)) {
-            let number = read(value);
-            if number > 0.0 {
-                return number;
-            }
-        }
-    }
-    for key in keys {
-        if let Some(value) = object.get(*key) {
-            let number = read(value);
-            if number > 0.0 {
-                return number;
-            }
-        }
-    }
-    0.0
+pub fn same_auth(a: &Value, b: &Value) -> bool {
+    authority(a) == authority(b)
+        && a["accessToken"] == b["accessToken"]
+        && a["refreshToken"] == b["refreshToken"]
+        && a["prefixPath"] == b["prefixPath"]
+        && a["platform"] == b["platform"]
 }
-
-/// JSON 值的文本形态（字符串去空白、数字转字符串、其余空串）。
-fn value_text(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.trim().to_string(),
-        Value::Number(number) => number.to_string(),
-        _ => String::new(),
-    }
+pub fn personal(secret: &Value) -> bool {
+    util::text(secret, &["enterpriseId"]).is_empty()
 }

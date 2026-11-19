@@ -1,405 +1,177 @@
-//! 千问办公模型目录（native `models.rs` 的站点分支裁剪版）。
-//!
-//! ── 清单从哪来 ──────────────────────────────────────────────
-//!   1. **静态兜底**：`metadata.json` 里的 `default_models`（`高级` / `标准` /
-//!      `Qwen3.8-Max` 三条，与 native `Site::fallback_models` 同一份）。启动即可
-//!      用，网络不通 / 没账号时 `/v1/models` 仍然有内容。
-//!   2. **远程刷新**：`GET {gateway}algo/api/v2/model/list?Encode=1`（COSY 签名，
-//!      缓存 1 小时）。结果由宿主目录缓存（`catalog.get`）持有，进程重启后仍在。
-//!
-//! ── 这一家的目录形状（与 Qoder 不同，别照抄）───────────────
-//! `{"qwork": [ {key, display_name, max_input_tokens, …} ]}` —— **整份目录都在
-//! `qwork` 这一个场景里**（含上游标了 `enable: false` 的条目），没有 `chat` /
-//! `app` 两段可合并。native 那边对应 `Site::model_scene` / `list_all_models`。
-//!
-//! ── 可见性不读上游 `enable`（native 2026-10-17 的修正，原样保留）──────
-//! `enable` 的语义是「**当前账号当前套餐**能不能用这个模型」，是逐账号的权益位，
-//! 不是「客户端展不展示」（Qoder 那边的实测数据把它彻底否掉过）。千问办公的
-//! 目录只有几个模型、都是当前一代，所以这里一律 `shown`，与 `enable` 无关。
+//! 展示目录由 catalog.accounts.v1 按国际账号保存聚合，签名/路由素材仍在原账号 state。
+//! qwork 展示与当前账号 enable 权益分开，合法名称在插件内解析，不借另一账号的目录。
+use super::{account, catalog, client, cosy, endpoints, refresh, util};
+use agent2api_wasm_sdk::{
+    self as sdk, json,
+    state::{self, Scope},
+    Error, Result, Value,
+};
 
-use agent2api_wasm_sdk::{self as sdk, json, Error, Result, Value};
+const KEY: &str = "qwenwork-intl-route-catalog";
+const TTL: i64 = 3_600_000;
+const BACKOFF: &str = "catalog-refresh";
 
-use super::context;
-use super::cosy::{self, CosyIdentity};
-use super::credentials::Credentials;
-use super::protocol::truthy;
-use super::site;
-
-/// 远程目录缓存有效期（源实现 `CACHE_TTL_MS`：1 小时）
-const CACHE_TTL_MS: i64 = 60 * 60 * 1000;
-
-/// 本站点的静态兜底清单（`metadata.json` 的 `default_models`）。
-///
-/// ── 为什么不在这里再抄一份表 ────────────────────────────────
-/// 这份表已经作为 `metadata.json` 的 `default_models` 落在包里（宿主启动时
-/// 会读它做初始目录），native 那张 CN 表与它逐条相同（id / upstreamKey /
-/// enabled / efforts / vision / credits / visibility 都一致）。再抄一份等于
-/// 两处事实源 —— 改一处忘另一处时，界面与转发会看到两个不同的清单。
-pub fn fallback() -> Vec<Value> {
-    super::metadata()["default_models"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-}
-
-/// 宿主目录缓存里的远程清单（没有则空）
-fn remote() -> Vec<Value> {
-    sdk::catalog::cached()
-        .ok()
-        .and_then(|cached| cached["models"].as_array().cloned())
-        .unwrap_or_default()
-}
-
-/// 当前生效的清单：远程优先，否则静态兜底。
-pub fn list() -> Vec<Value> {
-    let mut models = remote();
-    if models.is_empty() {
-        models = fallback();
-    }
-    for model in models.iter_mut() {
-        if let Some(object) = model.as_object_mut() {
-            object.insert(
-                "providerId".to_string(),
-                Value::String(site::PROVIDER_ID.to_string()),
-            );
-        }
-    }
-    models
-        .into_iter()
-        .filter(|model| model.get("id").and_then(Value::as_str).is_some_and(|id| !id.is_empty()))
-        .collect()
-}
-
-/// 把客户端的模型名解析成「上游标识 + 模型配置」。
-///
-/// ── 匹配顺序（与 native `catalog::providers_for_model` 同口径）────
-/// 先按 `id` 全等（忽略大小写），再按 `name` 全等，最后按 `upstreamKey`。
-pub fn resolve(model_id: &str) -> Option<Value> {
-    let wanted = model_id.trim().to_lowercase();
-    if wanted.is_empty() {
-        return None;
-    }
-    let models = list();
-    for key in ["id", "name", "upstreamKey"] {
-        if let Some(found) = models.iter().find(|model| {
-            model
-                .get(key)
-                .and_then(Value::as_str)
-                .map(|text| text.trim().to_lowercase() == wanted)
-                .unwrap_or(false)
-        }) {
-            return Some(found.clone());
-        }
-    }
-    // 远程目录里没有时再查一遍静态兜底（覆盖「远程清单缺这一条」的情形）
-    fallback().into_iter().find(|model| {
-        ["id", "name", "upstreamKey"].iter().any(|key| {
-            model
-                .get(*key)
-                .and_then(Value::as_str)
-                .map(|text| text.trim().to_lowercase() == wanted)
-                .unwrap_or(false)
-        })
-    })
-}
-
-/// `models.list` 的应答（三档语义：远程 / 兜底）。
-pub fn list_response() -> Result<Value> {
-    let cached = sdk::catalog::cached().unwrap_or(Value::Null);
-    let models = list();
-    let is_remote = cached["models"]
-        .as_array()
-        .is_some_and(|items| !items.is_empty());
-    Ok(json!({
-        "models": models,
-        "meta": {
-            "remote": is_remote,
-            "refreshed_at": if is_remote { cached["meta"]["refreshed_at"].clone() } else { json!(0) },
-        },
-    }))
-}
-
-/// 拉取并返回远程目录（结果交给宿主缓存）。
-///
-/// `force = false` 时命中 TTL 直接早退（自动路径）；用户手动点刷新时调用方传
-/// `true` —— 缓存该不该复用只由**谁发起**决定。
-///
-/// ── 没有账号时为什么返回「没刷」而不是「失败」──────────────────
-/// 手动刷新的逐家结果会显示在模型页上。一个从不用 Qoder 的用户点刷新时，
-/// 报一条红色失败会让他以为哪里坏了 —— 而事实只是「这家没有可刷的东西」。
-/// 三档语义里这正是 `unchanged`（skipped）的定义：**不是错误**。自动路径每次
-/// 拉目录/启动都会走到这里，所以也只回 unchanged。
-pub fn refresh(force: bool) -> Result<Value> {
-    let credentials = match super::refresh::snapshot() {
-        Ok((_, credentials)) => credentials,
-        Err(_) => return Ok(json!({ "refreshed": false, "count": 0 })),
-    };
-    let credentials = if credentials.expiring() {
-        super::refresh::ensure_fresh(true)?
-    } else {
-        credentials
-    };
-    if !force {
-        let cached = sdk::catalog::cached().unwrap_or(Value::Null);
-        let age = sdk::now() - cached["meta"]["refreshed_at"].as_i64().unwrap_or(0);
-        if cached["models"].as_array().is_some_and(|items| !items.is_empty())
-            && (0..CACHE_TTL_MS).contains(&age)
-        {
-            return Ok(json!({
-                "refreshed": false,
-                "count": cached["models"].as_array().map(Vec::len).unwrap_or(0),
-            }));
-        }
-    }
-    let payload = fetch(&credentials)?;
-    let models = parse_catalog(&payload);
-    if models.is_empty() {
-        return Err(Error::http(502, "上游返回的模型目录为空"));
-    }
-    Ok(json!({
-        "refreshed": true,
-        "count": models.len(),
-        "models": models,
-        "meta": { "remote": true, "refreshed_at": sdk::now() },
-    }))
-}
-
-/// 打一次目录请求（COSY 签名；GET 的签名体为空）。
-fn fetch(credentials: &Credentials) -> Result<Value> {
-    let url = site::gateway_url("algo/api/v2/model/list?Encode=1");
-    let identity = CosyIdentity {
-        user_id: &credentials.user_id,
-        auth_token: &credentials.access_token,
-        name: &credentials.name,
-        email: &credentials.email,
-        machine_id: &credentials.machine_id,
-    };
-    let headers = cosy::build_auth_headers(None, &url, &identity)?;
-    let response = super::auth::request("GET", &url, None, &headers)?;
-    if !response.ok {
-        return Err(Error::http(
-            response.status.max(400),
-            format!("模型目录刷新失败（HTTP {}）", response.status),
-        ));
-    }
-    let payload = response.payload.unwrap_or(Value::Null);
-    if let Some(message) = envelope_error(&payload) {
-        return Err(Error::http(502, message));
-    }
-    Ok(payload)
-}
-
-/// 上游目录响应里的业务错误（HTTP 200 也可能带错误）
-fn envelope_error(payload: &Value) -> Option<String> {
-    let code = payload
-        .get("statusCodeValue")
-        .and_then(Value::as_i64)
-        .or_else(|| payload.get("code").and_then(Value::as_i64));
-    match code {
-        Some(200) | None => None,
-        Some(code) => Some(format!(
-            "上游返回业务错误 {code}: {}",
-            payload
-                .get("message")
-                .and_then(Value::as_str)
-                .or_else(|| payload.get("body").and_then(Value::as_str))
-                .unwrap_or("")
-                .chars()
-                .take(200)
-                .collect::<String>()
-        )),
-    }
-}
-
-/// 解析目录响应（千问办公：`{ qwork: [ … ] }`，**整份保留**）。
-///
-/// ── 与 Qoder 那一份的三处差别（都是 native 站点分支的直接后果）────
-///   1. **只有一个场景**：目录全在 `qwork` 里，没有 `chat` + `app` 两段合并，
-///      也不需要按 `format == openai` 去挑；
-///   2. **`enable: false` 也列**：它的 `enable` 是「本套餐能不能用」，而客户端
-///      列表照样把这些模型列出来（native `Site::list_all_models`）；
-///   3. **可见性一律 `shown`**：目录只有几个模型、都是当前一代，没有 Qoder 那种
-///      「世代 / 档位别名」要藏。
-///
-/// 对外模型 id 仍用 `display_name` **去掉空白**（源实现 `toModelId`）——
-/// 客户端看到的名称可读，请求时再映射回 `key`。
-fn parse_catalog(payload: &Value) -> Vec<Value> {
-    let rows: Vec<&Value> = payload
-        .get(site::MODEL_SCENE)
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .collect();
-    let mut models: Vec<Value> = Vec::new();
-    let mut seen: Vec<String> = Vec::new();
-    for item in rows {
-        let key = item.get("key").and_then(Value::as_str).unwrap_or("").trim();
-        let display = item.get("display_name").and_then(Value::as_str).unwrap_or("").trim();
-        if key.is_empty() || display.is_empty() {
-            continue;
-        }
-        let id: String = display.chars().filter(|ch| !ch.is_whitespace()).collect();
-        if id.is_empty() {
-            continue;
-        }
-        let lowered = id.to_lowercase();
-        if seen.iter().any(|known| known == &lowered) {
-            continue;
-        }
-        seen.push(lowered);
-
-        let vision = item.get("is_vl").map(truthy).unwrap_or(false);
-        let reasoning = item.get("is_reasoning").map(truthy).unwrap_or(false)
-            || item.get("thinking_config").map(truthy).unwrap_or(false);
-        // 上游在该模型条目里声明支持的思考档位，作为请求时的白名单
-        let efforts: Vec<Value> = item
-            .pointer("/thinking_config/enabled/efforts")
-            .and_then(Value::as_object)
-            .map(|map| map.keys().map(|key| Value::String(key.clone())).collect())
-            .unwrap_or_default();
-        let context_window = context_window_of(item);
-        let source = item.get("source").and_then(Value::as_str).unwrap_or("system");
-        // 倍率（官方中文名「Credit 消耗倍率」）：上游在模型条目**顶层**给
-        // `price_factor`，取值 0～3.2。折扣时段它本身就是折后价
-        // （另有 `original_price_factor` 记原价）—— 取实际生效的那个。
-        let credits = credits_of(item);
-        // 整份保留（见函数头第 2 条）：千问办公的 `enable` 是「本套餐能不能用」，
-        // 客户端列表照样把这些模型列出来。
-        let enabled = site::LIST_ALL_MODELS || item.get("enable").map(truthy).unwrap_or(false);
-
-        let mut model = entry(
-            &id,
-            display,
-            key,
-            reasoning,
-            vision,
-            enabled,
-            context_window,
-            source,
-            &credits,
-            // 目录只有几个模型、都是当前一代，一律 shown（见函数头第 3 条）
-            "shown",
+pub fn list(params: &Value) -> Result<Value> {
+    if params["account"].as_str().is_none_or(str::is_empty) {
+        return Ok(
+            json!({ "models": catalog::public(&catalog::fallback()), "meta": { "remote": false, "refreshed_at": 0 } }),
         );
-        if let Some(object) = model.as_object_mut() {
-            object.insert("efforts".to_string(), Value::Array(efforts));
-            if let Some(format) = item.get("format") {
-                if !format.is_null() {
-                    if let Some(config) = object.get_mut("config").and_then(Value::as_object_mut) {
-                        config.insert("format".to_string(), format.clone());
-                    }
+    }
+    let snapshot = account::read()?;
+    let cached = sdk::catalog::cached()?;
+    account::unchanged(&snapshot)?;
+    if cached["meta"]["remote"] == true && cached["models"].is_array() {
+        return Ok(cached);
+    }
+    Ok(
+        json!({ "models": catalog::public(&catalog::fallback()), "meta": { "remote": false, "refreshed_at": 0 } }),
+    )
+}
+fn cache() -> Result<state::Snapshot> {
+    state::get(Scope::Account, KEY, 1)
+}
+fn cached(
+    before: &state::Snapshot,
+    snapshot: &account::Snapshot,
+    fresh: bool,
+) -> Result<Option<Vec<Value>>> {
+    if !before.compatible || before.value["binding"] != snapshot.credentials.binding() {
+        return Ok(None);
+    }
+    if fresh
+        && !(0..TTL)
+            .contains(&util::now()?.saturating_sub(before.value["at"].as_i64().unwrap_or(0)))
+    {
+        return Ok(None);
+    }
+    Ok(before.value["models"].as_array().cloned())
+}
+fn fetch(snapshot: &account::Snapshot) -> Result<Vec<Value>> {
+    account::unchanged(snapshot)?;
+    let headers = cosy::headers(None, endpoints::MODELS, &snapshot.credentials)?;
+    let reply = client::request("GET", endpoints::MODELS, headers, None, "模型目录查询")?;
+    let payload = client::accepted(reply, "模型目录查询")?;
+    account::unchanged(snapshot)?;
+    catalog::parse(&payload)
+}
+fn store(before: &state::Snapshot, snapshot: &account::Snapshot, models: &[Value]) -> Result<i64> {
+    account::unchanged(snapshot)?;
+    let at = util::now()?;
+    let value = json!({ "binding": snapshot.credentials.binding(), "at": at, "models": models });
+    if value.to_string().len() > 240 * 1024 {
+        return Err(Error::http(502, "千问办公目录超过缓存容量，未替换现有目录"));
+    }
+    if !state::compare_exchange(Scope::Account, KEY, 1, before.revision, value, 0)? {
+        return Err(Error::http(409, "千问办公目录已被另一轮刷新，请重试"));
+    }
+    Ok(at)
+}
+pub fn refresh(params: &Value) -> Result<Value> {
+    if params["account"].as_str().is_none_or(str::is_empty) {
+        return Ok(
+            json!({ "refreshed": false, "message": "没有主程序选定的千问办公国际账号，已保留静态目录" }),
+        );
+    }
+    let result = (|| -> Result<Value> {
+        let mut snapshot = refresh::ensure(false)?;
+        let before = cache()?;
+        if !params["force"].as_bool().unwrap_or(false) {
+            if let Some(models) = cached(&before, &snapshot, true)? {
+                let public = catalog::public(&models);
+                let shown = list(params)?;
+                account::unchanged(&snapshot)?;
+                if shown["models"] == json!(public) && shown["meta"]["remote"] == true {
+                    return Ok(sdk::catalog::unchanged(models.len()));
                 }
+                return Ok(
+                    json!({ "refreshed": true, "count": public.len(), "models": public,
+                    "meta": { "remote": true, "refreshed_at": before.value["at"] } }),
+                );
             }
-            // 上下文档位（请求时按 prompt 估算升级，见 `context.rs`）：含上游
-            // **当前**选中的那档（`max_input_tokens`）—— 升档判据要与它比。
-            if let Some(config) = object.get_mut("config").and_then(Value::as_object_mut) {
-                let tiers = context::tiers_from_catalog(item);
-                if !tiers.is_empty() {
-                    config.insert("tiers".to_string(), Value::Array(tiers));
+        }
+        let models = match fetch(&snapshot) {
+            Err(error) if error.status == Some(401) && snapshot.credentials.can_refresh() => {
+                account::unchanged(&snapshot)?;
+                let original = snapshot.credentials.binding();
+                snapshot = refresh::ensure(true)?;
+                if snapshot.credentials.binding() != original {
+                    return Err(account::changed());
                 }
-                if let Some(current) = item.get("max_input_tokens").and_then(Value::as_i64) {
-                    if current > 0 {
-                        config.insert("max_input_tokens".to_string(), Value::from(current));
-                    }
-                }
+                fetch(&snapshot)?
             }
+            result => result?,
+        };
+        let at = store(&before, &snapshot, &models)?;
+        let public = catalog::public(&models);
+        Ok(
+            json!({ "refreshed": true, "count": public.len(), "models": public, "meta": { "remote": true, "refreshed_at": at } }),
+        )
+    })();
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) if util::terminal(&error) => Err(error),
+        Err(error) => Ok(sdk::catalog::failed(&error.message)),
+    }
+}
+pub fn for_account(snapshot: &account::Snapshot) -> Result<Vec<Value>> {
+    let before = cache()?;
+    if let Some(models) = cached(&before, snapshot, true)? {
+        account::unchanged(snapshot)?;
+        return Ok(models);
+    }
+    let previous = cached(&before, snapshot, false)?;
+    let backoff = util::transient(BACKOFF)?;
+    let now = util::now()?;
+    if backoff.compatible
+        && backoff.value["binding"] == snapshot.credentials.binding()
+        && backoff.value["retryAt"].as_i64().unwrap_or(0) > now
+    {
+        account::unchanged(snapshot)?;
+        return Ok(previous.unwrap_or_else(catalog::fallback));
+    }
+    if !util::put(
+        BACKOFF,
+        &backoff,
+        json!({ "binding": snapshot.credentials.binding(), "retryAt": now + 60_000 }),
+        TTL,
+    )? {
+        account::unchanged(snapshot)?;
+        return Ok(previous.unwrap_or_else(catalog::fallback));
+    }
+    let result = fetch(snapshot);
+    account::unchanged(snapshot)?;
+    match result {
+        Ok(models) => {
+            store(&before, snapshot, &models)?;
+            Ok(models)
         }
-        models.push(model);
+        Err(error) if util::terminal(&error) => Err(error),
+        Err(_) => Ok(previous.unwrap_or_else(catalog::fallback)),
     }
-    models
 }
-
-/// 构造一条目录条目（与 `metadata.json` 的 `default_models` 同形）。
-pub fn entry(
-    id: &str,
-    name: &str,
-    upstream_key: &str,
-    reasoning: bool,
-    vision: bool,
-    enabled: bool,
-    context_window: i64,
-    source: &str,
-    credits: &str,
-    visibility: &str,
-) -> Value {
-    let mut model = json!({
-        "id": id,
-        "name": name,
-        "upstreamKey": upstream_key,
-        "enabled": enabled,
-        // 可见性**不能**直接拿 `enabled` 顶替（两者语义不同）：静态兜底表里
-        // `Auto` 这些档位别名恰好是 `enabled: false`，但它们不可见的理由不是
-        // 「没启用」。真正的判据由调用方显式传 `visibility`。
-        "visibility": visibility,
-        "reasoning": reasoning,
-        "supportsReasoning": reasoning,
-        "supportsImages": vision,
-        // 本家的上游是 agent 形态，工具调用是固有能力
-        "supportsToolCall": true,
-        "efforts": [],
-        "maxInputTokens": context_window,
-        "maxOutputTokens": super::protocol::MAX_OUTPUT_TOKENS,
-        "isDefault": false,
-        "kind": "chat",
-        "config": {
-            "key": upstream_key,
-            "is_reasoning": reasoning,
-            "is_vl": vision,
-            "source": source,
-        },
-    });
-    // 倍率键只在有值时插入：少一个键让「上游没给」与「上游给了空串」可区分
-    if !credits.is_empty() {
-        if let Some(object) = model.as_object_mut() {
-            object.insert("credits".to_string(), Value::String(credits.to_string()));
-        }
+pub fn resolve(name: &str, snapshot: &account::Snapshot) -> Result<Value> {
+    if name.trim().is_empty() || name.len() > 512 || name.chars().any(char::is_control) {
+        return Err(Error::http(400, "请指定千问办公国际目录中的有效模型名"));
     }
-    model
-}
-
-/// 上游 `price_factor` → 展示文本（远程路径）。
-///
-/// `price_factor = 0` 是**合法值**（Qwen3.8-Flash 免费档，界面显示 `0x`），
-/// 不能当缺失去掉。因此返回**字符串**而非数字（数字 0 会被真值判定丢掉）。
-/// 也接受字符串形态（同一家的其它目录字段就混着两种形态）。
-fn credits_of(item: &Value) -> String {
-    let factor = match item.get("price_factor") {
-        Some(Value::Number(number)) => number.as_f64(),
-        Some(Value::String(text)) => text.trim().parse::<f64>().ok(),
-        _ => None,
-    };
-    let Some(factor) = factor else {
-        return String::new();
-    };
-    if !factor.is_finite() || factor < 0.0 {
-        return String::new();
+    let models = for_account(snapshot)?;
+    let model = catalog::find(&models, name)
+        .or_else(|| {
+            // 成功空目录及完整远程目录不能被静态旧条目重新填回。
+            (!models.is_empty()
+                && models
+                    .iter()
+                    .all(|model| model["capabilityEvidence"] != "remote_catalog"))
+            .then(|| catalog::find(&catalog::fallback(), name))
+            .flatten()
+        })
+        .ok_or_else(|| {
+            Error::http(400, "模型不在千问办公国际目录中，请刷新目录后重试")
+                .with_code("model_not_found")
+        })?;
+    if model["permissionKnown"] == true && model["accountEnabled"] != true {
+        return Err(Error::http(403, "当前千问办公国际账号的套餐未开通该模型")
+            .with_code("qwenwork_quota_limited"));
     }
-    format!("x{} credits", format_factor(factor))
-}
-
-/// 倍率数字 → 紧凑文本（整数不带小数点，其余最多两位小数、裁掉尾零）。
-///
-/// 不用 `{:.1}`：Qoder 的倍率有 `0.04` 这一档，一位小数会四舍五入成 `0.0`
-/// —— 一个「免费」的错误暗示。
-fn format_factor(value: f64) -> String {
-    let rounded = (value * 100.0).round() / 100.0;
-    if (rounded - rounded.trunc()).abs() < 1e-9 {
-        return format!("{}", rounded.trunc() as i64);
-    }
-    let text = format!("{rounded:.2}");
-    text.trim_end_matches('0').trim_end_matches('.').to_string()
-}
-
-/// 上下文窗口。
-///
-/// 千问办公的目录**没有 `context_config`**（没有多档上下文窗口），只有条目上的
-/// 一个 `max_input_tokens`（客户端声明值）。所以那一档就以它为准；条目没声明
-/// 时用站点声明的 1.02M —— 而不是退回一个更小的默认值，后者会让本可以放下的
-/// 长对话被判成超长（native `Site::max_input_tokens` 同一条口径）。
-fn context_window_of(item: &Value) -> i64 {
-    if let Some(declared) = item.get("max_input_tokens").and_then(Value::as_i64) {
-        if declared > 0 {
-            return declared;
-        }
-    }
-    site::MAX_INPUT_TOKENS
+    account::unchanged(snapshot)?;
+    Ok(model)
 }

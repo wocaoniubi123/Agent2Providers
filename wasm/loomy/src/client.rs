@@ -1,143 +1,71 @@
-//! Loomy 两种出站请求的薄封装：签名 POST（CAccount）与 token 请求（集成网关）。
-//!
-//! ── 为什么收在一处 ──────────────────────────────────────────
-//! 六处消费者（login / checkin / balance / onboarding / models）共用同一套超时、
-//! 错误翻译与「业务码 → 人话」口径；各写一份会让「哪个码算登录失效」这类判据分叉。
-//!
-//! ── 业务码的口径（实测 + 客户端源码对照）────────────────────
-//! CAccount 与集成网关都用 HTTP 200 + `{code, desc, data}` 表达业务结果：
-//!   - `000000`：成功；
-//!   - `020002` / `100002`：登录态无效（客户端 `AUTH_ERROR_CODES`）；
-//!   - 其余：业务失败，`desc` 是上游文案。
+//! 网络全部经宿主、沿调用账号/登录 flow 代理；不接收插件自由代理或主机覆盖。
 
 use agent2api_wasm_sdk::{http, json, Error, Result, Value};
 
-use super::endpoints;
-use super::sign;
+use super::{errors, sign, ACCOUNT_BASE, INTEGRATION_BASE};
 
-/// 登录态失效业务码（客户端 `AUTH_ERROR_CODES`）
-pub const AUTH_ERROR_CODES: [&str; 2] = ["020002", "100002"];
-
-/// 成功码
-pub const SUCCESS_CODE: &str = "000000";
-
-/// 单次响应的体积上限（积分流水摘要带 `list`，给足余量但不无限）。
-const MAX_BODY: usize = 4 * 1024 * 1024;
-
-/// 读取响应体里的业务码（字符串；缺失时为空串）
-pub fn business_code(payload: &Value) -> String {
-    match payload.get("code") {
-        Some(Value::String(code)) => code.trim().to_string(),
-        Some(Value::Number(code)) => code.to_string(),
-        _ => String::new(),
-    }
-}
-
-/// 业务码是不是「登录态无效」
-pub fn is_auth_error_code(code: &str) -> bool {
-    AUTH_ERROR_CODES.contains(&code) || code == "20002"
-}
-
-/// 上游业务文案（积分信封与两种模型协议的错误体）。
-pub fn upstream_message(payload: &Value) -> String {
-    [
-        payload.get("desc"),
-        payload.get("message"),
-        payload.pointer("/error/message"),
-        payload.get("error_msg"),
-    ]
-    .into_iter()
-    .find_map(|value| {
-        value
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-    })
-    .unwrap_or("")
-    .to_string()
-}
-
-/// 发一次请求并取回「状态码 + 解析后的响应体」。
-///
-/// 不按状态码早退：调用方各有各的翻译（业务码判定在 HTTP 200 上也要做）。
-/// 解析不出 JSON 时保留原文（`String`），让错误文案能带上上游真正说了什么。
-fn exchange(method: &str, url: &str, headers: Value, body: Option<&Value>) -> Result<(u16, Value)> {
-    let response = http::open(method, url, headers, body)?;
+pub fn read_json(response: http::Response, operation: &str, secrets: &[&str]) -> Result<Value> {
     let status = response.status;
-    let bytes = response.bytes(MAX_BODY)?;
-    let payload = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes)
-            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()))
-    };
-    Ok((status, payload))
-}
-
-/// 向 CAccount 发一次**带签名**的 POST（登录链路，没有账号上下文）。
-///
-/// 返回上游响应体（`{code, desc, data}`）。HTTP 层失败翻译成错误；业务码
-/// **不在这里判**（调用方各有各的翻译，见 `login.rs`）。
-pub fn signed_post(path: &str, body: &Value, what: &str) -> Result<Value> {
-    let url = format!("{}{path}", endpoints::xfyun_base_url());
-    let headers = sign::header_object(&sign::signed_headers("POST", path, Some(body)));
-    let (status, payload) = exchange("POST", &url, headers, Some(body))?;
+    let bytes = response.bytes(4 * 1024 * 1024).map_err(|mut error| {
+        error.message = format!("{operation}响应读取失败");
+        error
+    })?;
+    let payload: Value = serde_json::from_slice(&bytes).map_err(|_| {
+        if status == 401 {
+            Error::http(401, "Loomy 登录态已失效，请重新登录")
+        } else {
+            Error::http(
+                if (400..600).contains(&status) {
+                    status
+                } else {
+                    502
+                },
+                format!("{operation}未返回有效 JSON"),
+            )
+        }
+    })?;
     if !(200..300).contains(&status) {
-        return Err(Error::http(
-            status,
-            format!("{what}返回 HTTP {status}（上游地址 {url}）"),
-        ));
+        return Err(errors::http_error(status, &payload, secrets));
     }
     Ok(payload)
 }
 
-/// 向集成网关发一次带 `token`（= 登录 session）的请求。
-///
-/// `path` 形如 `/api/v1/points/first-login`；query 由调用方自己拼在 path 后。
-///
-/// 成功（HTTP 2xx）返回响应体；HTTP 失败翻译成错误。**登录态失效（业务码）
-/// 由调用方判定** —— 不同接口的成功码判定不同（模型列表接口根本不返回 `code`）。
+pub fn signed_post(path: &str, body: &Value, operation: &str, secrets: &[&str]) -> Result<Value> {
+    let bytes = body.to_string().into_bytes();
+    let headers = sign::headers(path, &bytes)?;
+    let response = http::open_raw(
+        "POST",
+        &format!("{ACCOUNT_BASE}{path}"),
+        headers,
+        Some(&bytes),
+    )
+    .map_err(|mut error| {
+        error.message = format!("{operation}网络请求失败");
+        error
+    })?;
+    read_json(response, operation, secrets)
+}
+
 pub fn token_request(
     method: &str,
     path: &str,
     session: &str,
     body: Option<&Value>,
-    what: &str,
+    operation: &str,
 ) -> Result<Value> {
-    if session.trim().is_empty() {
-        return Err(Error::new("Loomy 账号缺少 session"));
+    if session.is_empty() {
+        return Err(Error::http(401, "Loomy 账号缺少 session"));
     }
-    let url = format!("{}{path}", endpoints::integration_base_url());
-    let headers = json!({
-        "token": session,
-        "Authorization": format!("Bearer {session}"),
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    });
-    let empty = Value::Object(serde_json::Map::new());
-    let posting = method.eq_ignore_ascii_case("POST");
-    let (status, payload) = exchange(
-        if posting { "POST" } else { "GET" },
-        &url,
-        headers,
-        if posting { Some(body.unwrap_or(&empty)) } else { None },
-    )?;
-    if !(200..300).contains(&status) {
-        if status == 401 || is_auth_error_code(&business_code(&payload)) {
-            return Err(Error::http(
-                401,
-                format!("{what}：Loomy 登录态已失效，请重新登录（HTTP {status}）"),
-            ));
-        }
-        let message = upstream_message(&payload);
-        return Err(Error::http(
-            status,
-            if message.is_empty() {
-                format!("{what}返回 HTTP {status}")
-            } else {
-                format!("{what}返回 HTTP {status}：{message}")
-            },
-        ));
+    let headers = json!({ "token": session, "Authorization": format!("Bearer {session}"),
+        "Content-Type": "application/json", "Accept": "application/json" });
+    let response = http::open(method, &format!("{INTEGRATION_BASE}{path}"), headers, body)
+        .map_err(|mut error| {
+            error.message = format!("{operation}网络请求失败");
+            error
+        })?;
+    let payload = read_json(response, operation, &[session])?;
+    if payload.get("error").is_some_and(|error| !error.is_null()) {
+        return Err(errors::http_error(502, &payload, &[session]));
     }
     Ok(payload)
 }

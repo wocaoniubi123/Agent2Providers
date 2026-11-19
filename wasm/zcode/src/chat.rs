@@ -1,290 +1,293 @@
-//! 对话转发：`conversation`（真正跑在网关上的那条）与 `chat`（构造请求的直译）。
-//!
-//! ── 为什么本家必须走 `conversation` ──────────────────────────
-//! 网关 `plugin_host/rpc.rs` 的 `build_chat_request_async` 对**任何** wasm 包
-//! 直接回 501（插件不能只回答「怎么构造请求」），真正生效的是 `conversation`：
-//! 插件自己发上游请求、自己把上游协议折成 **chat SSE** 字节回传。
-//! `chat` 仍按 native `build_chat` 的语义实现（交出 `{url, headers, body,
-//! upstream}`），保证协议映射表里那一条不是空的 —— 但它不是生产路径。
-//!
-//! ── 本家为什么需要翻译层 ────────────────────────────────────
-//! 套餐池通道（`start-plan`）的上游是 Anthropic Messages。native 侧由网关的
-//! 翻译层折回 chat SSE；Wasm 侧没有那一层，所以往返两份转换都在插件里
-//! （见 `anthropic.rs` 的模块头）。编码套餐通道（`coding-plan`）上游本来就吐
-//! chat SSE，直接透传。
-//!
-//! ── 出错边界（照抄 atomcode 的判定，别改）─────────────────────
-//! 「已经 `stream.head` 之后才出错」与「还没下发就出错」是两种情况：
-//!   · 前者：下游已收到 200 与部分帧，只能用**流内错误帧**收尾（再抛给主程序
-//!     让它记一条失败），不能悄悄重发；
-//!   · 后者：直接抛错，由网关按 HTTP 错误回给客户端。
+//! 双通道共用标准 Chat SSE 输出。纯协议转换由宿主 protocol.convert.v1 承担，
+//! 本家保留HTTP 200业务拒绝、风控停止、验证码与Start Plan三块提示等专属规则。
+use super::{account, captcha, config, errors, network, prompt, quota, reasoning, request_context};
+use agent2api_wasm_sdk::{
+    self as sdk, http, json, protocol, sse::SseDecoder, Error, Result, Value,
+};
 
-use agent2api_wasm_sdk::{self as sdk, http, json, sse::SseDecoder, Error, Result, Value};
-
-use super::common::headers_object;
-use super::{account, anthropic, captcha, errors, http as net, models, plan, plan::Plan};
-
-/// 上游请求体上限（对话请求带历史，给足余量）。
-const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
-
-/// 错误响应的读取上限。
-const MAX_ERROR_BYTES: usize = 1024 * 1024;
-
-/// 取发送名：网关给的 `wire_model` 优先，缺省退回请求体里的 `model`。
-fn wire_model(params: &Value, body: &Value) -> Result<String> {
-    let from_params = params["wire_model"].as_str().unwrap_or("").trim();
-    if !from_params.is_empty() {
-        return Ok(models::wire_id(from_params));
-    }
-    let from_body = body["model"].as_str().unwrap_or("").trim();
-    if from_body.is_empty() {
-        return Err(Error::http(400, "ZCode 请求缺少模型名"));
-    }
-    Ok(models::wire_id(from_body))
+struct Output {
+    decoder: SseDecoder,
+    started: bool,
+    done: bool,
+    content: bool,
+    finish: bool,
+    pending: Vec<Value>,
+    pending_bytes: usize,
 }
-
-/// 客户端入站头（网关给的是小写键的 `{k: v}` 对象）。
-fn inbound_headers(params: &Value) -> serde_json::Map<String, Value> {
-    params["headers"]
-        .as_object()
-        .cloned()
-        .unwrap_or_default()
-}
-
-/// 组装一次上游请求（`conversation` 与 `chat` 共用同一套分派）。
-///
-/// 分派依据是**账号上的 `zcodePlan`**（不是模型名）：两条通道的凭证不能互相
-/// 替代，走错门的症状是业务拒绝而不是鉴权失败，所以选择权在用户手里。
-fn build(params: &Value, body: &Value, requested: &str) -> Result<Plan> {
-    let record = account::require_account()?;
-    let secret = record.get("secret").cloned().unwrap_or(Value::Null);
-    match account::plan_of(&secret) {
-        account::PLAN_START => {
-            let jwt = account::jwt(&secret);
-            // 设备标识：记录里没有就现场生成并落盘（见 `account::device_mid_or_create`）
-            let device_mid = account::device_mid(&secret);
-            let device_mid = if device_mid.is_empty() {
-                account::device_mid_or_create()?.unwrap_or_default()
-            } else {
-                device_mid
-            };
-            // 顺带一次「到点没」的风控配置同步（native `config_sync::ensure_captcha_config`）
-            if captcha::sync_due() {
-                sync_captcha_config();
-            }
-            plan::start_plan(&jwt, body, requested, &inbound_headers(params), &device_mid)
+impl Output {
+    fn new() -> Self {
+        Self {
+            decoder: SseDecoder::default(),
+            started: false,
+            done: false,
+            content: false,
+            finish: false,
+            pending: Vec::new(),
+            pending_bytes: 0,
         }
-        _ => plan::coding_plan(&account::access_token(&secret), body, requested),
+    }
+    fn push(&mut self, bytes: &[u8], model: &str) -> Result<()> {
+        for data in self.decoder.push(bytes)? {
+            if self.done {
+                break;
+            }
+            if data.trim().is_empty() {
+                continue;
+            }
+            if data.trim() == "[DONE]" {
+                if !self.finish {
+                    return Err(Error::http(502, "ZCode 未返回有效结束原因"));
+                }
+                self.flush()?;
+                sdk::stream_bytes(b"data: [DONE]\n\n")?;
+                self.done = true;
+                break;
+            }
+            let mut value: Value = serde_json::from_str(&data)
+                .map_err(|_| Error::http(502, "ZCode SSE 事件格式无效"))?;
+            if errors::has_error(&value) {
+                let status = value["error"]["status"]
+                    .as_u64()
+                    .or_else(|| value["error"]["statusCode"].as_u64())
+                    .and_then(|value| u16::try_from(value).ok())
+                    .unwrap_or(502);
+                if errors::code(&value) == Some(3007) {
+                    captcha::challenge()?;
+                }
+                return Err(errors::failure(status, &value));
+            }
+            let choices = value["choices"]
+                .as_array()
+                .ok_or_else(|| Error::http(502, "ZCode SSE 事件缺少 choices"))?;
+            for choice in choices {
+                self.content |= ["content", "reasoning_content", "reasoning"]
+                    .iter()
+                    .any(|key| {
+                        choice["delta"][*key]
+                            .as_str()
+                            .is_some_and(|value| !value.is_empty())
+                    })
+                    || choice["delta"]["tool_calls"]
+                        .as_array()
+                        .is_some_and(|tools| !tools.is_empty());
+                self.finish |= choice["finish_reason"]
+                    .as_str()
+                    .is_some_and(|reason| !reason.is_empty());
+            }
+            value["model"] = json!(model);
+            if self.started {
+                sdk::stream_event(&value)?;
+            } else {
+                self.pending_bytes = self.pending_bytes.saturating_add(data.len());
+                if self.pending.len() >= 128 || self.pending_bytes > 1024 * 1024 {
+                    return Err(Error::http(502, "ZCode 仅返回控制帧，没有有效内容"));
+                }
+                self.pending.push(value);
+                if self.content || self.finish {
+                    self.flush()?;
+                }
+            }
+        }
+        Ok(())
+    }
+    fn flush(&mut self) -> Result<()> {
+        if !self.started {
+            sdk::stream_head(200)?;
+            self.started = true;
+        }
+        for event in self.pending.drain(..) {
+            sdk::stream_event(&event)?;
+        }
+        self.pending_bytes = 0;
+        Ok(())
     }
 }
 
-/// 拉一次上游的风控配置并更新令牌池（native `config_sync::ensure_captcha_config`）。
-///
-/// 失败**静默**：配置只决定「要不要带验证码头」，拉不到时沿用上一次的判定
-/// （3007 会把它改回「要」），比因为一次配置拉取失败而拒绝整条推理好。
-fn sync_captcha_config() {
-    let url = format!(
-        "{}/api/v1/client/configs?{}",
-        super::region::ZCODE_ORIGIN,
-        plan::version_query()
-    );
-    let Ok(reply) = net::send("GET", &url, &[], None) else {
-        return;
-    };
-    if !reply.ok() {
-        return;
-    }
-    let captcha_config = reply.payload.pointer("/data/configs/captcha");
-    let Some(config) = captcha_config.filter(|value| value.is_object()) else {
-        return;
-    };
-    let enabled = config.get("enabled").and_then(Value::as_bool).unwrap_or(false);
-    let skip = config
-        .get("skip_model_request")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    captcha::apply_config(enabled, skip);
-    captcha::note_synced();
-}
-
-/// `chat` 方法：交出「要发出去的 HTTP 请求」（native `build_chat` 的直译）。
-///
-/// 主程序当前对 Wasm 插件不接受这条路径（`build_chat_request_async` 对 wasm
-/// 回 501），但协议映射里它是 `build_chat` 的对应物，保留完整语义而不是留一个
-/// 空壳 —— 将来网关放开这条路时不必再补一遍。
-pub fn plan_request(params: &Value) -> Result<Value> {
-    let body = params["body"].clone();
-    if !body.is_object() {
-        return Err(Error::http(400, "请求体必须是 JSON 对象"));
-    }
-    let requested = wire_model(params, &body)?;
-    let built = build(params, &body, &requested)?;
-    if built.body.to_string().len() > MAX_REQUEST_BYTES {
-        return Err(Error::http(413, "ZCode 请求体过大"));
-    }
-    Ok(built.to_json())
-}
-
-/// `conversation` 方法：自己发请求、自己折协议、自己吐 chat SSE。
 pub fn forward(params: &Value) -> Result<()> {
-    let mut body = params["body"].clone();
-    if !body.is_object() {
-        return Err(Error::http(400, "请求体必须是 JSON 对象"));
+    let record = account::record()?;
+    let secret = &record["secret"];
+    let mut original = params["body"].clone();
+    if !original.is_object() {
+        return Err(Error::http(400, "ZCode 请求体必须是对象"));
     }
-    // 推理请求恒为流式：native 侧由网关把 `stream` 定成 true（`is_error_response`
-    // 的注释：ZCode 的 JSON 响应是业务拒绝）。插件拿到的是客户端原始体，这里
-    // 与 native 保持同一口径 —— 不发 `stream:true` 会让上游回整段 JSON，白走
-    // 一次降级折叠。
-    body["stream"] = json!(true);
-    let requested = wire_model(params, &body)?;
-    let built = build(params, &body, &requested)?;
-    let serialized = built.body.to_string();
-    if serialized.len() > MAX_REQUEST_BYTES {
-        return Err(Error::http(413, "ZCode 请求体过大"));
+    let model = original["model"]
+        .as_str()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| Error::http(400, "ZCode 需要明确的模型名"))?
+        .to_string();
+    original["stream"] = json!(true);
+    let start_plan = account::plan(secret) == account::START;
+    let (url, mut headers, body, wire_model) = if start_plan {
+        let token = account::jwt(secret);
+        if token.is_empty() {
+            return Err(Error::http(400, "套餐池通道缺少 JWT，请核对账号凭据"));
+        }
+        let wire_model = model.to_ascii_lowercase();
+        let mut payload = protocol::request("anthropic", &original, &wire_model)?;
+        reasoning::anthropic(&mut payload, &original, &wire_model);
+        let context =
+            request_context::Context::new(&params["headers"], &original, &account::mid(secret))?;
+        let version = prompt::apply(&mut payload, &wire_model, &context)?;
+        let mut headers = config::identity_headers(&version, Some("ai-sdk/anthropic/3.0.81"));
+        headers["Content-Type"] = json!("application/json");
+        headers["Authorization"] = json!(format!("Bearer {token}"));
+        headers["anthropic-version"] = json!("2023-06-01");
+        if let Some(object) = headers.as_object_mut() {
+            object.extend(
+                context
+                    .headers
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+        }
+        (
+            format!("{}/api/v1/zcode-plan/anthropic/v1/messages", network::ZCODE),
+            headers,
+            payload,
+            wire_model,
+        )
+    } else {
+        let token = account::access(secret);
+        if token.is_empty() {
+            return Err(Error::http(400, "编码套餐通道缺少访问凭据"));
+        }
+        let mut headers = config::identity_headers(&config::app_version()?, None);
+        headers["Content-Type"] = json!("application/json");
+        headers["Accept"] = json!("*/*");
+        headers["Authorization"] = json!(format!("Bearer {token}"));
+        reasoning::chat(&mut original, &model);
+        if original.get("stream_options").is_none() {
+            original["stream_options"] = json!({});
+        }
+        if let Some(options) = original["stream_options"].as_object_mut() {
+            options.entry("include_usage").or_insert(json!(true));
+        }
+        (config::coding_url(), headers, original, model.clone())
+    };
+    let url = config::mapped_url(&url, &record)?;
+    let balance = if start_plan {
+        quota::snapshot(&record)?
+    } else {
+        None
+    };
+    account::require_current(&record)?;
+    if start_plan {
+        let settings = captcha::configuration(false)?;
+        if captcha::required(&settings)? {
+            let Some((param, region)) = captcha::take(&settings)? else {
+                return Err(Error::coded("套餐池请求需要官方人机验证，请打开管理界面为当前账号补充验证；不是额度或凭据失效", "local_precondition"));
+            };
+            headers["x-aliyun-captcha-verify-param"] = json!(param);
+            if !region.is_empty() {
+                headers["x-aliyun-captcha-verify-region"] = json!(region);
+            }
+        }
     }
-
-    let response = http::open(
-        "POST",
-        &built.url,
-        headers_object(&built.headers),
-        Some(&built.body),
-    )?;
-    let status = response.status;
-    let content_type = net::content_type(&response.headers);
-
-    if !(200..300).contains(&status) {
-        let bytes = response.bytes(MAX_ERROR_BYTES)?;
-        let payload = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
-        return Err(errors::http_error(status, &payload));
-    }
-
-    // HTTP 200 但正文是 JSON：要么是业务拒绝（native `is_error_response` 的
-    // 口径），要么是上游忽略了 `stream: true` —— 后者按一次性折叠降级。
-    if content_type.contains("application/json") || content_type.contains("+json") {
-        let bytes = response.bytes(MAX_ERROR_BYTES)?;
-        let payload = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
-        return degrade_json(&payload, status, &requested, built.upstream);
+    account::require_current(&record)?;
+    let mut response = http::open("POST", &url, headers, Some(&body))?;
+    account::require_current(&record)?;
+    let content_type = response.headers["content-type"]
+        .as_str()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !(200..300).contains(&response.status)
+        || content_type.split(';').next().unwrap_or("").trim() == "application/json"
+    {
+        let status = response.status;
+        let bytes = response.bytes(1024 * 1024)?;
+        let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        if errors::code(&value) == Some(3007) {
+            captcha::challenge()?;
+        }
+        return Err(quota::failure(
+            status,
+            &value,
+            &record,
+            &model,
+            balance.as_ref(),
+        )?);
     }
     if content_type.contains("text/html") {
-        return Err(Error::http(502, "ZCode 返回了网页而不是模型回答"));
+        return Err(Error::http(502, "ZCode 返回网页而非流式模型结果"));
     }
-
-    sdk::stream_head(status)?;
-    let result = if built.upstream == "anthropic" {
-        stream_anthropic(response, &requested)
+    let mut converter = if start_plan {
+        Some(protocol::Converter::new("anthropic", &wire_model)?)
     } else {
-        stream_chat(response)
+        None
     };
-    match result {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            // 已下发响应头与部分帧：只能补一条流内错误帧，不能把请求悄悄重发
-            sdk::stream_event(&errors_event(&error))?;
-            Err(error)
-        }
-    }
-}
-
-/// 上游给了 JSON 时的两条路：降级折叠 or 诚实报错。
-fn degrade_json(payload: &Value, status: u16, requested: &str, upstream: &str) -> Result<()> {
-    let explicit_error = payload.get("error").is_some_and(|value| !value.is_null());
-    let biz = plan::biz_code(payload);
-    let biz_failed = biz.is_some_and(|code| code != 0);
-    if explicit_error || biz_failed {
-        return Err(errors::http_error(status, payload));
-    }
-    let looks_like_message = payload.get("type").and_then(Value::as_str) == Some("message")
-        || (payload["content"].is_array() && payload["stop_reason"].is_string());
-    let looks_like_chat = payload["choices"].is_array();
-    if upstream == "anthropic" {
-        if !looks_like_message {
-            return Err(errors::http_error(502, payload));
-        }
-        sdk::stream_head(status)?;
-        for frame in anthropic::frames_from_message(payload, requested) {
-            sdk::stream_bytes(frame.as_bytes())?;
-        }
-        return Ok(());
-    }
-    if !looks_like_chat {
-        return Err(errors::http_error(502, payload));
-    }
-    // chat 的非流式体 → 一帧 delta（`message` 改名成 `delta`）+ `[DONE]`
-    let mut chunk = payload.clone();
-    chunk["object"] = json!("chat.completion.chunk");
-    if let Some(choices) = chunk.get_mut("choices").and_then(Value::as_array_mut) {
-        for choice in choices.iter_mut() {
-            let message = choice.get("message").cloned().unwrap_or(Value::Null);
-            if let Some(object) = choice.as_object_mut() {
-                object.insert("delta".to_string(), message);
-                object.remove("message");
+    let mut upstream_events = SseDecoder::default();
+    let mut upstream_complete = false;
+    let mut output = Output::new();
+    let result = (|| -> Result<()> {
+        while let Some(bytes) = response.read()? {
+            account::require_current(&record)?;
+            if let Some(converter) = &mut converter {
+                // 通用 Anthropic 转换器的错误帧不保留业务码；先检查本家原始 error，
+                // 其余帧交给共享转换器，工具/思考/usage 不在此重写一套。
+                for data in upstream_events.push(&bytes)? {
+                    if data.trim().is_empty() || data.trim() == "[DONE]" {
+                        continue;
+                    }
+                    let event: Value = serde_json::from_str(&data)
+                        .map_err(|_| Error::http(502, "ZCode 套餐池事件不是有效 JSON"))?;
+                    if errors::has_error(&event) {
+                        let status = event["error"]["status"]
+                            .as_u64()
+                            .or_else(|| event["error"]["statusCode"].as_u64())
+                            .or_else(|| event["status"].as_u64())
+                            .and_then(|value| u16::try_from(value).ok())
+                            .unwrap_or(502);
+                        if errors::code(&event) == Some(3007) {
+                            captcha::challenge()?;
+                        }
+                        return Err(quota::failure(
+                            status,
+                            &event,
+                            &record,
+                            &model,
+                            balance.as_ref(),
+                        )?);
+                    }
+                    if event["type"] == "message_stop" {
+                        upstream_complete = true;
+                    }
+                    let converted = converter.push(format!("data: {data}\n\n").as_bytes())?;
+                    output.push(&converted, &model)?;
+                    if output.done {
+                        break;
+                    }
+                }
+            } else {
+                output.push(&bytes, &model)?;
+            }
+            if output.done {
+                return Ok(());
             }
         }
-    }
-    sdk::stream_head(status)?;
-    sdk::stream_bytes(format!("data: {chunk}\n\n").as_bytes())?;
-    sdk::stream_bytes(b"data: [DONE]\n\n")?;
-    Ok(())
-}
-
-/// Anthropic SSE → chat SSE（状态机在 `anthropic::Stream`）。
-fn stream_anthropic(mut response: http::Response, model: &str) -> Result<()> {
-    let mut decoder = SseDecoder::default();
-    let mut stream = anthropic::Stream::new(model);
-    while let Some(bytes) = response.read()? {
-        let payloads = decoder.push(&bytes)?;
-        for frame in stream.push(&payloads) {
-            sdk::stream_bytes(frame.as_bytes())?;
-        }
-        if stream.is_finished() {
-            break;
-        }
-    }
-    // 没有 `message_stop` 的流在这里兜底收尾（补 finish_reason / usage / [DONE]）
-    for frame in stream.finish() {
-        sdk::stream_bytes(frame.as_bytes())?;
-    }
-    // 流内错误（`error` 事件 / 空流）的收尾帧已经在下发字节里了，这里只把失败
-    // 如实抛给主程序 —— 不再补一条错误事件，否则下游会收到两条错误帧。
-    match stream.take_failure() {
-        Some(error) => Err(error),
-        None => Ok(()),
-    }
-}
-
-/// Chat SSE 直通（编码套餐通道的上游本来就吐 chat SSE）。
-///
-/// 只在帧边界上判断 `[DONE]`：整块字节照原样下发（**不重新序列化** —— 上游帧
-/// 里可能有本插件不认识的字段，重排会让下游看到不一样的东西）。
-fn stream_chat(mut response: http::Response) -> Result<()> {
-    let mut decoder = SseDecoder::default();
-    let mut done = false;
-    while let Some(bytes) = response.read()? {
-        for payload in decoder.push(&bytes)? {
-            if payload.trim() == "[DONE]" {
-                done = true;
+        account::require_current(&record)?;
+        if let Some(converter) = &mut converter {
+            if !upstream_complete {
+                return Err(
+                    Error::http(502, "ZCode 套餐池流未收到 message_stop，未伪造完成帧")
+                        .with_code("runtime_stream_interrupted"),
+                );
             }
+            output.push(&converter.finish()?, &model)?;
         }
-        sdk::stream_bytes(&bytes)?;
-        if done {
-            break;
+        if !output.done {
+            return Err(Error::http(502, "ZCode 上游流提前中断，未收到完整结束标记")
+                .with_code("runtime_stream_interrupted"));
         }
-    }
-    // 上游正常结束却没带 `[DONE]`：补一个，否则下游聚合器会一直等结束标记。
-    if !done {
-        sdk::stream_bytes(b"data: [DONE]\n\n")?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        if output.started && !output.done {
+            sdk::stream_event(&errors::event(&error))?;
+        }
+        return Err(error);
     }
     Ok(())
-}
-
-/// 错误 → 流内错误帧（`data: {"error": {...}}`）。
-fn errors_event(error: &Error) -> Value {
-    let status = error.status.unwrap_or(502);
-    json!({
-        "error": {
-            "message": error.message,
-            "status": status,
-            "type": "upstream_error",
-        }
-    })
 }

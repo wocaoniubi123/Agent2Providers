@@ -1,297 +1,296 @@
-//! Loomy 新手任务（onboarding）：状态查询与一键领取。
-//!
-//! ── 上游契约（依据：客户端 `electron/onboarding-service.js` + 实测）──
-//! ```text
-//!   GET  {集成网关}/api/v1/onboarding/tasks            header token: <session>
-//!   POST {集成网关}/api/v1/onboarding/tasks/complete   body {"key": "<任务 key>"}
-//! ```
-//! 统一信封 `{code, desc, trace_id, data}`：`000000` 成功、`100002` 登录失效。
-//!
-//! ── 完成判定在客户端本地，上报不带行为证明 ──────────────────
-//! 8 个任务的「完成」在 Loomy 客户端里全是本地事件判定（发消息、建定时任务、
-//! 存远程控制配置、建搭子…），上报接口只带 `{key}`，没有签名或行为证据。
-//! 实测（2026-10-08，production）：对未完成的 key 直接 POST 立即到账**真积分**
-//! （`pick_skill` +1000 落进永久余额）；重复上报返回 `alreadyCompleted=true`，
-//! 幂等不重复加分。所以「领取」就是对该账号全部未完成的 key 逐个上报。
-//!
-//! ── 结算记忆（插件形态下存台账）──────────────────────────────
-//! 这 8 条是**一次性**福利：全部领完就永远是这个结论。结算后把快照写进账号
-//! 台账（`ledger.put`），之后的查询与领取**零上游请求**；手动「查询任务」
-//! 按钮带 `refresh = true` 强制实查（新事实会覆盖或清除记忆）。
-//!
-//! ── 为什么只挂手动入口，不进自动签到框架 ────────────────────
-//! 新手任务是一次性福利，签到是每日动作；把一次性领取塞进每日调度，会让之后
-//! 每一轮定时签到都白打一次查询接口。
+//! 原生八项新手任务：固定 key/积分，领取接口按 key 幂等，无额外行为证明。
+//! 沿用账号 onboarding 台账的结算快照；读取/修改始终由宿主限定当前账号并加锁。
+//! 只接手动 claim，不放入每日签到。全部已结算时零上游，refresh=true 可实查覆盖。
 
-use agent2api_wasm_sdk::{self as sdk, json, Error, Result, Value};
+use agent2api_wasm_sdk::{
+    self as sdk, json,
+    state::{self, Scope},
+    AccountLock, Error, Result, Value,
+};
 
-use super::{client, credentials};
+use super::{account, client, errors};
 
-const TASKS_PATH: &str = "/api/v1/onboarding/tasks";
-const COMPLETE_PATH: &str = "/api/v1/onboarding/tasks/complete";
-
-/// 台账的 kind（结算记忆）。
-const LEDGER_KIND: &str = "onboarding";
-
-/// 单个新手任务的静态信息（与 Loomy 客户端 task-registry 逐项一致，勿改 key）。
-pub struct Task {
-    /// 分组标题（对齐客户端任务面板的三段）
-    pub group: &'static str,
-    /// 上报 key（服务端契约，大小写敏感）
-    pub key: &'static str,
-    /// 展示标题
-    pub title: &'static str,
-    /// 完成奖励（积分）
-    pub points: i64,
+struct Task {
+    group: &'static str,
+    key: &'static str,
+    title: &'static str,
+    points: i64,
 }
-
-/// 8 个任务（合计 10000 积分）。key 与分值来自客户端 `TASK_POINTS`，一个都不能改。
-pub const TASKS: [Task; 8] = [
-    Task { group: "初识 Loomy", key: "first_message", title: "发送你的第一条消息", points: 500 },
-    Task { group: "初识 Loomy", key: "pick_skill", title: "试试选择一个技能", points: 1000 },
-    Task { group: "初识 Loomy", key: "generate_ppt", title: "生成第一份 PPT", points: 1500 },
-    Task { group: "打造你的专属 Loomy", key: "set_schedule", title: "设置定时任务", points: 1000 },
-    Task { group: "打造你的专属 Loomy", key: "install_skill", title: "在技能广场安装一个技能", points: 1500 },
-    Task { group: "打造你的专属 Loomy", key: "configure_remote", title: "配置远程控制", points: 1000 },
-    Task { group: "遇见你的 AI 搭子", key: "create_soul", title: "创建你的第一个搭子", points: 1500 },
-    Task { group: "遇见你的 AI 搭子", key: "share_soul", title: "把搭子分享给朋友", points: 2000 },
+const TASKS: [Task; 8] = [
+    Task {
+        group: "初识 Loomy",
+        key: "first_message",
+        title: "发送你的第一条消息",
+        points: 500,
+    },
+    Task {
+        group: "初识 Loomy",
+        key: "pick_skill",
+        title: "试试选择一个技能",
+        points: 1000,
+    },
+    Task {
+        group: "初识 Loomy",
+        key: "generate_ppt",
+        title: "生成第一份 PPT",
+        points: 1500,
+    },
+    Task {
+        group: "打造你的专属 Loomy",
+        key: "set_schedule",
+        title: "设置定时任务",
+        points: 1000,
+    },
+    Task {
+        group: "打造你的专属 Loomy",
+        key: "install_skill",
+        title: "在技能广场安装一个技能",
+        points: 1500,
+    },
+    Task {
+        group: "打造你的专属 Loomy",
+        key: "configure_remote",
+        title: "配置远程控制",
+        points: 1000,
+    },
+    Task {
+        group: "遇见你的 AI 搭子",
+        key: "create_soul",
+        title: "创建你的第一个搭子",
+        points: 1500,
+    },
+    Task {
+        group: "遇见你的 AI 搭子",
+        key: "share_soul",
+        title: "把搭子分享给朋友",
+        points: 2000,
+    },
 ];
+const TOTAL: i64 = 10_000;
 
-/// 任务总分（界面「已获得 x / 共 y」的分母）
-pub const TOTAL_POINTS: i64 = 10000;
-
-/// 上游信封判定：`000000` 放行；登录失效 401；其余 502 带 `desc`。
-fn ensure_success(payload: &Value, what: &str) -> Result<()> {
-    let code = client::business_code(payload);
-    if client::is_auth_error_code(&code) {
-        return Err(Error::http(401, "Loomy 登录态已失效，请重新登录后再试"));
-    }
-    if code != client::SUCCESS_CODE {
-        let message = client::upstream_message(payload);
-        return Err(Error::http(
-            502,
-            if message.is_empty() {
-                format!("{what}失败（上游 code={code}）")
-            } else {
-                format!("{what}失败：{message}")
-            },
-        ));
-    }
-    Ok(())
-}
-
-/// 拉一次任务完成表：返回值按 [`TASKS`] 顺序对齐（未知 key 忽略，缺省未完成 ——
-/// earned 不信任上游回传、自己算）。
-fn fetch_done(session: &str) -> Result<Vec<bool>> {
-    let payload = client::token_request("GET", TASKS_PATH, session, None, "新手任务查询")?;
-    ensure_success(&payload, "新手任务查询")?;
-    let tasks = payload
-        .pointer("/data/tasks")
-        .cloned()
-        .unwrap_or(Value::Null);
-    Ok(TASKS
-        .iter()
-        .map(|task| tasks.get(task.key).and_then(Value::as_bool).unwrap_or(false))
-        .collect())
-}
-
-/// 按注册中心输出任务行（界面直接渲染的形状）。
-fn task_rows(done: &[bool]) -> Vec<Value> {
+fn rows(done: &[bool]) -> Vec<Value> {
     TASKS
         .iter()
-        .zip(done.iter())
+        .zip(done)
         .map(|(task, done)| {
-            json!({
-                "key": task.key,
-                "title": task.title,
-                "group": task.group,
-                "points": task.points,
-                "done": done,
-            })
+            json!({ "key": task.key, "title": task.title,
+        "group": task.group, "points": task.points, "done": done })
         })
         .collect()
 }
 
-fn earned_of(done: &[bool]) -> i64 {
+fn earned(done: &[bool]) -> i64 {
     TASKS
         .iter()
-        .zip(done.iter())
+        .zip(done)
         .filter(|(_, done)| **done)
         .map(|(task, _)| task.points)
         .sum()
 }
 
-/// 读结算记忆（没有 / 读不懂 → None）。
-fn settled_snapshot() -> Option<Value> {
-    sdk::host("ledger.get", json!({ "kind": LEDGER_KIND }))
-        .ok()
-        .filter(Value::is_object)
-}
-
-/// 读当前账号的凭证（主程序已把 `params.account` 解析成账号上下文）。
-fn load_credentials() -> Result<credentials::Credentials> {
-    credentials::snapshot()
-}
-
-/// 用记忆回答一次状态查询。
-fn serve_memory(snapshot: &Value) -> Value {
-    json!({
-        "tasks": snapshot.get("tasks").cloned().unwrap_or(Value::Null),
-        "earned": snapshot.get("earned").cloned().unwrap_or(Value::Null),
-        "total": snapshot.get("total").cloned().unwrap_or(Value::Null),
-        "unclaimed": 0,
-        "settled": true,
-        "settledAt": snapshot.get("at").cloned().unwrap_or(Value::Null),
-    })
-}
-
-/// 按响应自己的结论落记忆，并把结果如实标回响应。
-///
-/// `settled == true` ⇒ 写入并返回快照本体，同时在响应里补 `settledAt`；否则
-/// **清掉**旧快照（上游出了新事实）。结论与旧快照一致（任务行逐字相同）时
-/// 沿用旧的 `at` —— 手动刷新不该把「结算于」改成「刚才查过」。
-fn remember(payload: &mut Value, previous: Option<&Value>) {
-    let settled = payload.get("settled").and_then(Value::as_bool) == Some(true);
-    if !settled {
-        // 清记忆：写 null（与 native `ledger_put(Null)` 同语义）
-        let _ = sdk::host(
-            "ledger.put",
-            json!({ "kind": LEDGER_KIND, "value": Value::Null }),
-        );
-        return;
-    }
-    let tasks = payload.get("tasks").cloned().unwrap_or(Value::Null);
-    let at = match previous {
-        Some(old) if old.get("tasks") == Some(&tasks) => {
-            old.get("at").and_then(Value::as_i64).unwrap_or_else(sdk::now)
-        }
-        _ => sdk::now(),
-    };
-    let snapshot = json!({
-        "at": at,
-        "tasks": tasks,
-        "earned": payload.get("earned").cloned().unwrap_or(Value::Null),
-        "total": payload.get("total").cloned().unwrap_or(Value::Null),
+fn settled() -> Result<Option<Value>> {
+    let value = sdk::host("ledger.get", json!({ "kind": "onboarding" }))?;
+    let valid = value["tasks"].as_array().is_some_and(|rows| {
+        rows.len() == TASKS.len()
+            && TASKS
+                .iter()
+                .zip(rows)
+                .all(|(task, row)| row["key"] == task.key && row["done"] == true)
     });
-    // 落库失败不影响本次结果（下次查询会重试）
-    let _ = sdk::host(
-        "ledger.put",
-        json!({ "kind": LEDGER_KIND, "value": snapshot }),
-    );
-    if let Some(object) = payload.as_object_mut() {
-        object.insert("settledAt".to_string(), json!(at));
-    }
+    Ok(valid.then_some(value))
 }
 
-/// 查询任务状态。
-///
-/// `refresh = false` 且记忆里已结算 ⇒ 直接回答，**零上游请求**。
-pub fn status(refresh: bool) -> Result<Value> {
-    let previous = settled_snapshot();
-    if !refresh {
-        if let Some(snapshot) = previous.as_ref() {
-            return Ok(serve_memory(snapshot));
-        }
-    }
-    let credentials = load_credentials()?;
-    let done = fetch_done(&credentials.session)?;
+fn memory(value: &Value) -> Value {
+    json!({ "tasks": value["tasks"], "earned": value["earned"], "total": value["total"],
+        "unclaimed": 0, "settled": true, "settledAt": value["at"] })
+}
+
+fn document(done: &[bool]) -> Value {
     let unclaimed = done.iter().filter(|done| !**done).count();
-    let mut payload = json!({
-        "tasks": task_rows(&done),
-        "earned": earned_of(&done),
-        "total": TOTAL_POINTS,
-        "unclaimed": unclaimed,
-        "settled": unclaimed == 0,
-    });
-    remember(&mut payload, previous.as_ref());
-    Ok(payload)
+    json!({ "tasks": rows(done), "earned": earned(done), "total": TOTAL,
+        "unclaimed": unclaimed, "settled": unclaimed == 0 })
 }
 
-/// 上报一个 key。成功返回「是否此前已完成」（上游幂等标记）。
+fn remember(document: &mut Value, previous: Option<&Value>) {
+    let snapshot = if document["settled"] == true {
+        let at = previous
+            .filter(|old| old["tasks"] == document["tasks"])
+            .and_then(|old| old["at"].as_i64())
+            .unwrap_or_else(sdk::now);
+        document["settledAt"] = json!(at);
+        json!({ "at": at, "tasks": document["tasks"], "earned": document["earned"], "total": TOTAL })
+    } else {
+        Value::Null
+    };
+    if sdk::host(
+        "ledger.put",
+        json!({ "kind": "onboarding", "value": snapshot }),
+    )
+    .is_err()
+    {
+        document["warnings"] = json!(["新手任务结算记忆未能保存，本次上游结果不受影响"]);
+    }
+}
+
+fn fetch(session: &str) -> Result<Vec<bool>> {
+    let payload = client::token_request(
+        "GET",
+        "/api/v1/onboarding/tasks",
+        session,
+        None,
+        "新手任务查询",
+    )?;
+    errors::ensure_success(&payload, "新手任务查询", session)?;
+    let tasks = payload
+        .pointer("/data/tasks")
+        .filter(|tasks| tasks.is_object())
+        .ok_or_else(|| Error::http(502, "Loomy 新手任务响应缺少完成状态表"))?;
+    TASKS
+        .iter()
+        .map(|task| {
+            tasks[task.key]
+                .as_bool()
+                .ok_or_else(|| Error::http(502, "Loomy 新手任务响应缺少明确完成状态，未尝试领取"))
+        })
+        .collect()
+}
+
+pub fn status(refresh: bool) -> Result<Value> {
+    let before = account::current()?;
+    let _lock = AccountLock::acquire()?;
+    account::ensure_current(&before)?;
+    let record = account::current()?;
+    let session = account::token(&record["secret"])?;
+    let previous = settled()?;
+    if !refresh {
+        if let Some(previous) = &previous {
+            account::ensure_current(&record)?;
+            return Ok(memory(previous));
+        }
+    }
+    let mut result = document(&fetch(&session)?);
+    account::ensure_current(&record)?;
+    remember(&mut result, previous.as_ref());
+    Ok(result)
+}
+
 fn claim_one(session: &str, key: &str) -> Result<bool> {
-    let body = json!({ "key": key });
     let payload = client::token_request(
         "POST",
-        COMPLETE_PATH,
+        "/api/v1/onboarding/tasks/complete",
         session,
-        Some(&body),
+        Some(&json!({ "key": key })),
         "新手任务领取",
     )?;
-    ensure_success(&payload, "新手任务领取")?;
-    Ok(payload
+    errors::ensure_success(&payload, "新手任务领取", session)?;
+    payload
         .pointer("/data/alreadyCompleted")
         .and_then(Value::as_bool)
-        .unwrap_or(false))
+        .ok_or_else(|| Error::http(502, "Loomy 新手任务领取结果缺少确认字段，未自动重新提交"))
 }
 
-/// 一键领取（或按 key 领单条）。
-///
-/// 先查完成表，再对**未完成**的 key 串行上报 —— 串行理由与签到一致（多请求
-/// 并发打同一个上游没有收益，还容易撞风控）；某 key 失败不中断其余（逐行带
-/// 原因返回），但**登录失效例外**：后面每个 key 都会以同样方式失败，立即整体 401。
-/// 已完成的 key 不发请求，所以这条命令天然幂等，重复点不会重复加分。
-///
-/// `only` 非空时只领那一个 key（`claim` 方法的逐条入口）。
 pub fn claim(only: &str) -> Result<Value> {
-    if let Some(snapshot) = settled_snapshot() {
-        return Ok(settled_claim_response(&snapshot));
+    if !only.is_empty() && !TASKS.iter().any(|task| task.key == only) {
+        return Err(Error::http(400, "Loomy 未识别的新手任务，未提交领取"));
     }
-    let credentials = load_credentials()?;
-    let before = fetch_done(&credentials.session)?;
-
-    let mut rows = Vec::new();
+    let before_lock = account::current()?;
+    let _lock = AccountLock::acquire()?;
+    account::ensure_current(&before_lock)?;
+    let record = account::current()?;
+    let session = account::token(&record["secret"])?;
+    if let Some(previous) = settled()? {
+        let mut result = memory(&previous);
+        result["results"] = json!([]);
+        result["claimed"] = json!(0);
+        result["failed"] = json!(0);
+        result["claimedPoints"] = json!(0);
+        account::ensure_current(&record)?;
+        return Ok(result);
+    }
+    let before = fetch(&session)?;
+    account::ensure_current(&record)?;
+    let state = state::get(Scope::Account, "onboarding-requests", 1)?;
+    if !state.compatible {
+        return Err(Error::http(409, "Loomy 新手领取记录格式已变化"));
+    }
+    let mut pending = state.value.as_object().cloned().unwrap_or_default();
+    for (index, task) in TASKS.iter().enumerate() {
+        if before[index] {
+            pending.remove(task.key);
+        }
+    }
+    let mut revision = state.revision;
+    let mut after = before.clone();
+    let mut results = Vec::new();
     let mut claimed = 0_i64;
     let mut failed = 0_i64;
     let mut claimed_points = 0_i64;
-    let mut after = before.clone();
     for (index, task) in TASKS.iter().enumerate() {
-        if before[index] {
+        if before[index] || !only.is_empty() && only != task.key {
             continue;
         }
-        if !only.is_empty() && only != task.key {
+        if pending.contains_key(task.key) {
+            failed += 1;
+            results.push(json!({ "key": task.key, "ok": false,
+                "error": "此前领取结果尚未确认，已只读查任务状态但未重复提交" }));
             continue;
         }
-        match claim_one(&credentials.session, task.key) {
+        account::ensure_current(&record)?;
+        pending.insert(task.key.into(), json!({ "startedAt": sdk::now() }));
+        if !state::compare_exchange(
+            Scope::Account,
+            "onboarding-requests",
+            1,
+            revision,
+            Value::Object(pending.clone()),
+            0,
+        )? {
+            return Err(Error::http(409, "Loomy 新手任务记录已变化，未覆盖其它操作"));
+        }
+        revision = state::get(Scope::Account, "onboarding-requests", 1)?.revision;
+        let reply = claim_one(&session, task.key);
+        account::ensure_current(&record)?;
+        match reply {
             Ok(already) => {
-                claimed += 1;
-                claimed_points += task.points;
+                pending.remove(task.key);
                 after[index] = true;
-                rows.push(json!({
-                    "key": task.key, "ok": true, "already": already, "points": task.points,
-                }));
+                claimed += 1;
+                // 并发或其他客户端已领取时只确认完成，不把旧奖励当成本次新赚。
+                if !already {
+                    claimed_points += task.points;
+                }
+                results.push(json!({ "key": task.key, "ok": true, "already": already, "points": task.points }));
             }
             Err(error) if error.status == Some(401) => return Err(error),
             Err(error) => {
+                if matches!(error.status, Some(400 | 403 | 429)) {
+                    pending.remove(task.key);
+                }
                 failed += 1;
-                rows.push(json!({ "key": task.key, "ok": false, "error": error.message }));
+                results.push(json!({ "key": task.key, "ok": false, "error": error.message }));
             }
         }
+        if !state::compare_exchange(
+            Scope::Account,
+            "onboarding-requests",
+            1,
+            revision,
+            Value::Object(pending.clone()),
+            0,
+        )? {
+            return Err(Error::http(
+                409,
+                "Loomy 领取结果已返回但台账有冲突，未重复领取",
+            ));
+        }
+        revision = state::get(Scope::Account, "onboarding-requests", 1)?.revision;
     }
-
-    let unclaimed = after.iter().filter(|done| !**done).count();
-    let mut payload = json!({
-        "results": rows,
-        "claimed": claimed,
-        "failed": failed,
-        "claimedPoints": claimed_points,
-        "tasks": task_rows(&after),
-        "earned": earned_of(&after),
-        "total": TOTAL_POINTS,
-        "unclaimed": unclaimed,
-        "settled": unclaimed == 0,
-    });
-    remember(&mut payload, None);
-    Ok(payload)
-}
-
-/// 记忆命中时领取接口的回答：这次**一次上游都没打**，因此没有一条 results。
-fn settled_claim_response(snapshot: &Value) -> Value {
-    let mut payload = serve_memory(snapshot);
-    if let Some(object) = payload.as_object_mut() {
-        object.insert("results".to_string(), json!([]));
-        object.insert("claimed".to_string(), json!(0));
-        object.insert("failed".to_string(), json!(0));
-        object.insert("claimedPoints".to_string(), json!(0));
-    }
-    payload
+    account::ensure_current(&record)?;
+    let mut result = document(&after);
+    result["results"] = json!(results);
+    result["claimed"] = json!(claimed);
+    result["failed"] = json!(failed);
+    result["claimedPoints"] = json!(claimed_points);
+    remember(&mut result, None);
+    Ok(result)
 }

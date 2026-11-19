@@ -1,177 +1,300 @@
-//! Kiro 的错误分类：四档映射与「输入过长」的识别。
-//!
-//! ── 上游的表达方式 ──────────────────────────────────────────
-//! ```text
-//!   400  ValidationException "Input is too long."（reason CONTENT_LENGTH_EXCEEDS_THRESHOLD）
-//!   429  月额度用完 / 请求数超限（USAGE_LIMIT / MONTHLY_REQUEST_COUNT）
-//!   503  INSUFFICIENT_MODEL_CAPACITY（模型没容量）
-//!   403  token 被拒（刷新后重试一次）
-//!   exception 帧  throttlingException / validationException / …
-//! ```
-//!
-//! ── 「输入过长」必须原样透传 ────────────────────────────────
-//! 它会被当成限额（`exceeded`）而罚账号，但实际是客户端上下文太长：换账号
-//! 没用，只会让另一个账号白撞一次。参考实现把它统一成 400 + 固定前缀，
-//! 我们沿用这句话（网关与客户端都按它判「该压缩上下文」）。
+//! 保留原生 Kiro 的额度/认证/上下文错误判据；错误必须先分类再脱敏。
+//! 超长输入和模型容量不足不能因为 exceeded/insufficient 字样被误罚成账号限额。
 
+use crate::util;
 use agent2api_wasm_sdk::{json, Error, Value};
 
-/// 「输入过长」的统一前缀（与参考实现同文）。
 pub const TOO_LONG: &str = "input is too long for the model's context: ";
 
-/// 文案里是否在说「对话超出模型窗口」。
-pub fn too_long_said(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    lower.contains("content_length_exceeds_threshold")
-        || lower.contains("model_context_window_exceeded")
-        || lower.contains("input is too long")
+#[derive(Clone, Copy, PartialEq)]
+pub enum Kind {
+    Auth,
+    Quota,
+    Content,
+    Other,
 }
 
-/// 文案里是否在说「额度 / 限流」。
-fn quota_said(message: &str) -> bool {
+pub fn too_long(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     [
-        "quota",
-        "insufficient",
-        "balance",
-        "credit",
-        "billing",
-        "usage_limit",
-        "usage limit",
-        "monthly_request_count",
-        "rate limit",
-        "rate limited",
-        "too many requests",
-        "throttl",
-        "limit reached",
-        "overloaded",
-        "额度",
-        "限流",
-        "频率",
+        "content_length_exceeds_threshold",
+        "model_context_window_exceeded",
+        "input is too long",
     ]
     .iter()
-    .any(|word| lower.contains(word))
+    .any(|hint| lower.contains(hint))
 }
-
-/// HTTP 状态 + 正文 → 上游失败（状态, 文案）。
-pub fn failure(status: u16, body: &str) -> (u16, String) {
-    let mut message = body.trim().to_string();
-    if let Ok(value) = serde_json::from_str::<Value>(body) {
-        if let Some(text) = value.get("message").and_then(|value| value.as_str()) {
-            message = text.to_string();
-            if let Some(reason) = value.get("reason").and_then(|value| value.as_str()) {
-                if !reason.is_empty() {
-                    message = format!("{message} ({reason})");
-                }
-            }
-        }
+pub fn kind(status: u16, message: &str) -> Kind {
+    let lower = message.to_ascii_lowercase();
+    if too_long(message) || lower.contains("insufficient_model_capacity") {
+        return Kind::Other;
     }
-    if message.is_empty() {
-        message = status_text(status);
+    if [
+        "content_filtered",
+        "content_filter",
+        "content blocked",
+        "blocked by content policy",
+    ]
+    .iter()
+    .any(|hint| lower.contains(hint))
+    {
+        return Kind::Content;
     }
-    if too_long_said(&message) {
-        return (400, format!("{TOO_LONG}{message}"));
+    if ["monthly_request_count", "usage_limit"]
+        .iter()
+        .any(|hint| lower.contains(hint))
+    {
+        return Kind::Quota;
     }
-    if message.contains("INSUFFICIENT_MODEL_CAPACITY") {
-        return (503, message);
+    if matches!(status, 401 | 403)
+        || [
+            "expiredtoken",
+            "expired token",
+            "tokenexpired",
+            "unauthorizedexception",
+            "invalid_token",
+            "invalid token",
+            "invalid bearer token",
+            "accessdeniedexception",
+        ]
+        .iter()
+        .any(|hint| lower.contains(hint))
+    {
+        return Kind::Auth;
     }
-    if message.contains("MONTHLY_REQUEST_COUNT") || message.contains("USAGE_LIMIT") {
-        return (429, format!("usage limit reached: {message}"));
+    if status == 429
+        || [
+            "quota",
+            "insufficient",
+            "balance",
+            "credit",
+            "billing",
+            "usage limit",
+            "rate limit",
+            "too many requests",
+            "throttl",
+            "limit reached",
+            "overloaded",
+            "额度",
+            "限流",
+            "频率",
+        ]
+        .iter()
+        .any(|hint| lower.contains(hint))
+    {
+        return Kind::Quota;
     }
-    (status, message)
+    Kind::Other
 }
-
-/// 常见状态码的标准文案。
-pub fn status_text(status: u16) -> String {
-    match status {
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        408 => "Request Timeout",
-        409 => "Conflict",
-        413 => "Request Entity Too Large",
-        429 => "Too Many Requests",
-        500 => "Internal Server Error",
-        502 => "Bad Gateway",
-        503 => "Service Unavailable",
-        504 => "Gateway Timeout",
-        _ => "Unknown Error",
-    }
-    .to_string()
-}
-
-/// 四档分类（供网关 `classify` 用）。
-pub fn classify(status: u16, body: &Value) -> Value {
-    let message = body
-        .get("message")
-        .and_then(|value| value.as_str())
-        .or_else(|| body.get("error").and_then(|value| value.as_str()))
-        .unwrap_or("")
-        .to_string();
-    if status == 401 || status == 403 {
-        return json!({
-            "kind": "token_expired", "status": 401,
-            "message": if message.is_empty() { "Kiro 的登录态已失效，请重新登录".to_string() } else { message },
-            "reset_at": Value::Null, "upstream_code": Value::Null,
-        });
-    }
-    if status == 429 || quota_said(&message) {
-        return json!({
-            "kind": "quota_limited", "status": status,
-            "message": if message.is_empty() { "Kiro 额度或频率已到上限".to_string() } else { message },
-            "reset_at": Value::Null, "upstream_code": Value::Null,
-        });
-    }
-    json!({
-        "kind": "fatal", "status": status.max(400), "message": message,
-        "reset_at": Value::Null, "upstream_code": Value::Null,
-    })
-}
-
-/// 流内错误的文案整理（与参考实现的 `exception()` 同口径）。
-pub fn exception_text(kind: &str, payload: &str) -> String {
-    let mut message = payload.trim().to_string();
-    if let Ok(value) = serde_json::from_str::<Value>(payload) {
-        if let Some(text) = value
-            .get("message")
-            .and_then(|value| value.as_str())
-            .or_else(|| value.get("Message").and_then(|value| value.as_str()))
-        {
-            message = text.to_string();
-        }
-        if let Some(reason) = value.get("reason").and_then(|value| value.as_str()) {
-            if !reason.is_empty() {
-                message = format!("{message} ({reason})");
-            }
-        }
-    }
-    if message.is_empty() {
-        message = "Kiro 返回了一个空的错误".to_string();
-    }
-    if kind.to_ascii_lowercase().contains("throttl") {
-        return format!("rate limited: {message}");
-    }
-    if kind.is_empty() {
-        message
+pub fn message(value: &Value) -> String {
+    let own = if let Some(text) = value.as_str() {
+        text.to_string()
     } else {
-        format!("{kind}: {message}")
+        util::text(value, &["message", "Message", "error_description"])
+    };
+    let own = if own.is_empty() {
+        if let Some(text) = value.get("error").and_then(Value::as_str) {
+            text.to_string()
+        } else {
+            util::text(&value["error"], &["message", "Message"])
+        }
+    } else {
+        own
+    };
+    let reason = util::text(value, &["reason", "__type", "code"]);
+    if reason.is_empty() {
+        own
+    } else {
+        format!("{own} ({reason})")
     }
 }
-
-/// 流内错误是否按额度处理（换账号 / 冷却）。
-pub fn stream_error_is_quota(text: &str) -> bool {
-    quota_said(text) && !too_long_said(text)
+pub fn upstream(status: u16, value: &Value, secrets: &[&str]) -> Error {
+    let scalar = value.is_string();
+    let message = message(value);
+    let capacity = message
+        .to_ascii_lowercase()
+        .contains("insufficient_model_capacity");
+    let (effective, code) = if too_long(&message) {
+        (400, "context_length_exceeded")
+    } else if capacity {
+        (503, "kiro_model_capacity")
+    } else {
+        match kind(status, &message) {
+            Kind::Auth => (401, "kiro_auth"),
+            Kind::Quota => (429, "kiro_quota"),
+            Kind::Content => (400, "kiro_content_blocked"),
+            Kind::Other => (
+                if (400..600).contains(&status) {
+                    status
+                } else {
+                    502
+                },
+                "kiro_upstream",
+            ),
+        }
+    };
+    let safe = if scalar {
+        String::new()
+    } else {
+        safe_message(&message, secrets)
+    };
+    let safe = if safe.is_empty() {
+        format!("Kiro 请求失败（HTTP {effective}）")
+    } else {
+        safe
+    };
+    let safe = if too_long(&message) && !safe.starts_with(TOO_LONG) {
+        format!("{TOO_LONG}{safe}")
+    } else {
+        safe
+    };
+    Error::http(effective, safe)
+        .with_code(code)
+        .with_reset(util::timestamp(
+            value.get("reset_at").or_else(|| value.get("resetAt")),
+        ))
 }
-
-/// 流内错误是否是输入过长（透传，不罚账号）。
-pub fn stream_error_is_too_long(text: &str) -> bool {
-    too_long_said(text)
+pub fn exception(event: &str, value: &Value, secrets: &[&str]) -> Error {
+    if value.is_string() {
+        let text = format!("{event}: {}", message(value));
+        return upstream(502, &json!(text), secrets);
+    }
+    upstream(
+        502,
+        &json!({ "message":format!("{event}: {}", message(value)),
+        "reset_at":value["reset_at"], "resetAt":value["resetAt"] }),
+        secrets,
+    )
 }
-
-/// 把上游失败转成 SDK 错误。
-pub fn http_error(status: u16, body: &str) -> Error {
-    let (status, message) = failure(status, body);
-    let code = if too_long_said(&message) { "too_long" } else { "kiro_upstream" };
-    Error::http(if status < 400 { 502 } else { status }, message).with_code(code)
+pub fn classify(status: u16, body: &Value) -> Value {
+    let text = message(body);
+    let code = body["code"]
+        .as_str()
+        .or_else(|| body["error"]["code"].as_str())
+        .unwrap_or("");
+    if code == "account_model_unavailable" {
+        return json!({ "kind":"fatal", "status":400, "message":safe_message(&text, &[]),
+            "reset_at":null, "upstream_code":null });
+    }
+    let (name, effective) = if code == "context_length_exceeded" || too_long(&text) {
+        ("fatal", 400)
+    } else if code == "kiro_model_capacity"
+        || text
+            .to_ascii_lowercase()
+            .contains("insufficient_model_capacity")
+    {
+        ("fatal", 503)
+    } else if code == "kiro_content_blocked" {
+        ("content_blocked", 400)
+    } else {
+        match kind(status, &text) {
+            Kind::Auth => ("token_expired", 401),
+            Kind::Quota => ("quota_limited", 429),
+            Kind::Content => ("content_blocked", 400),
+            Kind::Other => ("fatal", status.max(400)),
+        }
+    };
+    json!({ "kind": name, "status": effective, "message": safe_message(&text, &[]),
+        "reset_at": util::timestamp(body.get("reset_at").or_else(|| body.get("resetAt"))
+            .or_else(|| body["error"].get("reset_at")).or_else(|| body["error"].get("resetAt"))),
+        "upstream_code": body["upstream_code"].as_i64().or_else(|| body["error"]["upstream_code"].as_i64()) })
+}
+pub fn host_stop(error: &Error) -> bool {
+    matches!(
+        error.code.as_deref(),
+        Some(
+            "aborted"
+                | "cancelled"
+                | "runtime_stream_interrupted"
+                | "plugin_unavailable"
+                | "forbidden"
+                | "plugin_resource_limit"
+                | "plugin_protocol_error"
+                | "native_helper_not_authorized"
+        )
+    )
+}
+pub fn transport(error: Error) -> Error {
+    if host_stop(&error) {
+        return error;
+    }
+    if error.code.as_deref() == Some("timeout") {
+        Error::http(504, "Kiro 请求超时，请检查网络与账号代理").with_code("kiro_transport")
+    } else {
+        Error::http(502, "无法连接 Kiro，请检查网络与账号代理").with_code("kiro_transport")
+    }
+}
+pub fn redact(input: &str, secrets: &[&str]) -> String {
+    let mut text = input.to_string();
+    for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
+        for needle in [secret.to_string(), util::query(secret)] {
+            text = text.replace(&needle, "[已隐藏]");
+        }
+    }
+    text
+}
+pub fn safe_message(input: &str, secrets: &[&str]) -> String {
+    let text = redact(input, secrets);
+    let lower = text.to_ascii_lowercase();
+    // 错误不回显任意 URL、授权码或客户端秘密；完整报文只交宿主脱敏调试设施。
+    if [
+        "http://",
+        "https://",
+        "code=",
+        "code_verifier",
+        "codeverifier",
+        "clientsecret",
+        "client_secret",
+        "access_token",
+        "accesstoken",
+        "refresh_token",
+        "refreshtoken",
+        "bearer ",
+        "ksk_",
+    ]
+    .iter()
+    .any(|hint| lower.contains(hint))
+    {
+        return "Kiro 拒绝了本次请求，详细凭据信息已隐藏".into();
+    }
+    text.chars()
+        .filter(|ch| !ch.is_control())
+        .take(500)
+        .collect()
+}
+pub fn sanitize(value: &Value, secrets: &[&str]) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(key, _)| {
+                    let key = key.to_ascii_lowercase().replace(['_', '-'], "");
+                    ![
+                        "access",
+                        "refresh",
+                        "accesstoken",
+                        "refreshtoken",
+                        "clientsecret",
+                        "authorization",
+                        "apikey",
+                        "token",
+                        "password",
+                        "cookie",
+                        "codeverifier",
+                    ]
+                    .contains(&key.as_str())
+                })
+                .map(|(key, value)| (key.clone(), sanitize(value, secrets)))
+                .collect(),
+        ),
+        Value::Array(items) => {
+            Value::Array(items.iter().map(|value| sanitize(value, secrets)).collect())
+        }
+        Value::String(text) => json!(redact(text, secrets)),
+        _ => value.clone(),
+    }
+}
+pub fn event(error: &Error) -> Value {
+    json!({ "error": { "message": error.message, "status": error.status.unwrap_or(502), "code": error.code,
+        "reset_at":error.reset_at, "upstream_code":error.upstream_code,
+        "type": if error.status == Some(429) { "rate_limit_error" } else { "upstream_error" } } })
 }

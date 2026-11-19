@@ -1,171 +1,105 @@
-//! Kiro 的 Wasm 插件实现。
-//!
-//! 迁移来源：`crates/providers/src/providers/kiro/`（native）。
-//!
-//! ── 模块分工 ────────────────────────────────────────────────
-//!   `endpoints`   地址 / scopes / UA / 随机与 UUID（宿主 `random.bytes`）
-//!   `credentials` 凭证形态、公开视图、去重身份
-//!   `refresh`     刷新（social / idc / external-idp）与 profile 发现
-//!   `request`     Chat → `conversationState`（含工具配对与思考档位）
-//!   `eventstream` AWS event stream 帧解析（预读头、跳过 CRC）
-//!   `events`      事件 → 中立增量（文本 / 思考 / 工具 / 用量）
-//!   `chat`        `conversation`：首帧门 + chat SSE
-//!   `models`      目录（控制面两套路径）与缓存
-//!   `usage`       额度（`Get-Usage-Limits`）与窗口口径
-//!   `search`      独立网页搜索（`InvokeMCP`）
-//!   `login`       网页登录（回调回填）+ 本机导入 + API key
-//!   `account`     归一化（本机 / 表单 / 文件）
-//!   `errors`      四档分类与「输入过长」透传
-//!
-//! ── 与 native 的对应关系 ────────────────────────────────────
-//! `meta()` → `metadata()`；`conversation()` → `conversation`；
-//! `ensure_token()` → `token.ensure`；`refresh_token()` → `token.refresh`；
-//! `token_expiring()` → `token.expiring`；`classify()` → `classify`；
-//! `models()` → `models.list`；`refresh_models()` → `models.refresh`；
-//! `usage()` → `usage.query`；`normalize_account()` → `account.normalize`；
-//! `admin.action`（含 `web-search.*`）→ `admin.action`。
-//!
-//! ── 保留的自用改动 ─────────────────────────────────────────
-//! `ziyong` 相对 `upstream/beta` 在 `kiro/mod.rs` 加了一行
-//! `AccountFeatures.invite_code: false`（账号页的「邀请码」按钮位）。
-//! 本包的 `metadata.json` 里 `account_features.invite_code` 就是这一位，
-//! 网关用本 fork 的 protocol crate 反序列化，位在就生效。
-//!
-//! ── panic=abort ────────────────────────────────────────────
-//! 本模块在对话链路上，绝不 unwrap/expect/panic。
+//! Kiro 独立 WASM，单身份，无 WASI。网页登录由宿主托管双阶段授权；
+//! 本机登录通过宿主固定投影读取，续期与安全写回另行授权，不执行 CLI。
+
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod account;
+mod catalog;
 mod chat;
+mod client;
 mod credentials;
 mod endpoints;
 mod errors;
 mod events;
 mod eventstream;
+mod image;
+mod local;
 mod login;
+mod login_callback;
+mod login_methods;
+mod login_oauth;
+mod login_stage;
+mod messages;
 mod models;
+mod network;
+mod reasoning;
 mod refresh;
 mod request;
 mod search;
+mod thinking;
+mod token_json;
+mod token_usage;
+mod tool_stream;
+mod tools;
 mod usage;
+mod util;
 
 use agent2api_wasm_sdk::{self as sdk, json, Error, Result, Value};
-
 sdk::export_provider!(handle);
 
-/// 与 native 侧 `meta()` 逐字段一致（已按装包期硬校验修正过能力位）。
-const METADATA: &str = include_str!("metadata.json");
-
 fn metadata() -> Value {
-    serde_json::from_str(METADATA).unwrap_or(Value::Null)
+    json!({ "id": endpoints::ID, "label": "Kiro", "order": 31,
+        "capabilities": { "chat": true, "stateful": true, "refresh": true, "model_refresh": true,
+            "usage": true, "checkin": false, "claims": false, "web_login": true,
+            "sse_model_rewrite": false, "sse_strip_newline_chunks": false, "anonymous_default_session": false,
+            "system_proxy_when_unset": false, "refresh_uses_account": true, "supports_default_model": true, "env_credentials": false },
+        "login_methods": [
+            { "kind": "browser", "button": "Kiro网页登录", "hint": login_methods::WEB },
+            { "kind": "desktop", "button": "导入kiro-cli / Kiro IDE登录态", "hint": "读取并关联官方本机登录；续期与安全写回需在插件设置中另行授权，不执行 CLI。" },
+            { "kind": "token", "label": "Kiro API key或凭据JSON", "placeholder": "{\"apiKey\":\"ksk_…\"}", "extra_fields": [] }
+        ],
+        "account_features": { "usage": true, "credit_detail": true, "credit_expiry": false,
+            "usage_detail": false, "edition": false, "identifier": ["accountId", "uid"], "expiry": ["expiresAt"],
+            "long_lived": false, "claim": false, "plan_channel": false, "email_as_name": true },
+        "default_models": models::fallback() })
 }
-
 fn handle(method: &str, params: Value) -> Result<Value> {
     match method {
         "init" => Ok(json!([metadata()])),
-        "ping" => Ok(json!(true)),
         "provider.info" => Ok(metadata()),
-
-        // ── 账号面 ──────────────────────────────────────────
+        "ping" => Ok(json!(true)),
         "account.normalize" => account::normalize(&params),
-        "account.view" => Ok(account::view(&params["secret"])),
-        "account.identity" => Ok(json!(credentials::identity(&params["secret"]))),
-
-        // ── 凭据 ────────────────────────────────────────────
-        "token.ensure" => {
-            let (_, credentials) = refresh::ensure(false)?;
-            Ok(json!(credentials.access))
-        }
-        "token.refresh" => {
-            let (_, credentials) = refresh::ensure(true)?;
-            Ok(json!(credentials.access))
-        }
-        "token.expiring" => Ok(json!(expiring(&params))),
-
-        // ── 目录 ────────────────────────────────────────────
-        "models.list" => Ok(models::list()),
-        "models.refresh" => models::refresh_catalog(params["force"].as_bool().unwrap_or(false)),
-
-        // ── 额度 ────────────────────────────────────────────
+        "account.view" => account::view(&params["secret"]),
+        "account.identity" => Ok(json!(account::identity(&params["secret"])?)),
+        "token.ensure" => Ok(json!(refresh::ready()?.credentials.access)),
+        "token.refresh" => Ok(json!(refresh::force()?.credentials.access)),
+        "token.expiring" => Ok(json!(refresh::expiring()?)),
+        "models.list" => catalog::list(&params),
+        "models.refresh" => catalog::refresh(&params),
         "usage.query" => usage::query(),
-
-        // ── 对话 ────────────────────────────────────────────
+        "login.start" => login::start(&params),
+        "login.callback" => login::callback(&params),
+        "login.poll" => login::poll(&params),
+        "login.cancel" => login::cancel(&params),
         "conversation" => {
             chat::forward(&params)?;
             Ok(Value::Null)
         }
-
-        // ── 登录 ────────────────────────────────────────────
-        "login.start" => login::start(&params),
-        "login.poll" => login::poll(&params),
-        "login.callback" => login::callback(&params),
-        "login.cancel" => login::cancel(&params),
-
-        // ── 管理动作 ────────────────────────────────────────
-        "admin.action" => admin_action(&params),
-
-        // ── 错误分类与策略 ──────────────────────────────────
+        "admin.action" => match params["action"].as_str() {
+            Some("auth.methods") => Ok(login_methods::methods(params["payload"]["locale"].as_str().unwrap_or("zh-CN"))),
+            Some("web-search.capabilities") => Ok(search::capabilities()),
+            Some("web-search.search") => search::search(&params["payload"]),
+            Some("local.status") => Ok(local::status()),
+            Some("network.user-agent") => Ok(json!({ "accountWide": true })),
+            _ => Err(Error::unsupported()),
+        },
         "classify" => Ok(errors::classify(
-            params["status"].as_u64().unwrap_or(502) as u16,
+            params["status"]
+                .as_u64()
+                .and_then(|value| u16::try_from(value).ok())
+                .unwrap_or(502),
             &params["body"],
         )),
-        "is_error_response" => Ok(json!(params["status"].as_u64().unwrap_or(0) >= 400)),
-        "error.policy" => Ok(json!({ "stop": false })),
-        "retry_advice" => Ok(Value::Null),
-        "retry.decision" => Ok(json!({ "action": "default" })),
-        "cooldown_models" => Ok(json!({ "models": [] })),
-        "reasoning_patch" => Ok(reasoning_patch(&params)),
-        "images.capabilities" => Ok(json!({ "generation": false, "editing": false })),
-
-        _ => Err(Error::unsupported()),
-    }
-}
-
-/// `token.expiring`：判据与续期用同一把尺（`LEAD_MS`）。
-///
-/// 本机登录态要现读一次才能知道有效期；读不到就回 false（别把一条读不出来的
-/// 账号塞进批量维护队列，那会变成每轮一条稳定失败）。
-fn expiring(params: &Value) -> bool {
-    let secret = params.get("secret").cloned().unwrap_or_else(|| params.clone());
-    let credentials = credentials::Credentials::from_secret(&secret);
-    if credentials.is_api_key() {
-        return false;
-    }
-    if credentials.is_local() {
-        let Ok(live) = refresh::read_local() else {
-            return false;
-        };
-        let live = credentials::Credentials::from_secret(&live);
-        return !live.fresh(endpoints::LEAD_MS);
-    }
-    !credentials.fresh(endpoints::LEAD_MS)
-}
-
-/// 管理动作：登录方式、独立网页搜索、额度来源。
-fn admin_action(params: &Value) -> Result<Value> {
-    let action = params["action"].as_str().unwrap_or("");
-    match action {
-        "auth.methods" => Ok(login::methods()),
-        "web-search.capabilities" | "web-search.search" => search::dispatch(action, &params["payload"]),
-        "quota.sources" => Ok(json!([])),
-        other => Err(Error::http(
-            400,
-            format!(
-                "Kiro 不认识管理动作「{other}」（可用：auth.methods / web-search.capabilities / web-search.search / quota.sources）"
-            ),
+        "reasoning_patch" => Ok(reasoning::patch(
+            params["level"].as_str().unwrap_or(""),
+            &params["body"],
         )),
-    }
-}
-
-/// 思考档位：写进 `reasoning_effort`，由 `request` 翻成 Kiro 的预算。
-fn reasoning_patch(params: &Value) -> Value {
-    let body = &params["body"];
-    if body.get("reasoning_effort").is_some_and(|value| !value.is_null()) {
-        return json!({ "action": "skip", "reason": "客户端已指定思考档位" });
-    }
-    let level = params["level"].as_str().unwrap_or("");
-    if matches!(level, "low" | "medium" | "high" | "xhigh" | "max") {
-        json!({ "action": "set", "field": "reasoning_effort", "value": level })
-    } else {
-        json!({ "action": "skip", "reason": "Kiro 不支持该思考档位" })
+        "is_error_response" => Ok(json!(params["status"].as_u64().unwrap_or(502) >= 400)),
+        "error.policy" => Ok(json!({ "stop": false })),
+        "retry.decision" => Ok(json!({ "action": "default" })),
+        "retry_advice" => Ok(Value::Null),
+        "cooldown_models" => Ok(json!({ "models": [] })),
+        "images.capabilities" => Ok(json!({ "generation": false, "editing": false })),
+        _ => Err(Error::unsupported()),
     }
 }

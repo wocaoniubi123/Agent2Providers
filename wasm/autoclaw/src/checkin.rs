@@ -1,156 +1,212 @@
-//! AutoClaw 每日签到（`autoclaw-task-complete` 的 `daily_signin`）。
-//!
-//! ── 上游接口 ────────────────────────────────────────────────
-//! ```text
-//! POST {userapi}/autoclaw-proxy/proxy/autoclaw-task-complete   {"task_id":"daily_signin"}
-//! GET  {userapi}/autoclaw-proxy/proxy/autoclaw-task-list       签到未领取时的归因
-//! POST {userapi}/userapi/v1/user-info                          「登录」钩子（活动福利）
-//! ```
-//! 三条都在 userapi 域，带同一套 `X-Auth-Sign` 签名头（见 `sign.rs`）。
-//!
-//! ── 「今天已签到」与「签到成功」必须分开 ─────────────────────
-//! 上游对重复调用返回 `success:false + already_completed:true`。把它算成成功会让
-//! 「今天已签到」在界面上显示成「签到成功」，与实际入账不符 —— 所以判据是
-//! 「本次真的领到了」（`reward_points > 0` 或显式 success 且未 completed）。
-//!
-//! ── 与 native 的差别：活动福利的「触发 + 复核」没有搬 ────────────
-//! native 在签到后还会读一次积分流水（`promotion.rs`）、未到账时打一次
-//! user-info 触发「登录即发」、再等 1.5 秒复核。wasm 侧**不做这一段**：
-//!   · 它是**附加收益**，不是签到本身的成败（native 也这么定位）；
-//!   · 复核依赖睡 1.5 秒（宿主 sleep），会把一次签到 RPC 拖长；
-//!   · 福利接口（`promotion-config` + 流水分页）是另一套契约，单独搬要再开一个
-//!     模块，超出「签到」这条方法的范围。
-//! 因此本方法只回签到本身的结果；活动福利在客户端下次启动 / 余额查询时会自然
-//! 到账（那是服务端「登录即发」的行为，与插件无关）。
-//!
-//! ── 硬约束 ──────────────────────────────────────────────────
-//! release 是 `panic=abort`：零 unwrap/expect/panic。
+//! daily_signin 由 task-complete 完成，不把 HTTP 200 或已完成当新奖励。
+//! 账号锁 + 在途台账避免并发/取消后的立即重领；活动奖励仍以 user-info 触发及流水确认。
+use super::{account, client, endpoints, promotion, util};
+use agent2api_wasm_sdk::{self as sdk, json, AccountLock, Error, Result, Value};
 
-use agent2api_wasm_sdk::{json, Error, Result, Value};
+const KIND: &str = "autoclawDailySignin";
+const TASK_COMPLETE: &str = "/autoclaw-proxy/proxy/autoclaw-task-complete";
+const TASK_LIST: &str = "/autoclaw-proxy/proxy/autoclaw-task-list";
 
-use super::credential;
-use super::upstream;
-
-/// 签到任务 id（源实现 `DAILY_SIGNIN_TASK_ID`）
-const DAILY_SIGNIN_TASK_ID: &str = "daily_signin";
-
-/// 完成任务路径（源实现 `TASK_COMPLETE_PATH`）
-const TASK_COMPLETE_PATH: &str = "/autoclaw-proxy/proxy/autoclaw-task-complete";
-/// 任务列表路径（签到未领取时归因用）
-const TASK_LIST_PATH: &str = "/autoclaw-proxy/proxy/autoclaw-task-list";
-
-/// 每日签到。
-///
-/// 返回协议里的 `CheckinReport` 形状：`{outcome, credit, streak, message}`。
-/// `outcome` 的四个取值与网关的枚举一致：`claimed` / `done` / `inactive` / `failed`。
-///
-/// `account_id` 非空时必须是宿主当前账号（见 `upstream::account_record`）。
-pub fn claim(account_id: &str) -> Result<Value> {
-    let record = upstream::account_record(account_id)?;
-    let credentials = credential::credential(&record)?;
-    if credentials.token.trim().is_empty() {
-        return Err(Error::http(401, "该账号没有可用凭证，无法签到"));
-    }
-    let body = json!({ "task_id": DAILY_SIGNIN_TASK_ID });
-    let payload = upstream::post(TASK_COMPLETE_PATH, &credentials.token, &body, "签到")?;
-    // 业务码判定：签到走的是通用任务接口，登录态失效同样以业务码表达
-    if let Some(code) = upstream::code_of(&payload) {
-        if upstream::is_auth_expired_code(code) {
-            return Err(Error::http(401, "登录态已过期，无法签到"));
-        }
-        if code != 0 {
-            let message = payload
-                .get("msg")
-                .and_then(Value::as_str)
-                .filter(|text| !text.is_empty())
-                .unwrap_or("签到失败");
-            return Ok(json!({
-                "outcome": "failed", "credit": Value::Null, "streak": Value::Null,
-                "message": message
-            }));
-        }
-    }
-    let data = payload.get("data").cloned().unwrap_or(Value::Null);
-    let already_completed = data
-        .get("already_completed")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let reported_success = data.get("success").and_then(Value::as_bool).unwrap_or(false);
-    let reward_points = data.get("reward_points").and_then(Value::as_i64).unwrap_or(0);
-    // 「本次领到了」的判据是 reward_points > 0 或显式 success。**已领过不算成功**。
-    let claimed = reward_points > 0 || (reported_success && !already_completed);
-    if claimed {
-        let message = if reward_points > 0 {
-            format!("签到成功，获得 {reward_points} 积分")
-        } else {
-            "签到成功".to_string()
-        };
-        return Ok(json!({
-            "outcome": "claimed",
-            "credit": if reward_points > 0 { json!(format!("{reward_points} 积分")) } else { Value::Null },
-            "streak": Value::Null,
-            "message": message,
-        }));
-    }
-    // 未领到：区分「今天已领过」与「上游异常」，前者是正常的幂等结果
-    if already_completed {
-        return Ok(json!({
-            "outcome": "done", "credit": Value::Null, "streak": Value::Null,
-            "message": "今天已签到"
-        }));
-    }
-    let hint = describe_task_state(&credentials);
-    let message = match hint {
-        Some(hint) => format!("签到未领取（{hint}）"),
-        None => "签到未领取".to_string(),
-    };
-    // 上游说「没有可签到的活动」时归 inactive，否则按失败报
-    let inactive = payload
-        .get("msg")
-        .and_then(Value::as_str)
-        .map(|text| text.contains("没有可") || text.contains("活动未"))
-        .unwrap_or(false);
-    Ok(json!({
-        "outcome": if inactive { "inactive" } else { "failed" },
-        "credit": Value::Null,
-        "streak": Value::Null,
-        "message": message,
-    }))
+fn save(value: &Value) -> Result<()> {
+    sdk::host("ledger.put", json!({ "kind": KIND, "value": value })).map(|_| ())
+}
+fn identity(snapshot: &account::Snapshot) -> String {
+    let user = account::user(&snapshot.secret);
+    util::hash(
+        &json!([
+            endpoints::PROVIDER,
+            snapshot.record["id"],
+            if user.is_empty() {
+                util::hash(&account::access(&snapshot.secret))
+            } else {
+                user
+            }
+        ])
+        .to_string(),
+    )
 }
 
-/// 签到未领取时，拉一次任务列表给出归因（**只读**，且失败不升级为错误）。
-///
-/// 返回 None 表示「列表里没有可用信息」——调用方据此退回通用文案，
-/// 不把一次辅助查询的失败拼接进用户看到的消息里。
-fn describe_task_state(credentials: &credential::Credential) -> Option<String> {
-    let payload = upstream::get(TASK_LIST_PATH, &credentials.token, "任务列表查询").ok()?;
-    if upstream::code_of(&payload).unwrap_or(0) != 0 {
-        return None;
+pub fn claim() -> Result<Value> {
+    let initial = account::read()?;
+    let _lock = AccountLock::acquire()?;
+    let current = account::read()?;
+    if !account::same(&initial, &current) {
+        return Err(Error::http(409, "AutoClaw 账号已变化，未执行签到"));
     }
-    let tasks = payload.get("data").and_then(Value::as_array)?;
-    let task = tasks
-        .iter()
-        .find(|item| item.get("task_id").and_then(Value::as_str) == Some(DAILY_SIGNIN_TASK_ID))?;
-    let completed = task.get("completed").and_then(Value::as_bool).unwrap_or(false);
-    if completed {
-        Some("任务列表显示今天已完成".to_string())
+    let day = util::day()?;
+    let id = identity(&current);
+    let mut ledger = sdk::host("ledger.get", json!({ "kind": KIND }))?;
+    if !ledger.is_null() && !ledger.is_object() {
+        return Err(Error::http(409, "AutoClaw 签到台账格式异常，未执行签到"));
+    }
+    if !ledger.is_object() || ledger["day"] != day || ledger["identity"] != id {
+        ledger = json!({ "day": day, "identity": id, "completed": false });
+    }
+    if ledger["inFlightUntil"].as_i64().unwrap_or(0) > sdk::now() {
+        return Ok(report(
+            &json!({ "success": false, "msg": "上一轮签到结果尚未确认，稍后会核对任务状态", "pending": true }),
+            Some(
+                ledger["inFlightUntil"]
+                    .as_i64()
+                    .unwrap_or(sdk::now() + 60_000),
+            ),
+        ));
+    }
+    if ledger["retryAt"].as_i64().unwrap_or(0) > sdk::now() {
+        return Ok(report(
+            &json!({ "success": false, "msg": "本轮签到尚在冷却，稍后继续核对", "pending": true }),
+            ledger["retryAt"].as_i64(),
+        ));
+    }
+    let mut claim = if ledger["completed"] == true {
+        json!({ "success": false, "alreadyCompleted": true, "msg": "今天已签到" })
     } else {
-        None
+        // 崩溃留下在途标记后，先用只读任务状态核对，不直接重复 POST。
+        let confirmed = if ledger["inFlightUntil"].as_i64().unwrap_or(0) > 0 {
+            match task_done(&current.secret)? {
+                Some(completed) => completed,
+                None => {
+                    return Ok(report(
+                        &json!({ "success": false, "msg": "上一轮签到结果未知，任务列表也未给出结论，请稍后核对", "pending": true }),
+                        Some(sdk::now() + 600_000),
+                    ))
+                }
+            }
+        } else {
+            false
+        };
+        if confirmed {
+            json!({ "success": false, "alreadyCompleted": true, "msg": "任务列表确认今天已签到" })
+        } else {
+            ledger["inFlightUntil"] = json!(sdk::now() + 120_000);
+            save(&ledger)?;
+            run(&current.secret)?
+        }
+    };
+    ledger["completed"] = json!(claim["success"] == true || claim["alreadyCompleted"] == true);
+    // POST 已发出但任务状态未知时保留在途标记；冷却后只能先回读，不能直接重领。
+    if ledger["completed"] == true || claim["pending"] != true {
+        ledger["inFlightUntil"] = json!(0);
     }
+    ledger["retryAt"] = if ledger["completed"] == true {
+        Value::Null
+    } else {
+        json!(sdk::now() + 600_000)
+    };
+    ledger["updatedAt"] = json!(sdk::now());
+    let current_again = account::read()?;
+    if !account::same(&current, &current_again) {
+        return Err(Error::http(
+            409,
+            "AutoClaw 账号已变化，未把旧签到结果写到新身份",
+        ));
+    }
+    save(&ledger)?;
+
+    let mut reward = match promotion::today(&current.secret) {
+        Ok(value) => value,
+        Err(error) if error.code.as_deref() == Some("forbidden") => return Err(error),
+        Err(_) => Value::Null,
+    };
+    // 只有确实读到「未发放」才触发；查不到不能推断无奖励并重复副作用。
+    if reward["granted"] == false
+        && sdk::now().saturating_sub(ledger["promotionAttemptAt"].as_i64().unwrap_or(0)) >= 600_000
+    {
+        if !account::same(&current, &account::read()?) {
+            return Err(Error::http(409, "AutoClaw 账号已变化，未触发旧账号活动"));
+        }
+        ledger["promotionAttemptAt"] = json!(sdk::now());
+        save(&ledger)?;
+        match promotion::activate(&current.secret) {
+            Ok(()) => {
+                sdk::sleep(1500)?;
+                match promotion::today(&current.secret) {
+                    Ok(value) => reward = value,
+                    Err(error) if error.code.as_deref() == Some("forbidden") => return Err(error),
+                    Err(_) => {}
+                }
+            }
+            Err(error) if error.code.as_deref() == Some("forbidden") => return Err(error),
+            Err(error) => {
+                claim["promotionError"] = json!(error.message);
+            }
+        }
+    }
+    if !account::same(&current, &account::read()?) {
+        return Err(Error::http(
+            409,
+            "AutoClaw 账号已变化，请重新查询签到与活动结果",
+        ));
+    }
+    claim = promotion::attach(claim, reward);
+    let retry = if claim["success"] == true || claim["alreadyCompleted"] == true {
+        None
+    } else {
+        Some(sdk::now() + 600_000)
+    };
+    Ok(report(&claim, retry))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `outcome` 的取值必须在网关的枚举内（错一个就是整条签到结果解析失败）。
-    #[test]
-    fn outcome_vocabulary() {
-        for outcome in ["claimed", "done", "inactive", "failed"] {
-            assert!(["claimed", "done", "inactive", "failed"].contains(&outcome));
-        }
-        // 任务 id 与上游路径都是契约，写错就静默「签到失败」
-        assert_eq!("daily_signin", DAILY_SIGNIN_TASK_ID);
-        assert!(TASK_COMPLETE_PATH.ends_with("autoclaw-task-complete"));
+fn run(secret: &Value) -> Result<Value> {
+    let payload = client::post(
+        TASK_COMPLETE,
+        &account::access(secret),
+        &json!({ "task_id": "daily_signin" }),
+        "签到",
+    )?;
+    client::business(&payload, "签到")?;
+    let data = &payload["data"];
+    if !data.is_object() {
+        return Err(Error::http(502, "AutoClaw 签到未返回有效任务结果"));
     }
+    let points = util::integer(&data["reward_points"]);
+    let already = data["already_completed"] == true;
+    let success = !already && (points.is_some_and(|points| points > 0) || data["success"] == true);
+    if success {
+        return Ok(
+            json!({ "success": true, "alreadyCompleted": false, "rewardPoints": points,
+            "msg": points.filter(|points| *points > 0).map(|points| format!("签到成功，获得 {points} 积分")).unwrap_or_else(|| "签到成功".into()) }),
+        );
+    }
+    if already {
+        return Ok(
+            json!({ "success": false, "alreadyCompleted": true, "rewardPoints": points, "msg": "今天已签到" }),
+        );
+    }
+    let completed = match task_done(secret) {
+        Ok(value) => value,
+        Err(error) if error.code.as_deref() == Some("forbidden") => return Err(error),
+        Err(_) => None,
+    };
+    Ok(
+        json!({ "success": false, "alreadyCompleted": completed == Some(true), "pending": completed.is_none(), "rewardPoints": points,
+        "msg": match completed { Some(true) => "任务列表显示今天已签到", Some(false) => "签到未领取，稍后重试",
+            None => "签到结果尚未确认，稍后只读核对任务状态" } }),
+    )
+}
+fn task_done(secret: &Value) -> Result<Option<bool>> {
+    let payload = client::get(TASK_LIST, &account::access(secret), "任务列表查询")?;
+    client::business(&payload, "查询任务列表")?;
+    Ok(payload["data"]
+        .as_array()
+        .and_then(|tasks| tasks.iter().find(|task| task["task_id"] == "daily_signin"))
+        .and_then(|task| task["completed"].as_bool()))
+}
+fn report(claim: &Value, retry: Option<i64>) -> Value {
+    let outcome = if claim["success"] == true {
+        "claimed"
+    } else if claim["alreadyCompleted"] == true {
+        "done"
+    } else if claim["pending"] == true {
+        "inactive"
+    } else {
+        "failed"
+    };
+    let credit = (claim["success"] == true)
+        .then(|| util::integer(&claim["rewardPoints"]))
+        .flatten()
+        .filter(|points| *points > 0)
+        .map(|points| format!("{points} 积分"));
+    json!({ "outcome": outcome, "message": util::text(claim, &["msg"]), "credit": credit, "streak": null,
+        "retryAt": retry, "details": claim })
 }

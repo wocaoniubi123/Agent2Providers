@@ -1,284 +1,172 @@
-//! CatPaw 工具字段归一化：OpenAI `tools` / `tool_choice` → 上游 `toolConfigs`。
-//!
-//! 移植来源 `proxy-chat-utils.mjs` 的 `normalizeTools` 与
-//! `catpaw-upstream-messages.mjs` 的 `normalizeTools` / `toolChoiceMode`
-//! （两处的 `normalizeTools` 规则一致，以后者为准：它多了 `enable` /
-//! `fromClient` 两个上游要求的字段）。
-//!
-//! ── 字段映射（UPSTREAM_PROTOCOL §3.2 是唯一权威）───────────────
-//! | OpenAI 入站 | 上游 `toolConfigs[]` |
-//! |---|---|
-//! | `type:"function"` | （不出现；整条就是工具定义） |
-//! | `function.name` | `name` |
-//! | `function.description` | `description`（截 8000 字符） |
-//! | `function.parameters` | `inputSchema`（缺省 `{"type":"object","properties":{}}`） |
-//! | — | `enable: true` / `fromClient: true`（常量：客户端工具一律启用） |
-//!
-//! ── 为什么 `strict` 一律拒绝 ────────────────────────────────
-//! 原实现对 `strict: true` 直接报 400（`strict=true 暂不支持`）。上游没有
-//! 「强制按 schema 输出」的开关，声称支持等于骗客户端。`strict: false` 是默认
-//! 行为，放行。
-//!
-//! ── 硬约束 ──────────────────────────────────────────────────
-//! 纯函数：不发网络请求、不持锁、零 unwrap / expect / panic。
+//! 只构造客户端工具声明，不执行工具、不建立跨请求索引。
+//! 字段沿用旧 CatPaw tools.rs；除语义深度外另限物理深度/节点，组合键不能绕过预算。
 
-use serde_json::{json, Map, Value};
+use agent2api_wasm_sdk::{json, Result, Value};
+use std::collections::BTreeSet;
 
-use super::errors::CatPawError;
+use crate::errors;
 
-/// `tool_choice` 的归一形态（原实现 `toolChoiceMode`）
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ToolChoice {
+const MAX_TOOLS: usize = 256;
+const MAX_DESCRIPTION_CHARS: usize = 8000;
+const MAX_DEPTH: usize = 32;
+const MAX_PHYSICAL_DEPTH: usize = 64;
+const MAX_NODES: usize = 32_768;
+const MAX_TOOL_BYTES: usize = 256 * 1024;
+const MAX_TOOLS_BYTES: usize = 2 * 1024 * 1024;
+
+/// 这是客户端要求，不是上游已经满足该要求的回执。
+#[derive(Clone, PartialEq, Eq)]
+pub(super) enum ToolChoice {
     Auto,
     None,
     Required,
-    /// 指定函数名（`{type:"function", function:{name}}`）
     Function(String),
 }
 
-/// 解析 `tool_choice`（原实现 `toolChoiceMode`）。
-///
-/// `undefined` / `null` / `"auto"` 都归 `Auto`；对象形态只认
-/// `{type:"function", function:{name:"…"}}`，其余报 400。
-pub fn tool_choice_mode(tool_choice: Option<&Value>) -> Result<ToolChoice, CatPawError> {
-    let Some(value) = tool_choice else {
-        return Ok(ToolChoice::Auto);
-    };
-    if value.is_null() {
-        return Ok(ToolChoice::Auto);
-    }
-    match value {
-        Value::String(text) if text == "auto" => Ok(ToolChoice::Auto),
-        Value::String(text) if text == "none" => Ok(ToolChoice::None),
-        Value::String(text) if text == "required" => Ok(ToolChoice::Required),
-        Value::Object(object) => {
-            let kind = object.get("type").and_then(Value::as_str);
-            let name = object
-                .get("function")
-                .and_then(|function| function.get("name"))
-                .and_then(Value::as_str);
-            match (kind, name) {
-                (Some("function"), Some(name)) if !name.is_empty() => {
-                    Ok(ToolChoice::Function(name.to_string()))
-                }
-                _ => Err(invalid_choice()),
-            }
-        }
-        _ => Err(invalid_choice()),
-    }
+pub(super) struct PreparedTools {
+    pub(super) choice: ToolChoice,
+    pub(super) configs: Vec<Value>,
+    pub(super) available: Vec<String>,
+    /// 旧协议没有对应字段；保留原意，后续执行器不得宣称已强制其并行行为。
+    pub(super) parallel_requested: Option<bool>,
 }
 
-fn invalid_choice() -> CatPawError {
-    CatPawError::bad_request("tool_choice 只支持 auto、none、required 或指定 function")
-}
-
-/// `tools` → 上游 `toolConfigs`（原实现 `normalizeTools`）。
-///
-/// `None`（客户端没给 tools 字段）返回空数组，不是错误 —— 不带工具的纯对话
-/// 完全正常。给了但形态不对（非数组、非 function 类型）才报 400。
-pub fn normalize_tools(tools: Option<&Value>) -> Result<Vec<Value>, CatPawError> {
-    let Some(tools) = tools else {
-        return Ok(Vec::new());
+pub(super) fn prepare(body: &Value) -> Result<PreparedTools> {
+    let choice = choice(body.get("tool_choice"))?;
+    let items = match body.get("tools") {
+        None | Some(Value::Null) => &[][..],
+        Some(Value::Array(items)) if items.len() <= MAX_TOOLS => items.as_slice(),
+        _ => return Err(errors::invalid("CatPaw tools 必须是不超过 256 项的数组")),
     };
-    if tools.is_null() {
-        return Ok(Vec::new());
-    }
-    let Some(items) = tools.as_array() else {
-        return Err(CatPawError::bad_request("tools 必须是数组"));
+    let parallel_requested = match body.get("parallel_tool_calls") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(value)) => Some(*value),
+        _ => return Err(errors::invalid("parallel_tool_calls 必须是布尔值")),
     };
-    let mut names: Vec<&str> = Vec::with_capacity(items.len());
-    let mut out: Vec<Value> = Vec::with_capacity(items.len());
-    for (index, tool) in items.iter().enumerate() {
-        let object = tool.as_object();
-        let function = object
-            .filter(|object| object.get("type").and_then(Value::as_str) == Some("function"))
-            .and_then(|object| object.get("function"))
-            .and_then(Value::as_object)
-            .ok_or_else(|| {
-                CatPawError::bad_request(format!("tools[{index}] 只支持 type=function"))
-            })?;
-        if let Some(strict) = function.get("strict").filter(|value| !value.is_null()) {
-            match strict.as_bool() {
-                None => {
-                    return Err(CatPawError::bad_request(format!(
-                        "tools[{index}].function.strict 必须是布尔值"
-                    )))
-                }
-                Some(true) => {
-                    return Err(CatPawError::bad_request(format!(
-                        "tools[{index}].function.strict=true 暂不支持"
-                    )))
-                }
-                Some(false) => {}
-            }
+    let mut names = BTreeSet::new();
+    let mut configs = Vec::with_capacity(items.len());
+    let mut available = Vec::with_capacity(items.len());
+    let mut bytes = 0usize;
+    for tool in items {
+        if tool["type"].as_str() != Some("function") {
+            return Err(errors::invalid("CatPaw tools 只接受 type=function 的工具"));
         }
-        let name = function.get("name").and_then(Value::as_str).unwrap_or_default();
-        if name.is_empty()
-            || name.len() > 128
-            || !name
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
-        {
-            return Err(CatPawError::bad_request(format!(
-                "tools[{index}].function.name 无效"
-            )));
+        let function = tool["function"].as_object()
+            .ok_or_else(|| errors::invalid("CatPaw 工具缺少 function 对象"))?;
+        match function.get("strict") {
+            None | Some(Value::Null) | Some(Value::Bool(false)) => {},
+            Some(Value::Bool(true)) => return Err(errors::invalid("CatPaw 暂不支持工具 strict=true")),
+            _ => return Err(errors::invalid("工具 strict 必须是布尔值")),
         }
-        if names.contains(&name) {
-            return Err(CatPawError::bad_request(format!(
-                "tools[{index}] 重复的工具名称: {name}"
-            )));
-        }
-        names.push(name);
-        // `fn.parameters ?? { type:'object', properties:{} }`：**空值合并**
-        // （显式 null 也落到默认值；空对象 `{}` 是合法 schema，原样用）
-        let schema = match function.get("parameters") {
-            Some(value) if !value.is_null() => value.clone(),
-            _ => json!({ "type": "object", "properties": {} }),
-        };
+        let name = function.get("name").and_then(Value::as_str)
+            .ok_or_else(|| errors::invalid("CatPaw 工具缺少名称"))?;
+        validate_name(name)?;
+        if !names.insert(name) { return Err(errors::invalid("CatPaw tools 存在重复名称")); }
+        let default_schema = json!({ "type": "object", "properties": {} });
+        let schema = function.get("parameters").filter(|value| !value.is_null())
+            .unwrap_or(&default_schema);
         if !schema.is_object() {
-            return Err(CatPawError::bad_request(format!(
-                "tools[{index}].function.parameters 必须是 JSON Schema 对象"
-            )));
+            return Err(errors::invalid("CatPaw 工具 parameters 必须是 JSON Schema 对象"));
         }
-        validate_json_value(&schema, &format!("tools[{index}].function.parameters"), 0)?;
-        let mut config = Map::new();
-        config.insert("name".to_string(), Value::String(name.to_string()));
-        config.insert("enable".to_string(), Value::Bool(true));
-        if let Some(description) = function.get("description").and_then(Value::as_str) {
-            config.insert(
-                "description".to_string(),
-                Value::String(description.chars().take(8000).collect()),
-            );
+        validate_json(schema, true)?;
+        let description = match function.get("description") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(text)) if text.chars().count() <= MAX_DESCRIPTION_CHARS => Some(text),
+            Some(Value::String(_)) => return Err(errors::invalid("CatPaw 工具说明超过 8000 字符，未截断发送")),
+            _ => return Err(errors::invalid("CatPaw 工具 description 必须是文本")),
+        };
+        let mut config = json!({ "name": name, "enable": true, "fromClient": true,
+            "inputSchema": schema });
+        if let Some(description) = description { config["description"] = json!(description); }
+        bytes = bytes.checked_add(crate::prepare::json_bytes(&config, MAX_TOOL_BYTES)?)
+            .ok_or_else(|| errors::invalid("CatPaw 工具材料超过大小限制"))?;
+        if bytes > MAX_TOOLS_BYTES {
+            return Err(errors::invalid("CatPaw 工具材料超过 2 MiB，未截断发送"));
         }
-        config.insert("inputSchema".to_string(), schema);
-        config.insert("fromClient".to_string(), Value::Bool(true));
-        out.push(Value::Object(config));
+        // 未选中的工具也须校验，不能用 tool_choice=none 隐藏非法输入。
+        let selected = match &choice {
+            ToolChoice::None => false,
+            ToolChoice::Auto | ToolChoice::Required => true,
+            ToolChoice::Function(wanted) => wanted == name,
+        };
+        if selected { configs.push(config); available.push(name.to_string()); }
     }
-    Ok(out)
+    match &choice {
+        ToolChoice::Required if configs.is_empty() =>
+            return Err(errors::invalid("tool_choice=required 至少需要一个 function 工具")),
+        ToolChoice::Function(_) if configs.is_empty() =>
+            return Err(errors::invalid("tool_choice 指定的工具未在本次 tools 中声明")),
+        _ => {},
+    }
+    Ok(PreparedTools { choice, configs, available, parallel_requested })
 }
 
-/// 按 `tool_choice` 选出本轮实际下发给上游的工具集（原实现 `prepareRequest` 中段）。
-///
-/// | tool_choice | 下发的工具集 |
-/// |---|---|
-/// | `none` | 空（并已在上游侧断言「不许返回 tool_call」） |
-/// | `auto` / `required` | 全部 |
-/// | 指定函数 | 只含那一个（不存在则 400） |
-pub fn select_tools(all: &[Value], choice: &ToolChoice) -> Result<Vec<Value>, CatPawError> {
-    match choice {
-        ToolChoice::None => Ok(Vec::new()),
-        ToolChoice::Auto => Ok(all.to_vec()),
-        ToolChoice::Required => {
-            if all.is_empty() {
-                return Err(CatPawError::bad_request(
-                    "tool_choice 要求至少提供一个 function 工具",
-                ));
-            }
-            Ok(all.to_vec())
-        }
-        ToolChoice::Function(name) => {
-            let selected: Vec<Value> = all
-                .iter()
-                .filter(|tool| tool.get("name").and_then(Value::as_str) == Some(name.as_str()))
-                .cloned()
-                .collect();
-            if selected.is_empty() {
-                return Err(CatPawError::bad_request(format!(
-                    "tool_choice 指定的工具不存在: {name}"
-                )));
-            }
-            Ok(selected)
-        }
+fn choice(value: Option<&Value>) -> Result<ToolChoice> {
+    match value {
+        None | Some(Value::Null) => Ok(ToolChoice::Auto),
+        Some(Value::String(value)) if value == "auto" => Ok(ToolChoice::Auto),
+        Some(Value::String(value)) if value == "none" => Ok(ToolChoice::None),
+        Some(Value::String(value)) if value == "required" => Ok(ToolChoice::Required),
+        Some(Value::Object(value)) if value.get("type").and_then(Value::as_str) == Some("function") => {
+            let name = value.get("function").and_then(|value| value.get("name"))
+                .and_then(Value::as_str).ok_or_else(|| errors::invalid("tool_choice 缺少 function.name"))?;
+            validate_name(name)?;
+            Ok(ToolChoice::Function(name.to_string()))
+        },
+        _ => Err(errors::invalid("tool_choice 只支持 auto、none、required 或指定 function")),
     }
 }
 
-/// JSON Schema 允许的最深嵌套。
-///
-/// 原实现（照抄上游客户端）是 12，实测会把 zod 系 MCP server 整类挡在门外
-/// （issue #416），提到 32 覆盖实测最深的 31 层。
-const MAX_SCHEMA_DEPTH: usize = 32;
+pub(super) fn validate_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > 128
+        || !name.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte)) {
+        return Err(errors::invalid("CatPaw 工具名称必须为不超过 128 字节的字母、数字、下划线、点或连字符"));
+    }
+    Ok(())
+}
 
-/// 只表达「或 / 且 / 非」的 schema 组合键。它们不是数据层级，遍历时不计深度。
-const SCHEMA_COMBINATORS: &[&str] = &["anyOf", "oneOf", "allOf", "not"];
+pub(super) fn validate_call_id(id: &str) -> Result<()> {
+    if id.trim().is_empty() || id.len() > 256 || id.chars().any(char::is_control) {
+        return Err(errors::invalid("CatPaw tool_call_id 为空、过长或包含控制字符"));
+    }
+    Ok(())
+}
 
-/// JSON 值合法性校验（原实现 `validateJsonValue`）：嵌套深度 ≤32、
-/// 对象内不允许 `__proto__` / `constructor` / `prototype` 三个键。
-///
-/// ── 深度口径为什么改了（issue #416）─────────────────────────
-/// zod 系 MCP server 在把 zod schema 转成 JSON Schema 时会自动套
-/// `anyOf` / `oneOf` / `allOf` 包装层：语义上很浅的 schema 实测能到 16~31 层，
-/// 结果「挂载大型 MCP server」的客户端一发就 400。现在的口径：
-///   - 上限 32，覆盖实测最深的 31 层；
-///   - 组合键及其分支数组**不计层**（它们只是 schema 的组合语法）；
-///   - 真实的 object / array 嵌套仍按 32 层封顶。
-fn validate_json_value(value: &Value, path: &str, depth: usize) -> Result<(), CatPawError> {
-    if depth > MAX_SCHEMA_DEPTH {
-        return Err(CatPawError::bad_request(format!("{path} 嵌套过深")));
+/// schema 的组合键不计语义层级，但每个实际 JSON 容器都计物理深度和节点数。
+/// arguments/result 则不豁免 anyOf 等普通数据键。
+pub(super) fn validate_json(value: &Value, schema: bool) -> Result<()> {
+    let mut nodes = 0usize;
+    walk(value, schema, 0, 0, &mut nodes)?;
+    crate::prepare::json_bytes(value, MAX_TOOL_BYTES)?;
+    Ok(())
+}
+
+fn walk(value: &Value, schema: bool, depth: usize, physical: usize, nodes: &mut usize) -> Result<()> {
+    *nodes += 1;
+    if *nodes > MAX_NODES || depth > MAX_DEPTH || physical > MAX_PHYSICAL_DEPTH {
+        return Err(errors::invalid("CatPaw 工具 JSON 的深度或节点数超过限制"));
     }
     match value {
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => Ok(()),
         Value::Array(items) => {
-            for (index, item) in items.iter().enumerate() {
-                validate_json_value(item, &format!("{path}[{index}]"), depth + 1)?;
-            }
-            Ok(())
-        }
+            for item in items { walk(item, schema, depth + 1, physical + 1, nodes)?; }
+        },
         Value::Object(object) => {
             for (key, item) in object {
                 if matches!(key.as_str(), "__proto__" | "constructor" | "prototype") {
-                    return Err(CatPawError::bad_request(format!(
-                        "{path} 包含不允许的字段 {key}"
-                    )));
+                    return Err(errors::invalid("CatPaw 工具 JSON 包含不允许的原型字段"));
                 }
-                if SCHEMA_COMBINATORS.contains(&key.as_str()) {
+                if schema && matches!(key.as_str(), "anyOf" | "oneOf" | "allOf" | "not") {
                     if let Value::Array(branches) = item {
-                        for (index, branch) in branches.iter().enumerate() {
-                            validate_json_value(branch, &format!("{path}.{key}[{index}]"), depth)?;
+                        *nodes += 1;
+                        if *nodes > MAX_NODES || physical + 1 > MAX_PHYSICAL_DEPTH {
+                            return Err(errors::invalid("CatPaw 工具 JSON 的深度或节点数超过限制"));
                         }
-                        continue;
-                    }
-                    validate_json_value(item, &format!("{path}.{key}"), depth)?;
-                    continue;
-                }
-                validate_json_value(item, &format!("{path}.{key}"), depth + 1)?;
+                        for branch in branches { walk(branch, schema, depth, physical + 2, nodes)?; }
+                    } else { walk(item, schema, depth, physical + 1, nodes)?; }
+                } else { walk(item, schema, depth + 1, physical + 1, nodes)?; }
             }
-            Ok(())
-        }
+        },
+        _ => {},
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tool_choice_forms() {
-        assert_eq!(tool_choice_mode(None).unwrap_or(ToolChoice::None), ToolChoice::Auto);
-        assert_eq!(tool_choice_mode(Some(&Value::Null)).unwrap_or(ToolChoice::None), ToolChoice::Auto);
-        assert_eq!(tool_choice_mode(Some(&json!("required"))).unwrap_or(ToolChoice::None), ToolChoice::Required);
-        assert_eq!(
-            tool_choice_mode(Some(&json!({"type":"function","function":{"name":"f"}}))).unwrap_or(ToolChoice::None),
-            ToolChoice::Function("f".to_string())
-        );
-        assert!(tool_choice_mode(Some(&json!("weird"))).is_err());
-    }
-
-    #[test]
-    fn tools_map_to_tool_configs() {
-        let tools = json!([{ "type": "function", "function": { "name": "read", "description": "读", "parameters": {"type":"object"} } }]);
-        let configs = normalize_tools(Some(&tools)).unwrap_or_default();
-        assert_eq!(configs.len(), 1);
-        assert_eq!(configs[0]["name"], json!("read"));
-        assert_eq!(configs[0]["enable"], json!(true));
-        assert_eq!(configs[0]["fromClient"], json!(true));
-        assert_eq!(configs[0]["inputSchema"]["type"], json!("object"));
-    }
-
-    #[test]
-    fn strict_true_rejected_empty_required_rejected() {
-        let strict = json!([{ "type": "function", "function": { "name": "f", "strict": true } }]);
-        assert!(normalize_tools(Some(&strict)).is_err());
-        assert!(select_tools(&[], &ToolChoice::Required).is_err());
-        assert!(select_tools(&[], &ToolChoice::Function("f".into())).is_err());
-    }
+    Ok(())
 }

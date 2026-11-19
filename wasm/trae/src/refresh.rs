@@ -1,254 +1,277 @@
-//! Trae 的凭据续期（`ExchangeToken` 的 refreshToken 路径）。
-//!
-//! ── 为什么这条链的写法比别家更保守 ────────────────────────
-//! `refreshToken` **每次换发都会轮换**（旧的当场作废）。这意味着任何一次
-//! "发了请求但没把结果存下来"都是**把账号弄丢**：新串在内存里没落盘、
-//! 旧串已经被服务端作废。所以这里三条规矩是硬性的：
-//!   ① 失败**不改写**任何字段（参考实现同一条），旧的 refreshToken 仍可重试；
-//!   ② 成功后**先落盘再往下走**（落盘纪律在 `account::renew`）；
-//!   ③ 同一凭据的并发续期只打上游一次 —— 否则两个请求各自拿到不同的新串，
-//!      后存的那个把前一个覆盖掉，账号就废了。
-//!
-//! 到期判定不只看临期：参考实现还加了一条"签发龄超 15 天也换"（服务端有
-//! 吊销旧凭据的风险），所以 `needs_refresh` 的两个条件都要传（见 `account.rs`）。
+//! 旧原生刷新链：24小时临期/15天签发龄，账号锁单飞，轮换成功先CAS落盘。
+//! 仅400/10101归属拒绝才换已知ClientID；设备密钥和未知secret字段原样保留。
+//! 已有原设备密钥的账号先走同设备DeviceProof续期；设备注册拒绝才退旧轮换链。
+//! 不生成替代设备、不复用已发出但结果未知的refreshToken请求。
 
-use agent2api_wasm_sdk::{json, Error, Result, Value};
+use super::{account, client, credentials, device, endpoints, errors, headers, util};
+use agent2api_wasm_sdk::{self as sdk, json, AccountLock, Error, Result, Value};
 
-use super::account::Credential;
-use super::headers::CLIENT_USER_AGENT;
-use super::oauth::{client_id_for, other_client_id};
-use super::upstream::{describe_candidates, post_json, trim};
+pub fn client_ids(secret: &Value) -> Vec<String> {
+    let primary = endpoints::client_id(credentials::variant(secret));
+    let other = if primary == endpoints::SOLO_CLIENT {
+        endpoints::IDE_CLIENT
+    } else {
+        endpoints::SOLO_CLIENT
+    };
+    let mut out = Vec::new();
+    for id in [
+        util::text(secret, &["authClientId"]),
+        primary.into(),
+        other.into(),
+    ] {
+        if !id.is_empty() && !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out
+}
 
-/// 提前续期的窗口（参考实现 `defaultRefreshSkew = 24h`）。
-pub const REFRESH_LEAD_MS: i64 = 24 * 3600 * 1000;
-/// 签发龄上限：超过就换，即使还没到期（`auth.issuedRotateMax` 同一条）。
-pub const MAX_ISSUE_AGE_MS: i64 = 15 * 24 * 3600 * 1000;
-
-/// 换证端点（相对各 OAuth host）。注意与**授权码**换证不是同一个路径：
-/// 那条是 `/trae/api/v3/oauth/ExchangeToken`，见 `oauth.rs`。
-pub const REFRESH_PATH: &str = "/cloudide/api/v3/trae/oauth/ExchangeToken";
-
-/// 兜底 host（凭据里的 `apiHost` 不可用时依次试这两个）。
-///
-/// 顺序照参考实现的 `exchangeHosts(primary, oauth)`：账号 apiHost →
-/// **OAuth host**（= `https://api.trae.cn`，登录时就写进凭据了）→ 平台备用源
-/// （`api.trae.com.cn`）。先前写成"备用源在前"，只在 apiHost 为空时看得见差别
-/// —— 而那正好是手工粘贴的凭据的常态。
-const FALLBACK_HOSTS: [&str; 2] = ["https://api.trae.cn", "https://api.trae.com.cn"];
-
-/// 候选 host 顺序：凭据里那份优先，然后是两个兜底（参考实现 `exchangeHosts`）。
-///
-/// 这条 host 表**不只服务续期**：`GetUserInfo`（登录后的身份回读）打的是同一组
-/// host、同一份优先级，所以把它单独暴露出来，别让第二处再抄一遍顺序。
-pub fn candidate_hosts(api_host: &str) -> Vec<String> {
-    let mut hosts: Vec<String> = Vec::new();
-    for host in [api_host.trim()].iter().chain(FALLBACK_HOSTS.iter()) {
-        let host = host.trim_end_matches('/');
-        if host.is_empty() {
+pub fn token_fields(body: &Value) -> Result<Value> {
+    for result in [body.get("Result"), body.get("result")]
+        .into_iter()
+        .flatten()
+    {
+        let token = util::header(
+            &util::text(result, &["Token", "token", "AccessToken", "accessToken"]),
+            16384,
+        )?;
+        if token.is_empty() {
             continue;
         }
-        let host = if host.starts_with("http://") || host.starts_with("https://") {
-            host.to_string()
-        } else {
-            format!("https://{host}")
-        };
-        if !hosts.contains(&host) {
-            hosts.push(host);
+        let mut fields = json!({ "accessToken": token });
+        let refresh = util::header(
+            &util::text(result, &["RefreshToken", "refreshToken", "refresh_token"]),
+            16384,
+        )?;
+        if !refresh.is_empty() {
+            fields["refreshToken"] = json!(refresh);
         }
-    }
-    hosts
-}
-
-/// 续期端点的候选 URL（`candidate_hosts` × 本家的换证路径）。
-pub fn refresh_candidates(api_host: &str) -> Vec<String> {
-    candidate_hosts(api_host)
-        .into_iter()
-        .map(|host| format!("{host}{REFRESH_PATH}"))
-        .collect()
-}
-
-/// 续期请求体。`ClientID` 必须按 variant 选：参考实现里出过事故 ——
-/// 裸凭据缺 variant 时一律解析成 cn 的 ClientID，SOLO 登录当场换发出跨类
-/// token，之后积分/签到全 401（`code=1001`），而聊天还是正常的。
-pub fn refresh_body(client_id: &str, refresh_token: &str) -> Value {
-    json!({ "ClientID": client_id, "RefreshToken": refresh_token, "ClientSecret": "-", "UserID": "" })
-}
-
-/// 续期该试哪些 `ClientID`（顺序 = 候选，第一个被上游承认的就用它，并回写进凭据）。
-///
-/// ── 为什么不是一个而是两个 ──────────────────────────────────
-/// `variant` 表达的是**转发面**的谱系，`ClientID` 表达的是"这张 refreshToken
-/// 当初在哪个 OAuth 应用里 mint"，二者可以不一致，而续期只认后者。生产实测
-/// （2026-10-02，三条从 CPA 迁来的账号）：库里 `variant=solo`，CPA 盘上的
-/// `authClientId` 与当年 `ExchangeToken` 响应的 `Result.ClientID` 却都是
-/// **非 solo** 的 `ono9krqynydwx5` ⇒ 按 variant 推出来 `en1oxy7wnw8j9n` 去续期，
-/// 上游回 `400 10101 "refresh token is not matched to the client"`，
-/// 三条凭据从第一次进入续期窗口起就一直续不上。
-///
-/// 判据不是猜的：拿一枚**假**令牌打同一个端点，回的是
-/// `401 20101 "refresh token is invalid"`，与上面那条不同形 —— 所以
-/// 「not matched to the client」说的是"这枚令牌存在，但不属于你报的这个 client"。
-pub fn refresh_client_ids(credential: &Credential) -> Vec<String> {
-    let mut ids: Vec<String> = Vec::new();
-    let variant_id = client_id_for(credential.variant());
-    // 顺序 = 可信度：① 凭据里记着的归属（上游自己回显过的）②按 variant 推的
-    // ③ 本家已知表里的另一把（未知归属时的最后一搏，成功就把结果记回凭据）
-    let recorded = credential.auth_client_id.trim();
-    let mut candidates: Vec<&str> = Vec::new();
-    if !recorded.is_empty() {
-        candidates.push(recorded);
-    }
-    candidates.push(variant_id);
-    candidates.extend(other_client_id(variant_id));
-    for id in candidates {
-        let id = id.trim();
-        if !id.is_empty() && !ids.iter().any(|seen| seen == id) {
-            ids.push(id.to_string());
+        if let Some(at) = ["TokenExpireAt", "tokenExpireAt", "ExpiresAt", "expiresAt"]
+            .iter()
+            .find_map(|field| util::millis(&result[*field]))
+        {
+            fields["expiresAt"] = json!(at);
         }
-    }
-    ids
-}
-
-/// 从换证响应里读上游承认的那把 `ClientID`（`Result.ClientID`）。
-///
-/// 读不到给空串 —— 调用方据此**保留**原值，不许把已有字段抹成空。
-pub fn response_client_id(body: &str) -> String {
-    let Ok(parsed) = serde_json::from_str::<Value>(body) else {
-        return String::new();
-    };
-    ["Result", "result"]
-        .iter()
-        .find_map(|key| parsed.get(*key).and_then(Value::as_object))
-        .and_then(|object| first_string(object, &["ClientID", "clientId", "client_id"]))
-        .unwrap_or_default()
-}
-
-/// 解析换证响应。
-///
-/// 上游把令牌放在 `Result` 里，且字段名有两套写法（`Token` / `token` 等），
-/// 所以取值要逐个试；`TokenExpireAt` 是**毫秒**。
-///
-/// ── 到期字段数字与**字符串**都要认（issue #263）──────────────
-/// 中国版的 `TokenExpireAt` 是**字符串**形态（参考实现两处测试夹具原样：
-/// `"TokenExpireAt": "1900000000000"`，他们的解析全程 `str()` 兜底）。
-/// 旧解析只走 `as_i64` / `as_f64`，字符串静默落成 0 —— 面板上的有效期与
-/// 自动续期节奏（`needs_refresh` 看到期）一起坏，而且不报错。
-pub fn parse_refresh_response(body: &str) -> std::result::Result<(String, String, i64), String> {
-    let parsed: Value = serde_json::from_str(body).map_err(|error| format!("换证响应不是合法 JSON：{error}"))?;
-    for key in ["Result", "result"] {
-        if let Some(object) = parsed.get(key).and_then(Value::as_object) {
-            if let Some(token) = first_string(object, &["Token", "token", "AccessToken", "accessToken"]) {
-                let refresh = first_string(object, &["RefreshToken", "refreshToken", "refresh_token"]).unwrap_or_default();
-                let expires = ["TokenExpireAt", "tokenExpireAt", "ExpiresAt", "expiresAt"]
-                    .iter()
-                    .find_map(|field| timestamp_field(object.get(*field)))
-                    .unwrap_or(0);
-                return Ok((token, refresh, normalize_expires_at(expires)));
-            }
+        let id = util::header(
+            &util::text(result, &["ClientID", "clientId", "client_id"]),
+            256,
+        )?;
+        if !id.is_empty() {
+            fields["authClientId"] = json!(id);
         }
+        return Ok(fields);
     }
-    Err("换证响应里没有 access token".to_string())
+    Err(Error::http(
+        502,
+        "Trae 换证响应缺少有效访问令牌，未覆盖旧凭据",
+    ))
 }
 
-/// 时间戳字段的三种形态都认：整数、浮点、**字符串**数字。
-fn timestamp_field(value: Option<&Value>) -> Option<i64> {
-    match value? {
-        Value::Number(number) => number.as_i64().or_else(|| number.as_f64().map(|raw| raw as i64)),
-        Value::String(text) => text.trim().parse::<f64>().ok().map(|raw| raw as i64),
-        _ => None,
+fn bound_exchange(secret: &Value) -> Result<Option<Value>> {
+    let public = util::text(secret, &["devicePublicKey"]);
+    let private = util::text(secret, &["devicePrivateKey"]);
+    let device_id = util::text(secret, &["deviceId"]);
+    let machine = util::text(secret, &["machineId"]);
+    if public.is_empty() || private.is_empty() || device_id.is_empty() || machine.is_empty() {
+        return Ok(None);
     }
-}
-
-/// 秒与毫秒的归一（同 `Credential::expires_at_ms` 的判据）。
-pub fn normalize_expires_at(value: i64) -> i64 {
-    if value <= 0 {
-        return 0;
-    }
-    if value < 100_000_000_000 {
-        value * 1000
+    device::validate(&public, &private)?;
+    let primary = util::text(secret, &["apiHost"]);
+    let host = if primary.is_empty() {
+        endpoints::ACCOUNT.into()
     } else {
-        value
+        util::account_origin(&primary)?
+    };
+    let refresh = util::text(secret, &["refreshToken"]);
+    for id in client_ids(secret) {
+        let platform = if id == endpoints::SOLO_CLIENT {
+            "SOLO_PC"
+        } else {
+            "IDE_PC"
+        };
+        let body = json!({ "ClientID": id, "ClientSecret": "", "RefreshToken": refresh,
+            "IDEVersion": endpoints::IDE_VERSION,
+            "DeviceInfo": { "DeviceID": device_id, "MachineID": machine,
+                "PlatformCode": platform, "DeviceType": "PC", "DeviceName": "", "DeviceModel": "",
+                "ClientVersion": endpoints::IDE_VERSION, "DevicePublicKey": public,
+                "DeviceBrand": "", "DeviceCPU": "", "OSInfo": headers::platform()?, "OSVersion": "" },
+            "DeviceProof": device::proof(endpoints::EXCHANGE, &id, &refresh, &private)? });
+        if credentials::parse(&account::current()?["secret"])? != *secret {
+            return Err(
+                Error::http(409, "Trae 续期前账号材料已变化").with_code("local_precondition")
+            );
+        }
+        let reply = client::post(
+            &format!("{host}{}", endpoints::EXCHANGE),
+            headers::oauth(None),
+            &body,
+        )?;
+        if (200..300).contains(&reply.status) && !errors::failed(&reply.body) {
+            let mut patch = token_fields(&reply.body)?;
+            if patch["authClientId"].is_null() {
+                patch["authClientId"] = json!(id);
+            }
+            return Ok(Some(patch));
+        }
+        let code = errors::code(&reply.body);
+        if reply.status == 400 && code == Some(10101) {
+            continue;
+        }
+        if matches!(reply.status, 404 | 405) || matches!(code, Some(20401 | 20405)) {
+            return Ok(None);
+        }
+        return Err(errors::upstream(reply.status, &reply.body));
     }
+    Ok(None)
 }
 
-fn first_string(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<String> {
-    // 空串不算命中：参考实现的 `jsonString` 把 `""` 与"没有这个键"归成同一件事
-    // （`Token:""` 要往下一个键/下一层继续找，而不是当成换证成功）。
-    keys.iter()
-        .find_map(|key| object.get(*key).and_then(Value::as_str).filter(|text| !text.is_empty()))
-        .map(str::to_string)
-}
-
-/// 上游这次失败是不是在说「归属不对」。**只有**这种失败值得换一把 ClientID 再试。
-///
-/// 反面同样是实测出来的：一枚假令牌打这个端点回的是 `401 20101
-/// "refresh token is invalid"`，与归属无关 —— 那种情况下换 ClientID 只是白撞；
-/// 传输层失败也一样，跟参数无关。
-fn attribution_reject(status: u16, body: &str) -> bool {
-    if status != 400 {
-        return false;
+pub fn exchange(secret: &Value) -> Result<Value> {
+    let refresh = util::text(secret, &["refreshToken"]);
+    if refresh.is_empty() {
+        return Err(
+            Error::http(401, "Trae 账号没有续期凭据，请重新登录").with_code("trae_session_expired")
+        );
     }
-    let text = body.to_lowercase();
-    text.contains("10101") || text.contains("not matched to the client")
-}
-
-/// 打上游换新凭据（不含存储；调用方负责先落盘再继续）。
-///
-/// 返回的是**新凭据**（原凭据的其余字段带过来），失败时原凭据不受影响。
-pub fn refresh_once(credential: &Credential) -> Result<Credential> {
-    if !credential.can_refresh() {
-        return Err(Error::http(401, "Trae 凭据里没有 refreshToken，无法续期（请重新登录）"));
+    if let Some(fields) = bound_exchange(secret)? {
+        return Ok(fields);
     }
-    let headers = vec![("User-Agent".to_string(), CLIENT_USER_AGENT.to_string())];
-    let urls = refresh_candidates(&credential.api_host);
-    let mut errors: Vec<String> = Vec::new();
-    // 外层是 ClientID 候选、内层是 host 候选：归属不对时换归属，而不是换域名
-    for client_id in refresh_client_ids(credential) {
-        let body = refresh_body(&client_id, credential.refresh_token.trim());
-        let mut wrong_attribution = false;
-        for url in &urls {
-            // 每条失败都要带上用的哪把 ClientID：排查 10101 时，日志只写 host
-            // 与上游原文，"归属不对"这个原因看不出来
-            let label = format!("{url}（ClientID {client_id}）");
-            match post_json(url, &body, &headers) {
-                Ok(reply) if reply.status >= 400 => {
-                    if attribution_reject(reply.status, &reply.body) {
-                        wrong_attribution = true;
-                    }
-                    errors.push(format!("{} => HTTP {} {}", label, reply.status, trim(&reply.body)));
+    let hosts = util::account_hosts(&util::text(secret, &["apiHost"]), false)?;
+    let mut last = Error::http(502, "Trae 续期未成功，已保留旧凭据");
+    for id in client_ids(secret) {
+        let mut mismatch = false;
+        let body =
+            json!({ "ClientID": id, "RefreshToken": refresh, "ClientSecret": "-", "UserID": "" });
+        for host in &hosts {
+            if credentials::parse(&account::current()?["secret"])? != *secret {
+                return Err(
+                    Error::http(409, "Trae 续期前账号材料已变化").with_code("local_precondition")
+                );
+            }
+            let reply = match client::post(
+                &format!("{host}{}", endpoints::REFRESH),
+                headers::oauth(None),
+                &body,
+            ) {
+                Ok(reply) => reply,
+                // 一次性续期发出后结果未知，不通过换host自动重复消费同一枚refreshToken。
+                Err(error) => return Err(error),
+            };
+            if (200..300).contains(&reply.status) && !errors::failed(&reply.body) {
+                let mut fields = token_fields(&reply.body)?;
+                if fields["authClientId"].is_null() {
+                    fields["authClientId"] = json!(id);
                 }
-                Ok(reply) => match parse_refresh_response(&reply.body) {
-                    Ok((access_token, refresh_token, expires_at_ms)) => {
-                        let mut next = credential.clone();
-                        next.access_token = access_token;
-                        // 上游没回新 refreshToken 时**保留旧的**：清空它等于让账号变成
-                        // "过期后不可恢复"，而参考实现也是这么兜的。
-                        if !refresh_token.is_empty() {
-                            next.refresh_token = refresh_token;
-                        }
-                        next.expires_at = expires_at_ms;
-                        // 把上游承认的那把归属记下来（响应里没有就沿用本次用的那把）：
-                        // 下一次续期直接一发命中，不再靠 variant 猜
-                        let acknowledged = response_client_id(&reply.body);
-                        next.auth_client_id = if acknowledged.is_empty() {
-                            client_id.clone()
-                        } else {
-                            acknowledged
-                        };
-                        return Ok(next);
-                    }
-                    Err(reason) => errors.push(format!("{label} => {reason}")),
-                },
-                Err(error) => errors.push(format!("{label} => {}", error.message)),
+                return Ok(fields);
+            }
+            let attribution = reply.status == 400
+                && (errors::code(&reply.body) == Some(10101)
+                    || errors::message(&reply.body).contains("not matched to the client"));
+            last = errors::upstream(reply.status, &reply.body);
+            if attribution {
+                mismatch = true;
+                break;
+            }
+            // 鉴权/设备/额度拒绝不是换域名的理由；只对明确路径不可达保留原生备用源。
+            if !matches!(reply.status, 404 | 405) {
+                return Err(last);
             }
         }
-        // 换下一把归属的唯一理由：上游明说"这枚令牌不属于你报的这个 client"。
-        // 401（凭据被拒 = 该重登）与传输层失败都不是这个问题。
-        if !wrong_attribution {
+        if !mismatch {
             break;
         }
     }
-    // 4xx 语义原样透出（"凭据被拒（该重登）"与"上游挂了（该重试）"不能长一样）
-    let status = if errors.iter().any(|error| error.contains("HTTP 401")) { 401 } else { 502 };
-    Err(Error::http(status, describe_candidates(&urls, &errors)))
+    Err(last)
+}
+
+fn merge(secret: &Value, patch: &Value) -> Result<Value> {
+    let mut next = secret.clone();
+    let mut auth = &mut next;
+    for key in ["pluginSecret", "secret", "auth"] {
+        if auth.get(key).is_some_and(Value::is_object) {
+            auth = &mut auth[key];
+        }
+    }
+    let target = auth
+        .as_object_mut()
+        .ok_or_else(|| Error::http(409, "Trae 已保存凭据格式无效"))?;
+    for (key, value) in patch.as_object().into_iter().flatten() {
+        if !value.is_null() && value.as_str() != Some("") {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+    if !patch["expiresAt"].is_number() {
+        // 新token无到期读数时不能继续沿用旧token的时刻或其它旧别名。
+        for key in ["expiresAt", "expiresAtMs", "TokenExpireAt", "tokenExpireAt"] {
+            target.remove(key);
+        }
+    } else {
+        for key in ["expiresAtMs", "TokenExpireAt", "tokenExpireAt"] {
+            target.remove(key);
+        }
+    }
+    // 已更新的auth可能仍包在旧平铺时间之外；父级旧别名不能重新兜回新令牌。
+    let mut outer = &mut next;
+    for key in ["pluginSecret", "secret", "auth"] {
+        if outer.get(key).is_some_and(Value::is_object) {
+            for field in ["expiresAt", "expiresAtMs", "TokenExpireAt", "tokenExpireAt"] {
+                if let Some(fields) = outer.as_object_mut() {
+                    fields.remove(field);
+                }
+            }
+            outer = &mut outer[key];
+        }
+    }
+    Ok(next)
+}
+
+/// 调用方已经拿到账号锁；签到内部使用，避免同一次调用嵌套锁。
+pub fn locked(record: Value, force: bool) -> Result<Value> {
+    let secret = credentials::parse(&record["secret"])?;
+    let can = !util::text(&secret, &["refreshToken"]).is_empty();
+    if !force && (!can || !credentials::needs_refresh(&secret, util::now()?)) {
+        credentials::token(&secret)?;
+        return Ok(record);
+    }
+    let fields = exchange(&secret)?;
+    let next = merge(&record["secret"], &fields)?;
+    let normalized = credentials::parse(&next)?;
+    let updated = sdk::host(
+        "account.update",
+        json!({ "expect": record["secret"], "secret": next,
+        "public": account::view(&normalized) }),
+    )?;
+    if updated["updated"] != true {
+        return Err(Error::http(
+            409,
+            "Trae 续期期间凭据被替换，新令牌未覆盖账号；请确认登录状态",
+        )
+        .with_code("credential_conflict"));
+    }
+    let mut record = record;
+    record["secret"] = next;
+    Ok(record)
+}
+
+pub fn ensure(force: bool, observed: Option<&Value>) -> Result<Value> {
+    let before = account::current()?;
+    let expected = observed.unwrap_or(&before["secret"]);
+    let _guard = AccountLock::acquire()?;
+    let latest = account::current()?;
+    if latest["secret"] != *expected {
+        // 并发任务已经刷新，使用落盘的新值，不再把新refreshToken轮换一次。
+        let normalized = credentials::parse(&latest["secret"])?;
+        if force {
+            credentials::token(&normalized)?;
+            return Ok(latest);
+        }
+        return locked(latest, false);
+    }
+    locked(latest, force)
+}
+
+pub fn expiring() -> Result<bool> {
+    let record = account::current()?;
+    let secret = credentials::parse(&record["secret"])?;
+    Ok(!util::text(&secret, &["refreshToken"]).is_empty()
+        && credentials::needs_refresh(&secret, util::now()?))
 }

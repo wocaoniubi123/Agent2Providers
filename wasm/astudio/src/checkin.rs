@@ -1,134 +1,143 @@
-//! AStudio 每日签到：执行桌面端启动时的账号初始化，触发每日登录奖励。
-//!
-//! ── 发奖动作与到账核对 ──────────────────────────────────────
-//! POST `tenant-app/v2/init-app`（无 body、带 Cookie）才触发每日奖励；
-//! 查询会员/积分或关闭弹窗不发奖。所以流程是：
-//! 读余额 → 初始化账号 → 等 2.5 秒 → 再读余额，分别核对通用与星火积分。
-//! **余额没涨不等于今日已领**，也不能断言没有活动：只报告本次未观测到新到账，
-//! 让编排层保留重试（native 的取舍，逐条照搬）。
+//! 每日登录初始化只在本账号当天第一次真实请求时提交；未知结果只回查积分，不盲目重发。
+//! 两池正增量才报 claimed，零增量不假报 done；每日预约保存在宿主账号范围，锁内 CAS。
 
-use agent2api_wasm_sdk::{self as sdk, json, Error, Result, Value};
+use super::{account, client, endpoints, usage};
+use agent2api_wasm_sdk::{
+    self as sdk, json,
+    state::{Scope, Snapshot},
+    AccountLock, Error, Result, Value,
+};
+use sha2::{Digest, Sha256};
 
-use super::{account, client};
+const KEY: &str = "daily-login-v1";
 
-/// 到账等待（native 的 `REWARD_WAIT_MS`）。
-const REWARD_WAIT_MS: u64 = 2500;
-
-/// 一次积分读数。
-struct Balance {
-    points: Option<f64>,
-    spark: Option<f64>,
+fn report(outcome: &str, message: &str, credit: Option<String>) -> Value {
+    json!({ "outcome": outcome, "message": message, "credit": credit, "streak": null })
 }
 
-/// `checkin.claim`。
-pub fn checkin() -> Result<Value> {
-    let secret = account::current()?;
-    let credentials = account::Credentials::from_secret(&secret);
-    if credentials.key.is_empty() {
-        return Err(Error::http(401, "AStudio 账号缺少 modelBearerToken，请重新登录或粘贴"));
+fn save(previous: &Snapshot, value: Value) -> Result<Snapshot> {
+    if !sdk::state::compare_exchange(Scope::Account, KEY, 1, previous.revision, value, 0)? {
+        return Err(Error::http(409, "AStudio 每日登录状态已变化，未重复提交"));
     }
-    if !credentials.has_session() {
-        return Ok(report(
-            "ineligible",
-            None,
-            None,
-            Some("该账号只有模型凭据（无网页会话），无法执行每日登录签到"),
-        ));
+    let current = sdk::state::get(Scope::Account, KEY, 1)?;
+    if !current.compatible {
+        return Err(Error::http(409, "AStudio 每日登录状态版本不兼容"));
     }
-    let config = match client::studio_json(&credentials, client::PLAN_CONFIG, "签到配置") {
-        Ok(value) => value,
-        Err(client::StudioError::Expired(message)) => return Err(Error::http(401, message)),
-        Err(error) => return Ok(report("failed", None, None, Some(error.message()))),
-    };
-    if config.get("dailyLoginEnabled").and_then(Value::as_bool) == Some(false) {
-        return Ok(report("inactive", None, None, Some("当前没有每日登录积分活动")));
-    }
-    let before = match read_balance(&credentials) {
-        Ok(value) => value,
-        Err(client::StudioError::Expired(message)) => return Err(Error::http(401, message)),
-        Err(error) => return Ok(report("failed", None, None, Some(error.message()))),
-    };
-    // 不能用只读查询替代每日登录动作；上游拒绝时直接返回，不能继续报「余额没涨」。
-    if let Err(error) = client::init_app(&credentials) {
-        return match error {
-            client::StudioError::Expired(message) => Err(Error::http(401, message)),
-            client::StudioError::Failed(message) => Ok(report("failed", None, None, Some(&message))),
-        };
-    }
-    sdk::sleep(REWARD_WAIT_MS)?;
-    let after = match read_balance(&credentials) {
-        Ok(value) => value,
-        Err(client::StudioError::Expired(message)) => return Err(Error::http(401, message)),
-        Err(error) => return Ok(report("failed", None, None, Some(error.message()))),
+    Ok(current)
+}
+
+fn observe(record: &Value, previous: &Snapshot) -> Result<Value> {
+    let after = usage::balance(&record["secret"])?;
+    account::ensure_current(record)?;
+    let delta = |before: &Value, after: Option<f64>| {
+        after
+            .zip(account::number(before))
+            .map(|(after, before)| after - before)
+            .filter(|value| value.is_finite())
     };
     let deltas = [
-        ("通用积分", balance_delta(before.points, after.points)),
-        ("星火积分", balance_delta(before.spark, after.spark)),
+        (
+            "通用积分",
+            delta(&previous.value["before"]["points"], after.points),
+        ),
+        (
+            "星火积分",
+            delta(&previous.value["before"]["spark"], after.spark),
+        ),
     ];
-    if deltas.iter().all(|(_, delta)| delta.is_none()) {
-        return Ok(report(
-            "failed",
-            None,
-            None,
-            Some("签到前后积分读数不完整，无法确认奖励到账"),
-        ));
-    }
-    // 两个余额池独立核对：只到账星火积分也算成功，缺失读数不能当成 0。
     let rewards: Vec<String> = deltas
         .iter()
-        .filter_map(|(label, delta)| delta.filter(|value| *value > 0.0).map(|value| format!("{label} +{value}")))
+        .filter_map(|(label, delta)| {
+            delta
+                .filter(|delta| *delta > 0.0)
+                .map(|delta| format!("{label} +{delta}"))
+        })
         .collect();
-    if !rewards.is_empty() {
-        let credit = rewards.join("，");
-        return Ok(json!({
-            "outcome": "claimed",
-            "credit": credit,
-            "streak": Value::Null,
-            "message": format!("每日登录奖励已到账：{credit}"),
-        }));
+    if rewards.is_empty() {
+        return Ok(report(
+            "failed",
+            "每日登录结果尚未确认；后续只回查积分，不重复提交初始化",
+            None,
+        ));
     }
-    // 初始化成功不是领奖凭证；未到账保留重试，不能按「今日无活动」结束。
+    let credit = rewards.join("，");
+    let mut value = previous.value.clone();
+    value["phase"] = json!("observed");
+    value["credit"] = json!(credit);
+    save(previous, value)?;
     Ok(report(
-        "failed",
-        None,
-        None,
-        Some("每日登录已执行，但未观测到新增积分（可能今日已领取或暂未到账）"),
+        "claimed",
+        &format!("每日登录奖励已观测到账：{credit}"),
+        Some(credit.clone()),
     ))
 }
 
-/// 组一条签到报告。
-fn report(outcome: &str, credit: Option<&str>, streak: Option<u32>, message: Option<&str>) -> Value {
-    json!({
-        "outcome": outcome,
-        "credit": credit,
-        "streak": streak,
-        "message": message,
-    })
-}
-
-fn read_balance(credentials: &account::Credentials) -> std::result::Result<Balance, client::StudioError> {
-    let value = client::studio_json(credentials, client::POINTS_BALANCE, "积分余额")?;
-    let balance = Balance {
-        points: balance_number(value.get("totalBalance")),
-        spark: balance_number(value.get("sparkTotalBalance")),
-    };
-    if balance.points.is_none() && balance.spark.is_none() {
-        return Err(client::StudioError::Failed("积分余额读数不完整".into()));
+fn run() -> Result<Value> {
+    let _lock = AccountLock::acquire()?;
+    let record = account::current()?;
+    let secret = &record["secret"];
+    if !account::has_session(secret) {
+        return Ok(report(
+            "ineligible",
+            "该账号只有模型凭据，无网页会话，无法执行每日登录签到",
+            None,
+        ));
     }
-    Ok(balance)
+    let now = sdk::now();
+    if now <= 0 {
+        return Err(Error::http(502, "AStudio 每日登录无法取得当前时间"));
+    }
+    let day = now.saturating_add(8 * 3_600_000) / 86_400_000;
+    let fingerprint = format!("{:x}", Sha256::digest(account::cookie(secret)?.as_bytes()));
+    let previous = sdk::state::get(Scope::Account, KEY, 1)?;
+    if !previous.compatible {
+        return Err(Error::http(409, "AStudio 每日登录状态版本不兼容"));
+    }
+    if previous.value["day"].as_i64() == Some(day) {
+        if previous.value["fingerprint"] != fingerprint {
+            return Ok(report(
+                "failed",
+                "今日网页会话已更换，原初始化结果需先确认；未重复提交",
+                None,
+            ));
+        }
+        return match previous.value["phase"].as_str() {
+            Some("observed") => Ok(report("done", "今日每日登录奖励已经观测到账", None)),
+            Some("pending") => observe(&record, &previous),
+            _ => Err(Error::http(
+                409,
+                "AStudio 今日每日登录状态不完整，未重复提交",
+            )),
+        };
+    }
+    let config = client::studio("GET", endpoints::PLAN, Some(secret))?.data(true, "session")?;
+    if config["dailyLoginEnabled"] == false {
+        return Ok(report("inactive", "当前没有每日登录积分活动", None));
+    }
+    let before = usage::balance(secret)?;
+    account::ensure_current(&record)?;
+    let reserved = save(
+        &previous,
+        json!({ "day": day, "phase": "pending", "fingerprint": fingerprint,
+        "before": { "points": before.points, "spark": before.spark } }),
+    )?;
+    account::ensure_current(&record)?;
+    client::init(secret)?;
+    sdk::sleep(2500)?;
+    observe(&record, &reserved)
 }
 
-fn balance_number(value: Option<&Value>) -> Option<f64> {
-    value
-        .and_then(|value| {
-            value
-                .as_f64()
-                .or_else(|| value.as_str().and_then(|text| text.trim().parse::<f64>().ok()))
-        })
-        .filter(|number| number.is_finite() && *number >= 0.0)
-}
-
-fn balance_delta(before: Option<f64>, after: Option<f64>) -> Option<f64> {
-    let delta = after? - before?;
-    delta.is_finite().then_some(delta)
+pub fn claim() -> Result<Value> {
+    match run() {
+        Ok(report) => Ok(report),
+        Err(error)
+            if matches!(
+                error.code.as_deref(),
+                Some("astudio_session_expired" | "astudio_model_expired")
+            ) =>
+        {
+            Err(error)
+        }
+        Err(error) => Ok(report("failed", &error.message, None)),
+    }
 }

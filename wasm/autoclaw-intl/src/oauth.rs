@@ -1,218 +1,235 @@
-//! AutoClaw **国际版**的 OAuth 网页登录（Zai / Google）两跳。
-//!
-//! ── 协议（三步，实测）───────────────────────────────────────
-//! ```text
-//! ① POST {intl}/userapi/overseasv1/oauth-captcha-config   {}
-//!      → data {enabled, region, prefix, scene_id, captcha_supplier}
-//!      ★ 这就是「这个构建要不要走 OAuth」的开关：国内版返回 enabled:false。
-//! ② POST {intl}/userapi/overseasv1/{zai|google}-oauth-url
-//!      {source_id, device_id, navigate_uri, ali_captcha_verify_param}
-//!      → data.oauth_url（官方登录页）
-//! ③ 浏览器在登录页完成登录 → 302 到 {navigate_uri}?code=…&state=…
-//!    POST {intl}/userapi/overseasv1/{zai|google}-oauth-login
-//!      {source_id, device_id, code, state, navigate_uri}
-//!      → data {access_token, refresh_token, user_id, user_name, first_login}
-//! ```
-//!
-//! ── 卡点：第 ② 步强制要求阿里云风控验证码 ────────────────────
-//! 不带 `ali_captcha_verify_param` 得到 `631002 当前版本已停止服务`（一个与真实
-//! 原因无关的误导码）；带假值得到 `630014 审核失败`。验证码是**浏览器端 JS SDK**，
-//! 复刻算法成本高且会随上游更新失效 —— 因此不复刻，而是让插件**接收**前端跑完
-//! SDK 得到的那个不透明字符串并原样转交（`login.oauth-start` 的
-//! `captchaVerifyParam`）。第 ③ 步不需要验证码（用假 code 打 `zai-oauth-login`
-//! 得到 `631001 User login error` 而不是 630014），所以换码可以完全在插件里做。
-//!
-//! ── navigate_uri 必须长成客户端那样（别改）─────────────────────
-//! Zai 的 OAuth 服务按 client 登记的白名单逐字校验 `redirect_uri`：名单里只有
-//! 官方客户端那四个 loopback 端口上的 `http://localhost:<端口>/auth/callback-zai`。
-//! 端口不是那四个之一、host 写成 `127.0.0.1`、路径不对 —— 一律被拒，窗口里直接
-//! 渲染 `{"detail":"Redirect URI not registered for this client"}`。
-//! **Google 是另一套规则**（RFC 8252 的 loopback 宽松匹配，端口任意），所以同一
-//! 份代码「谷歌能登、Zai 登不上」。
-//!
-//! ── 安全 ────────────────────────────────────────────────────
-//! 回调地址不会被真的访问（插件没有监听器），授权码由用户回填。安全由
-//! **一次性授权码**与登录状态表承担：code 一次性、流程必须进行中、换码失败即失败。
-//! token 只进账号库，不进日志。
-//!
-//! ── 硬约束 ──────────────────────────────────────────────────
-//! release 是 `panic=abort`：本文件零 unwrap / expect / panic。
-
+//! 原生 Region::Intl 的 Zai/Google 三步协议；所有 POST 只到国际 userapi。
+//! Aliyun 票据只能来自通用宿主的真实交互，不能由表单、账号验证码池或 native helper 代填。
+//! 本家原生交换协议没有客户端 code_verifier 字段；不虚构 PKCE，也不改上游授权页 challenge。
+use super::{account, client, endpoints, oauth_urls, profile, util};
 use agent2api_wasm_sdk::{json, Error, Result, Value};
 
-use super::upstream;
-
-/// 验证码配置（同时是「这个构建要不要走 OAuth」的开关）
-pub const CAPTCHA_CONFIG_PATH: &str = "/userapi/overseasv1/oauth-captcha-config";
-
-/// 两个变体（顺序 = 界面上按钮的顺序：Zai 在前，与客户端一致）。
-const VENDORS: [&str; 2] = ["zai", "google"];
-
-/// 是不是认识的变体（不认识就**不静默回落到某一个**）。
-pub fn is_vendor(name: &str) -> bool {
-    VENDORS.contains(&name)
+pub const CAPTCHA_CONFIG: &str = "/userapi/overseasv1/oauth-captcha-config";
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Vendor {
+    Zai,
+    Google,
 }
-
-/// 界面上那个按钮的名字
-fn label(vendor: &str) -> &'static str {
-    match vendor {
-        "google" => "Google",
-        _ => "Zai",
+impl Vendor {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Zai => "zai",
+            Self::Google => "google",
+        }
     }
-}
-
-/// 取授权地址的端点
-fn url_path(vendor: &str) -> &'static str {
-    match vendor {
-        "google" => "/userapi/overseasv1/google-oauth-url",
-        _ => "/userapi/overseasv1/zai-oauth-url",
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Zai => "Zai",
+            Self::Google => "Google",
+        }
     }
-}
-
-/// 用授权码换凭证的端点
-fn login_path(vendor: &str) -> &'static str {
-    match vendor {
-        "google" => "/userapi/overseasv1/google-oauth-login",
-        _ => "/userapi/overseasv1/zai-oauth-login",
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "zai" => Ok(Self::Zai),
+            "google" => Ok(Self::Google),
+            _ => Err(Error::http(400, "AutoClaw 国际版只支持 Zai 或 Google 授权")),
+        }
     }
-}
-
-/// 业务码 → 用户能看懂的原因（OAuth 这条链自己的码表，与短信那条分开）。
-pub fn describe_error(code: i64, upstream_msg: &str) -> String {
-    match code {
-        631_002 => "本次登录缺少风控验证（验证码未通过或已过期），请重新点击登录再试一次".to_string(),
-        630_014 => "风控验证未通过，请重新点击登录再试一次".to_string(),
-        631_001 => "授权码无效或已过期，请重新点击登录".to_string(),
-        400_001 => "请求参数有误（登录链路内部错误，请重试）".to_string(),
-        400_002 => "请求签名校验失败（本机时钟可能有偏差），请校准系统时间后重试".to_string(),
-        _ => {
-            if upstream_msg.trim().is_empty() {
-                format!("登录失败（上游 code={code}）")
-            } else {
-                format!("登录失败：{}", upstream_msg.trim())
-            }
+    fn url_path(self) -> &'static str {
+        match self {
+            Self::Zai => "/userapi/overseasv1/zai-oauth-url",
+            Self::Google => "/userapi/overseasv1/google-oauth-url",
+        }
+    }
+    fn login_path(self) -> &'static str {
+        match self {
+            Self::Zai => "/userapi/overseasv1/zai-oauth-login",
+            Self::Google => "/userapi/overseasv1/google-oauth-login",
         }
     }
 }
 
-/// 取 OAuth 授权地址（**需要验证码参数**）。
-///
-/// 站点由 `region::userapi_base`（进而是 `region::REGION`）决定，这里不重复传。
-pub fn request_oauth_url(
-    vendor: &str,
-    navigate_uri: &str,
-    captcha_verify_param: &str,
-    device_id: &str,
-) -> Result<String> {
-    let captcha = captcha_verify_param.trim();
-    if captcha.is_empty() {
-        // 本地就挡掉：不带它打上游必然得到那条误导性的 631002
-        return Err(Error::http(400, "缺少风控验证参数，请先完成验证码"));
+fn business(payload: &Value, action: &str) -> Result<()> {
+    let code = util::integer(&payload["code"]);
+    if code == Some(0) {
+        return Ok(());
     }
-    let body = json!({
-        "source_id": "autoclaw",
-        "device_id": device_id,
-        "navigate_uri": navigate_uri,
-        "ali_captcha_verify_param": captcha,
-    });
-    let what = format!("获取 {} 授权地址", label(vendor));
-    let payload = upstream::post_anonymous(url_path(vendor), &body, &what)?;
-    let code = payload.get("code").and_then(Value::as_i64).unwrap_or(0);
-    if code != 0 {
-        let upstream_msg = payload.get("msg").and_then(Value::as_str).unwrap_or("");
-        return Err(Error::http(400, describe_error(code, upstream_msg)));
+    let message = match code {
+        Some(631_002) => "本轮缺少有效的官方风控验证，请重新发起授权".to_string(),
+        Some(630_014) => "官方风控验证未通过，请重新发起授权".into(),
+        Some(631_001) => "官方授权码无效或已过期，请重新登录".into(),
+        Some(400_001) => "国际版登录请求参数被拒，请重新发起".into(),
+        Some(400_002) => "国际版登录签名校验失败，请校准系统时间后重试".into(),
+        Some(400_005) => "国际版登录请求过于频繁，请稍后再试".into(),
+        _ => format!(
+            "{action}未完成（业务码 {}）",
+            code.map(|code| code.to_string())
+                .unwrap_or_else(|| "未返回".into())
+        ),
+    };
+    let mut error = Error::http(
+        if code == Some(400_005) { 429 } else { 502 },
+        format!("AutoClaw {message}"),
+    );
+    error.upstream_code = code;
+    Err(error)
+}
+fn config_text(data: &Value, key: &str, max: usize) -> Result<String> {
+    let value = data[key].as_str().map(str::trim).unwrap_or("");
+    if value.is_empty()
+        || !util::printable(value, max)
+        || value.bytes().any(|byte| byte.is_ascii_whitespace())
+    {
+        return Err(Error::http(
+            502,
+            "AutoClaw 国际版未返回完整有效的 Aliyun 配置",
+        ));
     }
-    let oauth_url = payload
-        .get("data")
-        .and_then(|data| data.get("oauth_url"))
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if oauth_url.is_empty() {
-        return Err(Error::http(502, "上游没有返回授权地址，请重试"));
+    Ok(value.into())
+}
+pub fn captcha_config() -> Result<Value> {
+    let payload = client::post(CAPTCHA_CONFIG, "", &json!({}), "国际授权验证配置查询")?;
+    business(&payload, "读取验证配置")?;
+    let data = &payload["data"];
+    let enabled = data["enabled"]
+        .as_bool()
+        .ok_or_else(|| Error::http(502, "AutoClaw 国际版验证配置缺少开关"))?;
+    if !enabled {
+        return Ok(
+            json!({ "enabled": false, "region": "", "prefix": "", "sceneId": "", "supplier": "" }),
+        );
     }
-    Ok(oauth_url)
+    let supplier = config_text(data, "captcha_supplier", 64)?;
+    if supplier != "aliyun" {
+        return Err(Error::http(
+            503,
+            "国际版上游返回了尚未接入的真人验证服务，未改用其他验证方式",
+        ));
+    }
+    Ok(
+        json!({ "enabled": true, "supplier": supplier, "region": config_text(data, "region", 32)?,
+        "prefix": config_text(data, "prefix", 256)?, "sceneId": config_text(data, "scene_id", 256)? }),
+    )
 }
 
-/// 用回调里的一次性授权码换凭证，返回可落库的扁平凭证（含 user_name）。
-pub fn exchange_code(
-    vendor: &str,
+/// 只由当前通用宿主真人交互调用，不接收普通 RPC payload 中的验证码。
+pub fn request_url(
+    vendor: Vendor,
+    navigate: &str,
+    device: &str,
+    captcha: &str,
+    approved_origins: &[String],
+) -> Result<oauth_urls::Authorization> {
+    oauth_urls::navigate(navigate, vendor)?;
+    if device.len() != 64 || !device.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Error::http(400, "AutoClaw 国际版授权设备标识无效"));
+    }
+    if captcha.is_empty() || !util::printable(captcha, 32 * 1024) || captcha != captcha.trim() {
+        return Err(Error::http(400, "缺少本轮真实完成的 Aliyun 验证结果"));
+    }
+    if approved_origins.is_empty() {
+        return Err(Error::http(503, "主程序尚未批准本轮国际版官方授权页来源"));
+    }
+    let operation = format!("国际 {} 授权地址获取", vendor.label());
+    let payload = client::post(
+        vendor.url_path(),
+        "",
+        &json!({ "source_id": "autoclaw", "device_id": device,
+        "navigate_uri": navigate, "ali_captcha_verify_param": captcha }),
+        &operation,
+    )?;
+    business(&payload, "获取授权地址")?;
+    let raw = payload["data"]["oauth_url"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| Error::http(502, "AutoClaw 国际版没有返回官方授权地址"))?;
+    let authorization = oauth_urls::authorization(raw, vendor, navigate, approved_origins)?;
+    if payload["data"]
+        .get("state")
+        .is_some_and(|value| value.as_str() != Some(authorization.official_state.as_str()))
+    {
+        return Err(Error::http(
+            502,
+            "AutoClaw 官方授权地址与响应中的流程标识不一致",
+        ));
+    }
+    Ok(authorization)
+}
+
+/// 调用者先校验官方完整回调并 CAS 标记换码中；失败后不复用授权码。
+pub fn exchange(
+    vendor: Vendor,
     code: &str,
     state: &str,
-    navigate_uri: &str,
-    device_id: &str,
+    navigate: &str,
+    device: &str,
 ) -> Result<Value> {
-    let body = json!({
-        "source_id": "autoclaw",
-        "device_id": device_id,
-        "code": code,
-        "state": state,
-        "navigate_uri": navigate_uri,
-    });
-    let what = format!("{} 登录换取凭证", label(vendor));
-    let payload = upstream::post_anonymous(login_path(vendor), &body, &what)?;
-    let status = payload.get("code").and_then(Value::as_i64).unwrap_or(0);
-    if status != 0 {
-        let upstream_msg = payload.get("msg").and_then(Value::as_str).unwrap_or("");
-        return Err(Error::http(400, describe_error(status, upstream_msg)));
+    oauth_urls::navigate(navigate, vendor)?;
+    if [code, state].iter().any(|value| {
+        value.is_empty()
+            || !util::printable(value, 4096)
+            || value.bytes().any(|byte| byte.is_ascii_whitespace())
+    }) || device.len() != 64
+        || !device.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(Error::http(400, "AutoClaw 国际版授权换码参数无效"));
     }
-    let data = payload.get("data").cloned().unwrap_or(Value::Null);
-    let token = data
-        .get("access_token")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if token.is_empty() {
-        return Err(Error::http(502, "登录成功但上游没有返回 access_token"));
+    let payload = client::post(
+        vendor.login_path(),
+        "",
+        &json!({ "source_id": "autoclaw", "device_id": device,
+        "code": code, "state": state, "navigate_uri": navigate }),
+        "国际授权换码",
+    )?;
+    business(&payload, "换取登录态")?;
+    let data = &payload["data"];
+    let token = util::strip_bearer(&util::text(data, &["access_token"]));
+    let refresh = util::strip_bearer(&util::text(data, &["refresh_token"]));
+    util::token_valid(&token, false)
+        .map_err(|_| Error::http(502, "AutoClaw 国际版授权未返回有效访问凭据"))?;
+    util::token_valid(&refresh, true)
+        .map_err(|_| Error::http(502, "AutoClaw 国际版授权返回的刷新凭据无效"))?;
+    if token.starts_with("enc:") || refresh.starts_with("enc:") {
+        return Err(Error::http(502, "国际版 OAuth 不应返回本机密文凭据"));
     }
-    let refresh_token = data
-        .get("refresh_token")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    let user_name = data
-        .get("user_name")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    let mut credentials = json!({ "token": token, "deviceId": device_id });
-    if let Some(object) = credentials.as_object_mut() {
-        if !refresh_token.is_empty() {
-            object.insert("refreshToken".to_string(), Value::String(refresh_token));
+    let user = util::scalar(&data["user_id"]);
+    let mut secret = account::parse(
+        &json!({ "provider": endpoints::PROVIDER, "region": "intl", "token": token,
+        "refreshToken": refresh, "deviceId": device, "userId": user }),
+    )?;
+    let username = util::text(data, &["user_name"]);
+    if !username.is_empty() {
+        secret["name"] = json!(username);
+    }
+    // 与原生相同，邮箱查询不是授权成功的前提；身份冲突和主机拒绝不能静默忽略。
+    match profile::fetch(&secret) {
+        Ok(profile) => {
+            let uid = util::text(&profile, &["userId"]);
+            if !uid.is_empty() {
+                if !account::user(&secret).is_empty() && uid != account::user(&secret) {
+                    return Err(Error::http(
+                        409,
+                        "AutoClaw 国际版资料与授权账号不一致，未添加账号",
+                    )
+                    .with_code("identity_changed"));
+                }
+                secret["userId"] = json!(uid);
+            }
+            let email = util::text(&profile, &["email"]);
+            if !email.is_empty() {
+                secret["email"] = json!(email);
+            }
         }
-        // 备注名兜底：OAuth 账号有用户名（手机验证码那条没有，用脱敏手机号）
-        if !user_name.is_empty() {
-            object.insert("userName".to_string(), Value::String(user_name));
+        Err(error)
+            if matches!(
+                error.code.as_deref(),
+                Some("forbidden" | "identity_changed")
+            ) || error.status == Some(401) =>
+        {
+            return Err(error)
         }
+        Err(_) => {}
     }
-    Ok(credentials)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 变体白名单与端点映射：不认识的名字不能被静默当成 zai。
-    #[test]
-    fn vendors_are_explicit() {
-        assert!(is_vendor("zai"));
-        assert!(is_vendor("google"));
-        assert!(!is_vendor("wechat"));
-        assert_eq!("/userapi/overseasv1/zai-oauth-url", url_path("zai"));
-        assert_eq!("/userapi/overseasv1/google-oauth-login", login_path("google"));
+    if account::user(&secret).is_empty() {
+        return Err(Error::http(
+            502,
+            "AutoClaw 国际版授权未给出用户身份，未添加空账号",
+        ));
     }
-
-    /// 缺验证码参数在本地就挡掉（不打上游、不产生误导性的 631002）。
-    #[test]
-    fn missing_captcha_is_rejected_locally() {
-        let error = request_oauth_url("zai", "http://localhost:18432/auth/callback-zai", "  ", "dev")
-            .err()
-            .unwrap_or_else(Error::unsupported);
-        assert_eq!(Some(400), error.status);
-        assert!(error.message.contains("风控验证"));
-    }
+    account::normalized(account::project(&account::parse(&secret)?))
 }

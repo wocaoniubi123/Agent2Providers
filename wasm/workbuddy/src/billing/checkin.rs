@@ -1,293 +1,141 @@
-//! WorkBuddy **国内版每日签到**（`POST /v2/billing/meter/daily-checkin`）。
-//!
-//! ── 与「每日活跃上报」的分工 ────────────────────────────────
-//! 两套互不相通的连签（详见 `growth::daily_activity` 的模块头）：
-//!
-//! ```text
-//! 签到活动   POST /v2/billing/meter/daily-checkin
-//!            → checkin-activity-status 的 streak_days（签到连签，签到就涨）
-//! 成长中心   POST /v2/report 的一条 chat_request_send 事件
-//!            → activity/growth/streak 的 streak.days（连登 / 活跃地图）
-//! ```
-//!
-//! 本文件只管前者；后者在 `admin` 的 `growth.daily` 动作里。
-//!
-//! ── 返回形状与网关逐字相同 ──────────────────────────────────
-//! ```text
-//!   成功  { success: true, code: 0, data: <归一>, raw: <data> }
-//!   失败  { success: false, code: <码>, msg: "...", requestId?: ... }
-//! ```
-//! 前端的签到结果卡按 `success` / `msg` 分流，所以形状不能改。
-//!
-//! ── 「今天已领过」为什么不算失败 ────────────────────────────
-//! 上游对重复领取回业务错误，而那不是故障（每天只该领一次）。命中「已领」文案时
-//! 返回 `success: false` 但**不报错**（`Err` 只表示请求没打成）。
-//!
-//! ── 硬约束 ──────────────────────────────────────────────────
-//! 零 unwrap/expect/panic。
+//! 国内每日签到与成长活跃不同；仅明确已领的400/409放行，未知不能伪装成功。
+use crate::{
+    account, headers, ledger, network,
+    session::{self, Session},
+    util,
+};
+use agent2api_wasm_sdk::{self as sdk, json, AccountLock, Error, Result, Value};
 
-use agent2api_wasm_sdk::{json, Result, Value};
-
-use crate::endpoints::RESPONSE_CODE_OK;
-
-use super::call;
-
-/// 签到领取端点（国内版；带 `/v2` 前缀）。
-const DAILY_CHECKIN_PATH: &str = "/v2/billing/meter/daily-checkin";
-
-/// 领取一次国内版每日签到。
-pub fn claim(session: &Value) -> Result<Value> {
-    let result = call::call(
-        "POST",
-        DAILY_CHECKIN_PATH,
-        None,
-        session,
-        None,
-        // `expect_code_ok = false`：重复领取要读 msg 判「今天已领」；
-        // `tolerate_duplicate_claim`：上游对重复领取回 HTTP 400
-        call::Options {
-            expect_code_ok: false,
-            tolerate_duplicate_claim: true,
-            ..Default::default()
-        },
-    )?;
-    if result.code == Some(RESPONSE_CODE_OK) && !result.data.is_null() {
-        return Ok(json!({
-            "success": true,
-            "code": 0,
-            "data": normalize_checkin(&result.data),
-            "raw": result.data,
-        }));
-    }
-    // 非 0 业务码：可能是「今天已领」，也可能是真的失败。两者都返回
-    // `success:false` + msg —— 交给调用方的文案分流。
-    let mut failure = serde_json::Map::new();
-    failure.insert("success".to_string(), Value::Bool(false));
-    failure.insert("code".to_string(), Value::from(result.code.unwrap_or(-1)));
-    failure.insert(
-        "msg".to_string(),
-        Value::String(result_msg(&result.raw).unwrap_or_else(|| "签到失败".to_string())),
-    );
-    let message = failure.get("msg").and_then(Value::as_str).unwrap_or("");
-    let already = !(message.contains("可能") || message.contains("未能") || message.contains("失败"))
-        && (message.contains("已签到") || message.contains("已领取"));
-    failure.insert("alreadyCompleted".to_string(), Value::Bool(already));
-    Ok(Value::Object(failure))
+fn already(message: &str) -> bool {
+    !["可能", "未能", "失败"].iter().any(|v| message.contains(v))
+        && (message.contains("已签到") || message.contains("已领取"))
 }
-
-/// 从响应体里取可读文案（`msg` 优先，空串当没有）。
-fn result_msg(raw: &Option<Value>) -> Option<String> {
-    let payload = raw.as_ref()?;
-    payload
-        .get("msg")
-        .and_then(Value::as_str)
-        .filter(|text| !text.is_empty())
-        .or_else(|| {
-            payload
-                .get("message")
-                .and_then(Value::as_str)
-                .filter(|text| !text.is_empty())
-        })
-        .map(str::to_string)
-}
-
-/// 领取响应 → 统一签到形态。
-///
-/// ── 为什么键名要摊平成驼峰 ──────────────────────────────────
-/// 上游给的是蛇形（`checked_in` / `continuous_days`），而界面的签到卡读驼峰
-/// （`checkedIn` / `continuousDays`）。归一次到这里，读侧就只有一套。
-///
-/// ── 取不到值的键为什么有时消失、有时是 null ─────────────────
-/// 与 Node 的 `pick(...)` / `toInt(pick(...))` 语义逐字对应：
-///   - `pick` 的返回值直接进对象，取不到就**不出这个键**；
-///   - `toInt(pick(...))` 解不出时是 `null`，键**保留**。
-/// 界面按「键在不在」区分「上游没说」与「上游说了 0」，所以不能统一。
-pub fn normalize_checkin(data: &Value) -> Value {
+pub fn normalize(data: &Value) -> Value {
     if !data.is_object() {
         return data.clone();
     }
-    let pick = |keys: &[&str]| -> Option<Value> {
-        for key in keys {
-            if let Some(value) = data.get(*key) {
-                if !value.is_null() {
-                    return Some(value.clone());
-                }
-            }
-        }
-        None
+    let pick = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|key| data.get(*key).filter(|v| !v.is_null()))
+            .cloned()
     };
-    let int_of = |keys: &[&str]| -> Value {
-        pick(keys)
-            .and_then(|value| to_int(&value))
-            .map(Value::from)
-            .unwrap_or(Value::Null)
-    };
-
-    let mut result = serde_json::Map::new();
-    if let Some(value) = pick(&[
-        "checked_in",
-        "checkedIn",
-        "is_checked_in",
-        "isCheckedIn",
-        "signed",
-        "is_signed",
-    ]) {
-        result.insert("checkedIn".to_string(), value);
-    }
-    result.insert(
-        "continuousDays".to_string(),
-        int_of(&[
-            "continuous_days",
-            "continuousDays",
-            "continuous_checkin_days",
-            "streak",
-            "serial_days",
-        ]),
-    );
-    result.insert(
-        "totalDays".to_string(),
-        int_of(&["total_days", "totalDays", "total_checkin_days", "accumulate_days"]),
-    );
-    result.insert(
-        "points".to_string(),
-        int_of(&["points", "credit", "reward_points", "rewardPoints", "daily_points"]),
-    );
-    if let Some(value) = pick(&["start_time", "startTime"]) {
-        result.insert("startTime".to_string(), value);
-    }
-    if let Some(value) = pick(&["end_time", "endTime"]) {
-        result.insert("endTime".to_string(), value);
-    }
-    if let Some(value) = pick(&["activity_online_status", "activityOnlineStatus", "online"]) {
-        result.insert("online".to_string(), value);
-    }
-    result.insert("raw".to_string(), data.clone());
-    Value::Object(result)
-}
-
-/// JS `Number(x)` 的整数化（认数字、布尔、以及字符串形式的数字）。
-fn to_int(value: &Value) -> Option<i64> {
-    match value {
-        Value::Number(number) => number
-            .as_i64()
-            .or_else(|| number.as_f64().map(|float| float as i64)),
-        Value::Bool(flag) => Some(i64::from(*flag)),
-        Value::String(text) => {
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
-                return None;
+    let int = |keys: &[&str]| {
+        pick(keys).and_then(|v| {
+            if let Some(b) = v.as_bool() {
+                Some(i64::from(b))
+            } else {
+                util::integer(&v)
             }
-            trimmed
-                .parse::<i64>()
-                .ok()
-                .or_else(|| trimmed.parse::<f64>().ok().map(|float| float as i64))
+        })
+    };
+    let mut value = json!({ "continuousDays": int(&["continuous_days", "continuousDays", "continuous_checkin_days", "streak_days", "streakDays", "streak", "serial_days"]),
+        "totalDays": int(&["total_days", "totalDays", "total_checkin_days", "accumulate_days"]),
+        "points": int(&["points", "credit", "reward_points", "rewardPoints", "daily_points"]), "raw": data });
+    for (target, aliases) in [
+        (
+            "checkedIn",
+            &[
+                "checked_in",
+                "checkedIn",
+                "is_checked_in",
+                "isCheckedIn",
+                "signed",
+                "is_signed",
+                "today_checked_in",
+                "todayCheckedIn",
+            ][..],
+        ),
+        ("startTime", &["start_time", "startTime"][..]),
+        ("endTime", &["end_time", "endTime"][..]),
+        (
+            "online",
+            &["activity_online_status", "activityOnlineStatus", "online"][..],
+        ),
+    ] {
+        if let Some(v) = pick(aliases) {
+            value[target] = v;
         }
-        _ => None,
     }
+    value
 }
-
-/// claim 结果 → 协议层的签到报告。
-///
-/// ── 为什么判据是 `success` / `alreadyCompleted` / 文案三分 ─────
-/// 上游把三件事混在同一个业务码空间里：
-/// ```text
-///   success: true          → 刚领到                      → claimed
-///   alreadyCompleted: true → 今天已经领过（不是失败）      → done
-///   msg 含「无此活动」等    → 这条通道没有这个签到         → inactive
-///   其余                    → 真失败                      → failed
-/// ```
-/// `done` 与 `claimed` 在调度上是同一件事（今天不能再领），差别只在界面文案；
-/// 把它们并成一个会让「今天已签」在台账里显示成「刚刚签到成功」。
-pub fn report_of(claim: &Value) -> Value {
-    let success = claim
-        .get("success")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let already = claim
-        .get("alreadyCompleted")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let message = claim
-        .get("msg")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .map(str::to_string);
+pub fn status(current: &Session) -> Result<Value> {
+    let reply = network::raw(
+        "POST",
+        &current.endpoint()?,
+        "/v2/billing/meter/checkin-activity-status",
+        headers::framework(&current.secret)?,
+        Some(&json!({})),
+    )?;
+    if !(200..300).contains(&reply.status) {
+        return Err(crate::errors::upstream(
+            reply.status,
+            &reply.value,
+            &current.secrets(),
+        ));
+    }
+    let data = reply.checked(&current.secrets())?;
+    if !data.is_object() {
+        return Err(Error::http(502, "WorkBuddy签到状态缺少资料，状态未知"));
+    }
+    Ok(normalize(&data))
+}
+pub fn claim() -> Result<Value> {
+    let _ = session::ensure(false)?;
+    let lock = AccountLock::acquire()?;
+    let current = session::ensure_locked(&lock)?;
+    if !account::personal(&current.secret) {
+        return Ok(
+            json!({ "outcome": "ineligible", "success": false, "message": "企业账号没有个人每日签到" }),
+        );
+    }
+    let today = util::day(sdk::now());
+    let old = ledger::get(&current, "dailyCheckin")?;
+    if old["day"] == today && old["completed"] == true {
+        let mut report = old["report"].clone();
+        report["outcome"] = json!("done");
+        report["alreadyCompleted"] = json!(true);
+        return Ok(report);
+    }
+    let reply = network::raw(
+        "POST",
+        &current.endpoint()?,
+        "/v2/billing/meter/daily-checkin",
+        headers::framework(&current.secret)?,
+        Some(&json!({})),
+    )?;
+    let message = crate::errors::clean(reply.message(), &current.secrets());
+    let duplicate = (reply.code() == Some(1001) || already(&message))
+        && (matches!(reply.status, 400 | 409) || (200..300).contains(&reply.status));
+    let ineligible = reply.code() == Some(1002);
+    let inactive = reply.code() == Some(1003)
+        || message.contains("活动未开启")
+        || message.contains("无此活动");
+    if !(200..300).contains(&reply.status) && !duplicate && !ineligible && !inactive {
+        return Err(crate::errors::upstream(
+            reply.status,
+            &reply.value,
+            &current.secrets(),
+        ));
+    }
+    let success = reply.ok() && reply.code() == Some(0) && reply.data().is_object() && !duplicate;
+    let data = normalize(reply.data());
     let outcome = if success {
         "claimed"
-    } else if already {
+    } else if duplicate {
         "done"
-    } else if message
-        .as_deref()
-        .is_some_and(|text| text.contains("活动未开启") || text.contains("无此活动"))
-    {
-        // 「活动未开启」是正常状态：上游这期没开，不是账号有问题
+    } else if ineligible {
+        "ineligible"
+    } else if inactive {
         "inactive"
     } else {
         "failed"
     };
-    // 连续天数：`data.continuousDays`（归一后的驼峰名）
-    let streak = claim
-        .get("data")
-        .and_then(|data| data.get("continuousDays"))
-        .and_then(Value::as_i64)
-        .filter(|value| *value >= 0);
-    // 本次到账积分：`data.points`
-    let credit = claim
-        .get("data")
-        .and_then(|data| data.get("points"))
-        .and_then(Value::as_i64)
-        .filter(|value| *value > 0)
-        .map(|value| format!("+{value} 积分"));
-    let mut report = json!({ "outcome": outcome });
-    if let Some(credit) = credit {
-        report["credit"] = json!(credit);
+    let mut report = json!({ "outcome": outcome, "success": success, "alreadyCompleted": duplicate,
+        "code": reply.code(), "data": data, "msg": message, "message": if success { "签到成功" } else { &message },
+        "credit": util::integer(&data["points"]).filter(|v| *v > 0).map(|v| format!("+{v} 积分")), "streak": data["continuousDays"] });
+    session::check(&current)?;
+    if ledger::put(&current, "dailyCheckin", &json!({ "day": today, "at": sdk::now(), "completed": success || duplicate, "report": report })).is_err() {
+        util::warning(&mut report, "签到结果已返回，但每日台账未保存");
     }
-    if let Some(streak) = streak {
-        report["streak"] = json!(streak);
-    }
-    if let Some(message) = message {
-        report["message"] = json!(message);
-    }
-    report
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn normalized_checkin_flattens_snake_case() {
-        let data = json!({
-            "checked_in": true, "continuous_days": 15, "points": 20,
-            "activity_online_status": 1
-        });
-        let normalized = normalize_checkin(&data);
-        assert_eq!(normalized["checkedIn"], json!(true));
-        assert_eq!(normalized["continuousDays"], json!(15));
-        assert_eq!(normalized["points"], json!(20));
-        assert_eq!(normalized["totalDays"], Value::Null);
-    }
-
-    #[test]
-    fn duplicate_claim_is_done_not_failed() {
-        let report = report_of(&json!({
-            "success": false, "alreadyCompleted": true, "msg": "今天已签到，请明天再来"
-        }));
-        assert_eq!(report["outcome"], json!("done"));
-        // 真失败
-        let report = report_of(&json!({ "success": false, "msg": "网络异常" }));
-        assert_eq!(report["outcome"], json!("failed"));
-        // 活动没开
-        let report = report_of(&json!({ "success": false, "msg": "活动未开启" }));
-        assert_eq!(report["outcome"], json!("inactive"));
-        // 领到
-        let report = report_of(&json!({
-            "success": true,
-            "data": { "continuousDays": 15, "points": 20 }
-        }));
-        assert_eq!(report["outcome"], json!("claimed"));
-        assert_eq!(report["credit"], json!("+20 积分"));
-        assert_eq!(report["streak"], json!(15));
-    }
+    Ok(report)
 }
