@@ -33,7 +33,6 @@ pub const GROWTH_WRITE_GAP_MS: u64 = 1200;
 ///
 /// **若实测仍被回滚，把这个常量改大再编即可。**
 pub const MP_CHAT_GAP_MS: u64 = 2_000;
-
 pub const DESKTOP_UA: &str = "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1";
 pub const CLI_UA: &str = "CLI/2.63.2 CodeBuddy/2.63.2";
 pub const WEB_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36";
