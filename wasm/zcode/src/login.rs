@@ -86,8 +86,8 @@ pub fn start(params: &Value) -> Result<Value> {
     Ok(
         json!({ "flow": flow, "url": url.to_string(), "poll_interval_ms": interval,
         "instructions": instructions(locale),
-        "external_browser": true, "allowed_hosts": ["zcode.z.ai", "bigmodel.cn", "open.bigmodel.cn"],
-        "login_ui": { "browserMode": "external", "manualCallback": false, "callbackInput": "url", "cookieCapture": null, "captureCallback": false } }),
+        "external_browser": false, "allowed_hosts": ["zcode.z.ai", "bigmodel.cn", "open.bigmodel.cn"],
+        "login_ui": { "browserMode": "choice", "manualCallback": false, "callbackInput": "url", "cookieCapture": null, "captureCallback": false } }),
     )
 }
 
@@ -218,6 +218,10 @@ fn step(state: &mut Value) -> Result<Option<Value>> {
             return Err(Error::http(502, "ZCode 国内版登录结果缺少访问令牌"));
         }
         state["oauth"] = json!(oauth);
+        state["refreshToken"] = json!(account::strip_bearer(&text(
+            &data["bigmodel"],
+            &["refresh_token", "refreshToken"]
+        )));
         state["jwt"] = json!(account::strip_bearer(&text(data, &["token"])));
         state["userId"] = json!(account::user(&data["user"]));
         state["name"] = data["user"]["name"].clone();
@@ -302,7 +306,7 @@ pub fn methods(locale: &str) -> Value {
         _ => ["用户 ID", "设备 UUID", "套餐通道", "编码套餐", "套餐池", "编码套餐使用 API Key，套餐池使用 JWT。旧凭据可不填用户 ID，但此类记录按凭据去重，没有固定用户身份。"],
     };
     json!({ "methods": [
-        { "methodIndex": 0, "type": "oauth", "label": labels[0], "prompts": [], "browserMode": "external", "manualCallback": false, "instructions": labels[1] },
+        { "methodIndex": 0, "type": "oauth", "label": labels[0], "prompts": [], "browserMode": "choice", "manualCallback": false, "instructions": labels[1] },
         { "methodIndex": 1, "type": "api", "label": labels[2], "instructions": fields[5], "prompts": [
             { "key": "accessToken", "type": "text", "label": "Access Token / API Key", "secret": true, "optional": true },
             { "key": "jwt", "type": "text", "label": "Start Plan JWT", "secret": true, "optional": true },

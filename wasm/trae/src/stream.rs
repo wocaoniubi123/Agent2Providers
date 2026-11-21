@@ -241,22 +241,46 @@ fn complete_arguments(value: &str) -> bool {
     !value.is_empty() && serde_json::from_str::<Value>(value).is_ok()
 }
 
+fn first_argument_key(value: &str) -> Option<&str> {
+    let value = value
+        .trim_start()
+        .strip_prefix('{')?
+        .trim_start()
+        .strip_prefix('"')?;
+    let mut escaped = false;
+    for (index, byte) in value.bytes().enumerate() {
+        match byte {
+            b'"' if !escaped => {
+                return value[index + 1..]
+                    .trim_start()
+                    .starts_with(':')
+                    .then_some(&value[..index]);
+            }
+            b'\\' if !escaped => escaped = true,
+            _ => escaped = false,
+        }
+    }
+    None
+}
+
+fn resent_arguments(current: &str, incoming: &str) -> bool {
+    let Some(key) = first_argument_key(current) else {
+        return false;
+    };
+    // 新增片段本身也可能是合法 JSON；整包重发必须是同一首字段的完整对象。
+    first_argument_key(incoming) == Some(key)
+        && serde_json::from_str::<Value>(incoming).is_ok_and(|value| value.is_object())
+        && !complete_arguments(&(current.to_owned() + incoming))
+}
+
 fn merge_piece(current: &mut String, incoming: &str) -> Result<()> {
     if incoming.is_empty() || current == incoming || current.starts_with(incoming) {
         return Ok(());
     }
-    if incoming.starts_with(current.as_str()) {
-        *current = incoming.into();
-    } else if incoming.starts_with('{') && complete_arguments(incoming)
-        && !complete_arguments(&(current.clone() + incoming))
-    {
-        // 只有「看起来就是一份完整参数对象」时才认为是上游发来的替代版本。
-        // 原先只判断 `complete_arguments(incoming)`，而 `10` / `true` / `"x"` 这类
-        // 分片本身就是合法 JSON —— 工具参数又是从数字、字符串处分片下发的，
-        // 于是 `{"num":10,"query":"Debian 10 ...` 里的那个 `10` 会把已累积的
-        // 前缀整体替换掉，最终拼出 `10 buster LTS ..."}` 这种残缺对象，
-        // flush_tools 报「参数在完成前被截断」（2026-11-20 用真实分片复现）。
-        // 完整参数必然是 JSON 对象，以 `{` 开头，加这个前缀判断即可分辨。
+    // 上游 f22828b 用 `resent_arguments` 做同一件事，判据比我的更精确：
+    // 除了「本身是完整 JSON 对象」，还要求「首字段名与已累积内容相同」，
+    // 避免把恰好以 `{` 开头的后续分片误判成整包重发。取上游。
+    if incoming.starts_with(current.as_str()) || resent_arguments(current, incoming) {
         *current = incoming.into();
     } else {
         if current.len().saturating_add(incoming.len()) > MAX_TOOL_BUFFER {
