@@ -190,17 +190,13 @@ pub fn forward(mut params: Value) -> Result<()> {
                 .unwrap_or("")
                 .contains("application/json");
             let mut output = Output::new(&shown)?;
-            // 上游 f22828b 把「2xx 但 content-type 是 json」也并入失败分支，
+            // 上游 f22828b 已把「2xx 但 content-type 是 json」并入失败分支，
             // 与我原来那条 `trae_json_stream` 诊断是同一件事，取上游的写法。
+            // 我原先另写的 `else if json_response` 分支因此永远不可达，已删除。
             let result = if !(200..300).contains(&status) || json_response {
                 match client::read(response) {
                     Ok(reply) => Err(tag_error(errors::upstream(status, &reply.body), "trae_http_status")),
                     Err(error) => Err(tag_error(error, "trae_http_status")),
-                }
-            } else if json_response {
-                match client::read(response) {
-                    Ok(reply) => Err(tag_error(errors::upstream(status, &reply.body), "trae_json_stream")),
-                    Err(error) => Err(tag_error(error, "trae_json_stream")),
                 }
             } else {
                 let mut diag = String::new();
