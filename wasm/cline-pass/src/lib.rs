@@ -33,14 +33,17 @@ pub const PROVIDER_ID: &str = "cline-pass";
 sdk::export_provider!(handle);
 
 fn metadata() -> Value {
-    json!({ "id": PROVIDER_ID, "label": "Cline 订阅池", "order": 18,
+    use sdk::error_rules::{attach, class};
+    let meta = json!({ "id": PROVIDER_ID, "label": "Cline 订阅池", "order": 18,
         "capabilities": { "chat": true, "stateful": false, "refresh": true, "model_refresh": true,
             "usage": true, "checkin": false, "claims": false, "web_login": true, "sse_model_rewrite": true,
             "refresh_uses_account": false, "anonymous_default_session": false, "env_credentials": false },
         "login_methods": [{ "kind": "browser", "button": "浏览器登录" }],
         "account_features": { "usage": true, "identifier": ["uid", "account"], "expiry": ["expiresAt"],
             "default_limiters": [] },
-        "admin_panels": ["upstream_headers"], "default_models": models::defaults() })
+        "admin_panels": ["upstream_headers"], "default_models": models::defaults() });
+    // 与 cline-free 对齐：429 归入 rate_limit，交给宿主统一冷却与换号。
+    attach(meta, vec![class("rate_limit", &[429], &[])], vec![])
 }
 
 fn handle(method: &str, params: Value) -> Result<Value> {
