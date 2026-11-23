@@ -30,7 +30,7 @@ members = ["crates/providers", "crates/provider-protocol", "crates/provider-sdk"
 [workspace.package]
 # 版本号跟随上游：与上游发行号一致，上游发新版时这里会落后，
 # `git log HEAD..upstream/beta` 之外多一个直观的「该合了」信号。
-version = "3.5.0-beta.3"
+version = "3.5.0"
 edition = "2021"
 rust-version = "1.88"
 license-file = "LICENSE"
