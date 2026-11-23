@@ -1,8 +1,8 @@
 {
   "id": "agent2api-wasm-qwenwork",
   "name": "千问办公 国内版",
-  "description": "独立的千问办公国内版提供商，支持网页设备授权、凭据导入、自动续期、账号模型目录、流式对话和积分查询。",
-  "version": "0.1.0-beta.2",
+  "description": "提供国内版多轮对话与独立模型目录，支持网页设备授权、凭据导入与自动续期，可按账号查询积分详情。",
+  "version": "0.1.0-beta.3",
   "protocol": 1,
   "providers": [
     { "id": "qwenwork", "label": "千问办公 国内版", "order": 24, "default_enabled": true }
